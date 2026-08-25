@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build output
+engine/build/
+ui/dist/
+
+# Runtime state written by the running server (not source config)
+server/patchbay_config.json
+server/output_routing.json
+server/talkback_config.json
+
+# Saved DAW scenes (user session data)
+scenes/*.json
+
+# Editor / OS
+.DS_Store
+*.swp
