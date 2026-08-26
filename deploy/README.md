@@ -67,38 +67,46 @@ AES67 sync. Software-timestamping NICs work but with worse jitter.
 
 ## PTP / clocking
 
-The RAVENNA driver runs the AES67 media clock as a **PTP slave** — it needs
-a grandmaster on the wire or streams won't lock. The media clock wants a
-stable *frequency* reference, not wall-clock time; NTP-disciplined
-`CLOCK_REALTIME` injects slews (and `makestep` discontinuities → clicks).
+The RAVENNA driver runs the AES67 media clock as a **PTP slave** — with no
+grandmaster on the wire the ALSA device opens but never transfers samples
+(`ptp/status` = `unlocked`, write stalls then closes).
 
-On `ck-aes67` the on-board Intel I217 NIC (`eno1`) is damaged but its
-**PHC (`/dev/ptp0`) still free-runs** — a usable hardware crystal. Two ways
-to use it (mutually exclusive):
+**The grandmaster must be a separate machine.** The driver captures PTP at
+`NF_INET_PRE_ROUTING` (`c_wrapper_lib.c`) — ingress from a NIC only, never
+locally-originated multicast. A `ptp4l` GM *on the same box* takes the
+grandmaster role but the driver never sees it (tested on `ck-aes67`). So:
 
-- **Path 1 — self-contained deck.** Once the RAVENNA module loads, check
-  whether the Merging driver registers a steerable PHC (`/dev/ptp1`). If
-  so: `phc2sys -s /dev/ptp0 -c /dev/ptp1` locks the media clock straight
-  to the crystal — no `ptp4l`, no network PTP. Cleanest.
-- **Path 2 — this box is the AES67 clock master** (staged, disabled, via
-  `install-ptp.sh`): `phc2sys-crystal.service` makes `CLOCK_REALTIME`
-  follow `/dev/ptp0` (and stops chrony — `Conflicts=`), then
-  `ptp4l-aes67-gm.service` distributes it as a GM on `enp3s0`
-  (`linuxptp/aes67-gm.conf`, software timestamping).
+- **`ptp4l-aes67-gm.service` on this box does NOT feed the local RAVENNA
+  driver** — it's only useful for making *other* LAN devices slave to this
+  box. Kept staged/disabled for that case.
+- **Path 1** (`phc2sys` → a RAVENNA PHC) is impossible — the Merging
+  driver registers no `/dev/ptp` clock (it uses an internal hrtimer).
 
-**Enable order for Path 2:** `sudo systemctl enable --now
-phc2sys-crystal` (chrony stops), then `sudo systemctl enable --now
-ptp4l-aes67-gm`. `aes67-gm.conf` `domainNumber` must equal `daemon.conf`
-`ptp_domain`. Wall-clock then drifts from UTC at the crystal's ppm error —
-re-align on demand by stopping `phc2sys-crystal` and running `chronyd -q`.
+Working options for the grandmaster:
+1. A dedicated small box on the LAN (e.g. a Raspberry Pi) running
+   `ptp4l -i eth0 -f gm.conf` on domain 0.
+2. A **second NIC in this box** running `ptp4l` GM, plugged into the same
+   switch as `enp3s0` — the switch floods the PTP multicast back to
+   `enp3s0`'s port, so it arrives as wire ingress and PRE_ROUTING sees it.
+   With the replacement HW-PTP NIC this is the clean single-box setup:
+   `ptp4l` GM on the new NIC (hardware timestamping, clocked off the free-
+   running I217 PHC at `/dev/ptp0` — 0.002 ppm skew, verified), RAVENNA on
+   `enp3s0`.
+3. A PTP-capable switch / hardware master / another AES67 device as GM.
 
-**Do not** run `phc2sys -s CLOCK_REALTIME -c /dev/ptp0` (that pipes NTP
-jitter *into* the reference), and `eno1` does **not** need to be `up` for
-`/dev/ptp0` to tick (confirmed).
+`aes67-gm.conf` `domainNumber` must equal `daemon.conf` `ptp_domain`
+(both 0). `eno1` does **not** need to be `up` for `/dev/ptp0` to tick.
+Never run `phc2sys -s CLOCK_REALTIME -c /dev/ptp0` (pipes NTP jitter into
+the reference).
 
-**When the replacement HW-PTP NIC arrives:** point `aes67-gm.conf`
-`[enp3s0]` and `daemon.conf` `interface_name` at it, set `time_stamping =
-hardware`. The I217 PHC then becomes a holdover backup.
+### RAVENNA ALSA period
+
+`20-aes67-ravenna-bridge.conf` pins `api.alsa.period-size = 48`
+(= `daemon.conf` `tic_frame_size_at_1fs`) with `period-num = 2` and
+`disable-tsched` — the driver rejects periods that don't match its tic
+frame size. Re-verify the negotiated `hw_params` (`cat
+/proc/asound/card0/pcm0p/sub0/hw_params`) once a GM is present and the
+device actually runs; the driver hints an "expected" buffer of 192.
 
 `ptp/phc-stability-check.py <dev> <seconds>` characterises a free-running
 PHC (rate offset + jitter vs the undisciplined TSC) before you rely on it.

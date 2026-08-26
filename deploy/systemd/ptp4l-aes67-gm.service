@@ -1,6 +1,10 @@
 [Unit]
 Description=AES67 media-clock PTP grandmaster (enp3s0, software timestamping)
 Documentation=file:///home/ck/aes67-deck/deploy/README.md
+# NOTE: this does NOT feed the RAVENNA driver on THIS host — the driver
+# captures PTP at NF_INET_PRE_ROUTING (wire ingress only), so it never
+# sees a same-box GM. Only enable this to make OTHER LAN devices slave to
+# this box. See README "PTP / clocking".
 After=network-online.target phc2sys-crystal.service
 Wants=network-online.target
 Requires=phc2sys-crystal.service
