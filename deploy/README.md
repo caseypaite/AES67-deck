@@ -33,16 +33,31 @@ i5-4570 / 4 GB). Adjust the NIC name and host specifics for your machine.
 
 ## Secure Boot
 
-The RAVENNA module is out-of-tree and DKMS-signs it with a machine-owner
-key at `/var/lib/shim-signed/mok/MOK.der`. With Secure Boot enabled the
-key must be enrolled once:
+The RAVENNA module is out-of-tree. Two ways to let it load:
+
+**A. Enroll the machine-owner certificate (keeps Secure Boot on — preferred).**
+The key pair is `/var/lib/shim-signed/mok/MOK.{der,priv}` (from
+`update-secureboot-policy --new-key`); `dkms/mok-signing.conf` pins it in
+`/etc/dkms/framework.conf.d/` so **every** DKMS build — now and on future
+kernel updates — is signed with it. The cert just has to be enrolled once:
 
 ```bash
-sudo mokutil --import /var/lib/shim-signed/mok/MOK.der   # set a one-time password
-sudo reboot                                              # at the blue MOK screen: Enroll MOK → password
+sudo deploy/secureboot/enroll-mok.sh     # shows the fingerprint, runs mokutil --import
+sudo reboot
+# at the blue "MOK Manager" screen (needs a monitor+keyboard for this one boot):
+#   Enroll MOK → Continue → Yes → <the password you set>
 ```
 
-Or disable Secure Boot in firmware and skip the enrollment.
+Verify afterwards: `mokutil --list-enrolled | grep ck-aes67`, then
+`sudo modprobe MergingRavennaALSA` loads silently.
+
+The signed module's `modinfo` `sig_key` equals the cert serial
+(`45:AD:62:…` on `ck-aes67`) — that's the check that enrollment will make
+it loadable.
+
+**B. Disable Secure Boot in firmware** (ThinkCentre: F1 → Security → Secure
+Boot → Disabled). Simpler, no per-key-rotation upkeep, but drops Secure
+Boot's protection entirely.
 
 ## Network
 
