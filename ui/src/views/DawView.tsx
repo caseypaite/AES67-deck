@@ -1,6 +1,7 @@
 import React, { useRef, useEffect } from 'react';
 import { useMixerStore } from '../stores/useMixerStore';
 import { useDawStore } from '../stores/useDawStore';
+import { uuid } from '../lib/uuid';
 
 export const DawView = () => {
   const allChannels = useMixerStore(state => state.channels);
@@ -53,7 +54,7 @@ export const DawView = () => {
              const armedTracks = Object.values(useMixerStore.getState().channels).filter(c => c.type === 'input' && c.arm);
              armedTracks.forEach(t => {
                 addClip({
-                  id: crypto.randomUUID(),
+                  id: uuid(),
                   trackId: t.id,
                   start: recordStartTime,
                   length: length,

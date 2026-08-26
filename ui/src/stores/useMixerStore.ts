@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { usePatchbayStore } from './usePatchbayStore';
 import { calfDefaultParams } from '../data/calfPlugins';
+import { uuid } from '../lib/uuid';
 
 export interface PluginNode {
   id: string;
@@ -189,7 +190,7 @@ const DEFAULT_RACK: Omit<PluginNode, 'id'>[] = [];
 const generateDefaultRack = (): PluginNode[] => {
   return DEFAULT_RACK.map(p => ({
     ...p,
-    id: crypto.randomUUID(),
+    id: uuid(),
     params: { ...p.params }
   }));
 };
@@ -284,7 +285,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         const entry = PLUGIN_REGISTRY.find(e => e.uri === pluginDef.uri);
         params = entry ? { ...entry.defaultParams } : {};
       }
-      const plugin: PluginNode = { ...pluginDef, id: crypto.randomUUID(), params };
+      const plugin: PluginNode = { ...pluginDef, id: uuid(), params };
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         // No index sent — the engine appends when it's omitted, matching
         // where this new plugin lands in the array below.
@@ -426,7 +427,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     const nodes: PluginNode[] = plugins
       .filter(p => typeof p.uri === 'string')
       .map(p => ({
-        id: crypto.randomUUID(),
+        id: uuid(),
         name: PLUGIN_REGISTRY.find(e => e.uri === p.uri)?.name || 'Plugin',
         uri: p.uri,
         enabled: p.enabled !== false,
@@ -554,7 +555,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           const plugins: PluginNode[] = rawPlugins
             .filter((p): p is Partial<PluginNode> & { uri: string } => typeof p.uri === 'string')
             .map((p) => ({
-              id: crypto.randomUUID(),
+              id: uuid(),
               name: p.name || PLUGIN_REGISTRY.find(e => e.uri === p.uri)?.name || 'Plugin',
               uri: p.uri,
               enabled: p.enabled !== false,

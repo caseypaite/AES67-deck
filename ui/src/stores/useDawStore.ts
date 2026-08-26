@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { uuid } from '../lib/uuid';
 
 export interface DawClip {
   id: string;
@@ -122,7 +123,7 @@ export const useDawStore = create<DawState>((set) => ({
         nextClips[id] = { ...clip, length: length1 };
 
         // Create Clip 2
-        const newId = crypto.randomUUID();
+        const newId = uuid();
         nextClips[newId] = {
           ...clip,
           id: newId,
@@ -154,7 +155,7 @@ export const useDawStore = create<DawState>((set) => ({
     const newSelection: string[] = [];
     
     state.clipboard.forEach(clip => {
-      const newId = crypto.randomUUID();
+      const newId = uuid();
       nextClips[newId] = {
         ...clip,
         id: newId,

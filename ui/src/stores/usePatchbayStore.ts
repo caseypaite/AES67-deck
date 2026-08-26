@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { uuid } from '../lib/uuid';
 
 const NUM_CHANNELS = 32;
 const OUTPUT_BUS_IDS = [100, 101, 102, 103, 104, 105, 106, 107, 108];
@@ -178,7 +179,7 @@ export const usePatchbayStore = create<PatchbayState>()(
         return { streams: newStreams };
       }
       const newStream: Aes67Stream = {
-        id: crypto.randomUUID(),
+        id: uuid(),
         name,
         address,
         channels: 2,
@@ -192,7 +193,7 @@ export const usePatchbayStore = create<PatchbayState>()(
   addManualStream: (name, address, channels, ports) => {
     set(state => ({
       manualStreams: [...state.manualStreams, {
-        id: crypto.randomUUID(),
+        id: uuid(),
         name,
         address,
         channels,
@@ -250,7 +251,7 @@ export const usePatchbayStore = create<PatchbayState>()(
         const existing = state.discoveredDestinations.find(d => d.name === f.name && d.address === f.address);
         return existing
           ? { ...existing, lastSeen: Date.now() }
-          : { id: crypto.randomUUID(), name: f.name, address: f.address, channels: 2, ports: [], lastSeen: Date.now() };
+          : { id: uuid(), name: f.name, address: f.address, channels: 2, ports: [], lastSeen: Date.now() };
       });
       return { discoveredDestinations: next };
     });
@@ -259,7 +260,7 @@ export const usePatchbayStore = create<PatchbayState>()(
   addManualDestination: (name, address, channels, ports) => {
     set(state => ({
       manualDestinations: [...state.manualDestinations, {
-        id: crypto.randomUUID(),
+        id: uuid(),
         name,
         address,
         channels,
