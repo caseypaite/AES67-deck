@@ -52,7 +52,7 @@ interface DawState {
   setTrackHeight: (trackId: number, height: number) => void;
 }
 
-export const useDawStore = create<DawState>((set, get) => ({
+export const useDawStore = create<DawState>((set) => ({
   clips: {
     '1': { id: '1', trackId: 1, start: 2.5, length: 15, color: 'bg-blue-600', name: 'Guitar Take 1' },
     '2': { id: '2', trackId: 1, start: 20, length: 10, color: 'bg-blue-600', name: 'Guitar Take 2' },

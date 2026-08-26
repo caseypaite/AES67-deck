@@ -12,7 +12,10 @@ namespace aes67_deck {
 namespace ipc {
 
 IpcClient::IpcClient(const std::string& socket_path) : socket_path_(socket_path), sock_fd_(-1), running_(false) {
-    tx_buffer_ = jack_ringbuffer_create(1024 * 64); // 64KB buffer
+    // 4MB: mostly headroom for the one-time plugin catalog dump (hundreds
+    // of LV2 plugins, each with several control ports of metadata) — the
+    // regular per-cycle metering messages are tiny by comparison.
+    tx_buffer_ = jack_ringbuffer_create(1024 * 1024 * 4);
     start();
 }
 
@@ -25,6 +28,9 @@ IpcClient::~IpcClient() {
 
 void IpcClient::set_command_callback(std::function<void(const std::string&, int, int, float)> cb) {
     command_callback_ = cb;
+}
+void IpcClient::set_plugin_manage_callback(std::function<void(const nlohmann::json&)> cb) {
+    plugin_manage_callback_ = cb;
 }
 void IpcClient::set_plugin_callback(std::function<void(const std::string&, int, int, const std::string&, float)> cb) {
     plugin_callback_ = cb;
@@ -117,6 +123,8 @@ void IpcClient::run() {
                         if (command_callback_) command_callback_("start_record", 0, -1, 0.0f);
                     } else if (type == "stop_record") {
                         if (command_callback_) command_callback_("stop_record", 0, -1, 0.0f);
+                    } else if (type == "lufs_reset") {
+                        if (command_callback_) command_callback_("lufs_reset", 0, -1, 0.0f);
                     } else if (type == "set_plugin_param" || type == "set_plugin_bypass") {
                         int channel = j.value("channel", -1);
                         int p_idx = j.value("pluginIndex", -1);
@@ -125,6 +133,18 @@ void IpcClient::run() {
                             std::string p_id = j.value("paramId", "");
                             if (plugin_callback_) plugin_callback_(type, channel, p_idx, p_id, val);
                         }
+                    } else if (type == "fx_focus") {
+                        // Which plugin editor the UI has open — drives the
+                        // per-plugin in/out metering. pluginIndex -1 == none.
+                        int channel = j.value("channel", -1);
+                        int p_idx = j.value("pluginIndex", -1);
+                        if (command_callback_) command_callback_("fx_focus", channel, p_idx, 0.0f);
+                    } else if (type == "add_plugin" || type == "remove_plugin" || type == "reorder_plugin" ||
+                               type == "replace_plugin" || type == "load_rack") {
+                        // Richer payloads (URIs, param maps, arrays) than the
+                        // fixed-shape callbacks above handle — hand the whole
+                        // parsed message through.
+                        if (plugin_manage_callback_) plugin_manage_callback_(j);
                     } else {
                         int channel = j.value("channel", -1);
                         if (channel != -1) {

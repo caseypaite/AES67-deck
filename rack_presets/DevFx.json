@@ -1,0 +1,38 @@
+[
+  {
+    "uri": "http://calf.sourceforge.net/plugins/Compressor",
+    "name": "Calf Compressor",
+    "enabled": true,
+    "params": {
+      "threshold": 0.02805028237464027,
+      "ratio": 2,
+      "knee": 2.82843,
+      "attack": 20,
+      "release": 139.15235762518873,
+      "detection": 0,
+      "stereo_link": 0,
+      "makeup": 2.16745193368956,
+      "mix": 1,
+      "level_in": 1
+    }
+  },
+  {
+    "uri": "http://calf.sourceforge.net/plugins/Deesser",
+    "name": "Calf De-Esser",
+    "enabled": true,
+    "params": {
+      "threshold": 0.1358418569811453,
+      "ratio": 3,
+      "f2_freq": 7466.369768624336,
+      "f2_q": 0.9594006315159334,
+      "f2_level": 3.9103352784892897,
+      "f1_freq": 3904.5915008470524,
+      "f1_level": 1,
+      "detection": 0,
+      "mode": 0,
+      "laxity": 15,
+      "sc_listen": 0,
+      "makeup": 1
+    }
+  }
+]

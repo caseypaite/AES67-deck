@@ -5,12 +5,16 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
 #include <atomic>
 #include <memory>
 #include <vector>
+#include <algorithm>
+#include <jack/ringbuffer.h>
 #include "audio/JackClient.h"
 #include "plugins/Lv2Host.h"
 #include "ipc/IpcClient.h"
+#include "ipc/json.hpp"
 #include "recorder/DiskWriter.h"
 
 using namespace aes67_deck;
@@ -40,6 +44,196 @@ struct ChannelState {
     std::vector<std::unique_ptr<plugins::PluginInstance>> insert_chain;
 };
 
+// Per-plugin in/out metering for whichever plugin editor the UI currently has
+// open (docs/fx-ui-design.md §6, the `fx` key on the metering message). The
+// UI announces its selection with an `fx_focus` command; the audio thread
+// captures the pre- and post-plugin peak for exactly that one slot and the
+// metering send-block rides the result out on the existing `metering` frame.
+// Focus ids: IPC thread writes, audio thread reads. Peaks: audio thread only,
+// same accumulate-then-decay scheme as ChannelState::current_peak_*.
+static std::atomic<int> g_fx_focus_channel{-1};
+static std::atomic<int> g_fx_focus_plugin{-1};
+static float g_fx_in_peak_l = 0.0f, g_fx_in_peak_r = 0.0f;
+static float g_fx_out_peak_l = 0.0f, g_fx_out_peak_r = 0.0f;
+
+// Real-time analyser for the focused plugin's *input* — a bank of Goertzel
+// detectors at log-spaced centre frequencies, fed sample-by-sample on the
+// audio thread and read out (dBFS, fast-rise / slow-fall smoothed) once per
+// RTA_WIN samples. Rendered behind the EQ curve in the UI. Audio thread only.
+static constexpr int RTA_BANDS = 31;
+static constexpr int RTA_WIN = 2048;
+static constexpr float RTA_F_LO = 30.0f, RTA_F_HI = 18000.0f;
+static float g_rta_coeff[RTA_BANDS];
+static float g_rta_s1[RTA_BANDS];
+static float g_rta_s2[RTA_BANDS];
+static float g_rta_mag[RTA_BANDS];   // last readout, dBFS
+static int   g_rta_count = 0;
+static bool  g_rta_ready = false;
+
+static void rta_init(double sample_rate) {
+    for (int k = 0; k < RTA_BANDS; ++k) {
+        float f = RTA_F_LO * std::pow(RTA_F_HI / RTA_F_LO, k / float(RTA_BANDS - 1));
+        double w = 2.0 * M_PI * f / sample_rate;
+        g_rta_coeff[k] = 2.0f * std::cos(w);
+        g_rta_s1[k] = g_rta_s2[k] = 0.0f;
+        g_rta_mag[k] = -120.0f;
+    }
+    g_rta_count = 0;
+    g_rta_ready = true;
+}
+
+// ── ITU-R BS.1770-4 loudness on the Master output (the `lufs` key on the
+// metering frame). K-weighting = a high-shelf pre-filter then an RLB
+// high-pass; coefficients below are the standard 48 kHz set (this rig runs
+// at 48 kHz). Mean-square of the K-weighted L+R is accumulated per ~100 ms
+// chunk; Momentary = last 400 ms, Short-term = last 3 s, Integrated = the
+// two-stage-gated mean over a rolling ring of 400 ms blocks. Audio thread
+// only; `g_lufs_reset` (IPC thread) requests an integrated restart.
+static constexpr double KW1_B0 = 1.53512485958697, KW1_B1 = -2.69169618940638, KW1_B2 = 1.19839281085285;
+static constexpr double KW1_A1 = -1.69065929318241, KW1_A2 = 0.73248077421585;
+static constexpr double KW2_B0 = 1.0, KW2_B1 = -2.0, KW2_B2 = 1.0;
+static constexpr double KW2_A1 = -1.99004745483398, KW2_A2 = 0.99007225036621;
+
+struct KwState { double s1x1{}, s1x2{}, s1y1{}, s1y2{}, s2x1{}, s2x2{}, s2y1{}, s2y2{}; };
+static inline double kweight(double x, KwState& s) {
+    double y1 = KW1_B0 * x + KW1_B1 * s.s1x1 + KW1_B2 * s.s1x2 - KW1_A1 * s.s1y1 - KW1_A2 * s.s1y2;
+    s.s1x2 = s.s1x1; s.s1x1 = x; s.s1y2 = s.s1y1; s.s1y1 = y1;
+    double y2 = KW2_B0 * y1 + KW2_B1 * s.s2x1 + KW2_B2 * s.s2x2 - KW2_A1 * s.s2y1 - KW2_A2 * s.s2y2;
+    s.s2x2 = s.s2x1; s.s2x1 = y1; s.s2y2 = s.s2y1; s.s2y1 = y2;
+    return y2;
+}
+
+static constexpr int    LUFS_CHUNK_MS = 100;
+static constexpr int    LUFS_ST_CHUNKS = 30;      // 3 s of short-term history
+static constexpr int    LUFS_BLOCK_RING = 3000;   // 400 ms blocks → 20 min rolling integrated
+static KwState g_kw_l, g_kw_r;
+static int     g_lufs_chunk_frames = 0;           // set in rta_init from sample rate
+static double  g_lufs_sq_accum = 0.0;
+static int     g_lufs_accum_n = 0;
+static double  g_lufs_chunks[LUFS_ST_CHUNKS];     // per-chunk (z_L+z_R) mean square, ring
+static int     g_lufs_chunk_pos = 0;
+static int     g_lufs_chunk_filled = 0;
+static double  g_lufs_blocks[LUFS_BLOCK_RING];    // per-400ms-block mean square, ring
+static int     g_lufs_block_pos = 0;
+static int     g_lufs_block_filled = 0;
+static int     g_lufs_chunks_in_block = 0;
+static double  g_lufs_block_accum = 0.0;
+static float   g_lufs_tp = 0.0f;                  // true-peak (approx), linear, decayed
+static std::atomic<bool> g_lufs_reset{false};
+
+static void lufs_init(double sample_rate) {
+    g_lufs_chunk_frames = std::max(1, int(sample_rate * LUFS_CHUNK_MS / 1000.0));
+    g_kw_l = KwState{}; g_kw_r = KwState{};
+    g_lufs_sq_accum = 0.0; g_lufs_accum_n = 0;
+    for (double& c : g_lufs_chunks) c = 0.0;
+    for (double& b : g_lufs_blocks) b = 0.0;
+    g_lufs_chunk_pos = g_lufs_chunk_filled = 0;
+    g_lufs_block_pos = g_lufs_block_filled = g_lufs_chunks_in_block = 0;
+    g_lufs_block_accum = 0.0;
+    g_lufs_tp = 0.0f;
+}
+
+// -0.691 dB offset + 10log10 of the summed K-weighted channel power.
+static inline float lufs_db(double meanSq) {
+    return meanSq > 1e-12 ? float(-0.691 + 10.0 * std::log10(meanSq)) : -120.0f;
+}
+
+// ── Master-bus analyser (the `master` key on the metering frame): a
+// log-spaced Goertzel spectrum of the Master output, L/R stereo correlation,
+// and a downsampled L/R scatter for the goniometer. Drives the mastering
+// panel shown when Master or Monitor is the selected channel. Audio thread
+// only, always running (Master is a single channel — cheap).
+static constexpr int MRTA_BANDS = 31;
+static constexpr int MRTA_WIN = 4096;   // ~85 ms → slower, steadier than the FX RTA
+static constexpr int GONIO_POINTS = 48;
+static float g_mrta_coeff[MRTA_BANDS];
+static float g_mrta_s1[MRTA_BANDS], g_mrta_s2[MRTA_BANDS];
+static float g_mrta_mag[MRTA_BANDS];
+static int   g_mrta_count = 0;
+static double g_corr_lr = 0.0, g_corr_ll = 0.0, g_corr_rr = 0.0;  // running sums over a window
+static int    g_corr_n = 0;
+static float  g_corr_val = 0.0f;    // smoothed correlation [-1, 1]
+static float  g_gonio[GONIO_POINTS * 2];  // interleaved L,R
+static int    g_gonio_pos = 0;
+static int    g_gonio_stride = 8, g_gonio_skip = 0;
+
+static void master_analyser_init(double sample_rate) {
+    for (int k = 0; k < MRTA_BANDS; ++k) {
+        float f = 30.0f * std::pow(18000.0f / 30.0f, k / float(MRTA_BANDS - 1));
+        g_mrta_coeff[k] = 2.0f * std::cos(2.0 * M_PI * f / sample_rate);
+        g_mrta_s1[k] = g_mrta_s2[k] = 0.0f;
+        g_mrta_mag[k] = -120.0f;
+    }
+    g_mrta_count = 0;
+    g_corr_lr = g_corr_ll = g_corr_rr = 0.0; g_corr_n = 0; g_corr_val = 0.0f;
+    for (float& g : g_gonio) g = 0.0f;
+    g_gonio_pos = g_gonio_skip = 0;
+    g_gonio_stride = std::max(1, int(sample_rate / 6000.0));  // ~6k scatter points/sec
+}
+
+// Every generic param key the UI sends (drive, blend, out, threshold, b1..b8,
+// etc.) mapped to the specific LV2 port symbol for each Calf plugin URI —
+// shared by the live set_plugin_param path and by add/load, which both need
+// to seed a freshly-instantiated plugin's initial parameter values.
+static std::string remap_param_symbol(const std::string& uri, const std::string& generic_key) {
+    std::string sym = generic_key;
+    if (uri == "http://calf.sourceforge.net/plugins/Saturator") {
+        if (sym == "out") sym = "level_out";
+    } else if (uri == "http://calf.sourceforge.net/plugins/Compressor") {
+        // exact matches for threshold, ratio, attack, release, makeup, mix
+    } else if (uri == "http://calf.sourceforge.net/plugins/Deesser") {
+        if (sym == "freq") sym = "f1_freq";
+        if (sym == "out") sym = "makeup";
+    } else if (uri == "http://calf.sourceforge.net/plugins/Equalizer8Band") {
+        if (sym == "b1") sym = "ls_level";
+        if (sym == "b2") sym = "p1_level";
+        if (sym == "b3") sym = "p2_level";
+        if (sym == "b4") sym = "p3_level";
+        if (sym == "b5") sym = "p4_level";
+        if (sym == "b6") sym = "hs_level";
+        // b7, b8 not used in 8Band? Actually 8Band has p1 to p4, ls, hs. That's 6 bands.
+    } else if (uri == "http://calf.sourceforge.net/plugins/VintageDelay") {
+        if (sym == "time_l") sym = "time_l";
+        if (sym == "time_r") sym = "time_r";
+        if (sym == "feedback") sym = "feedback";
+        if (sym == "mix") sym = "mix";
+        if (sym == "amount") sym = "amount";
+    } else if (uri == "http://calf.sourceforge.net/plugins/Reverb") {
+        if (sym == "decay") sym = "decay_time";
+        if (sym == "room_size") sym = "room_size";
+        if (sym == "damping") sym = "high_frq_damp";
+        if (sym == "dry_wet") sym = "amount";
+    } else if (uri == "http://calf.sourceforge.net/plugins/Limiter") {
+        if (sym == "limit") sym = "limit";
+        if (sym == "attack") sym = "attack";
+        if (sym == "release") sym = "release";
+        if (sym == "asc") sym = "asc";
+    }
+    return sym;
+}
+
+// Hard cap on plugins per rack. Matched by ChannelState::insert_chain's
+// reserve() below so insert/erase during normal operation never triggers a
+// vector reallocation on the audio thread (not RT-safe) — enforced again,
+// defensively, at the point Add commands are applied in case something ever
+// enqueues past capacity.
+constexpr size_t MAX_PLUGINS_PER_CHANNEL = 16;
+
+// A plugin-chain mutation, queued from the IPC thread and applied only by
+// the audio thread (which owns insert_chain) — see the drain loop at the
+// top of the process callback. Trivially copyable so it can move through a
+// lock-free jack_ringbuffer_t as raw bytes, the same mechanism IpcClient
+// already uses for its own tx queue.
+enum class PluginCmdType { Add, Remove, Reorder, Clear };
+
+struct PluginCmd {
+    PluginCmdType type;
+    int channel_id;
+    int index;   // Add: insert position (clamped to chain bounds when applied); Remove: index; Reorder: from-index
+    int index2;  // Reorder: to-index
+    plugins::PluginInstance* instance; // Add only — ownership transfers to whichever thread applies the command
+};
+
 // Push-to-talk state. Atomics because this is written from the IPC thread
 // and read every audio callback: unlike the bulk per-channel state, a stuck
 // or delayed read here has a real safety consequence (the operator's mic
@@ -47,10 +241,13 @@ struct ChannelState {
 // correctness guarantee the rest of ChannelState doesn't have.
 struct TalkbackState {
     std::atomic<bool> ptt_active{false};
-    // Master or one of the Aux buses only — the Monitor bus is never a
-    // valid destination (enforced again, structurally, in the audio
-    // callback below, not just at the IPC boundary).
-    std::atomic<int> dest_bus_id{MASTER_ID};
+    // Bitmask over Master + the 8 Aux buses — bit 0 is Master (100), bit i
+    // (1..NUM_AUX) is Aux (100+i). Multiple bits may be set at once so
+    // talkback can fan out to several buses simultaneously; the Monitor bus
+    // is never a valid destination (enforced again, structurally, in the
+    // audio callback below, not just at the IPC boundary) since it has no
+    // bit position here at all.
+    std::atomic<uint32_t> dest_bus_mask{1u}; // bit 0 (Master) set by default
 };
 
 int main(int argc, char** argv) {
@@ -74,7 +271,36 @@ int main(int argc, char** argv) {
     for (int b = 0; b < NUM_AUX; b++) channels[AUX_BASE + b] = ChannelState();
     channels[MONITOR_ID] = ChannelState();
 
+    // Pre-reserve so Add/Remove/Reorder (applied on the audio thread, see
+    // the process callback's drain loop) never trigger a vector
+    // reallocation mid-stream.
+    for (auto& pair : channels) pair.second.insert_chain.reserve(MAX_PLUGINS_PER_CHANNEL);
+
     TalkbackState talkback;
+
+    // Plugin-chain mutations flow IPC thread -> audio thread via this
+    // lock-free ring (mirrors IpcClient's own tx_buffer_ pattern); removed/
+    // replaced instances flow audio thread -> this cleanup thread via the
+    // trash ring, since destroying an LV2 plugin instance is not RT-safe
+    // and must never happen on the audio thread.
+    jack_ringbuffer_t* plugin_cmd_ring = jack_ringbuffer_create(64 * sizeof(PluginCmd));
+    jack_ringbuffer_t* plugin_trash_ring = jack_ringbuffer_create(256 * sizeof(void*));
+    if (!plugin_cmd_ring || !plugin_trash_ring) {
+        std::cerr << "Failed to allocate plugin command/trash ring buffers!" << std::endl;
+        return 1;
+    }
+
+    std::thread plugin_trash_thread([plugin_trash_ring]() {
+        while (true) {
+            while (jack_ringbuffer_read_space(plugin_trash_ring) >= sizeof(void*)) {
+                void* raw = nullptr;
+                jack_ringbuffer_read(plugin_trash_ring, reinterpret_cast<char*>(&raw), sizeof(raw));
+                delete static_cast<plugins::PluginInstance*>(raw);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+    plugin_trash_thread.detach();
 
     // Channels, buses, master, and monitor all start with an empty effect
     // rack. Users add plugins explicitly from the UI.
@@ -82,6 +308,44 @@ int main(int argc, char** argv) {
 
     double sr = jack.get_sample_rate();
     if (sr == 0) sr = 48000.0;
+    rta_init(sr);
+    lufs_init(sr);
+    master_analyser_init(sr);
+
+    // Full system LV2 plugin catalog for the Rack Manager's plugin browser
+    // — the UI groups these into "Live" (reportsLatency false) and
+    // "Studio" (true) sections. Static port-metadata scan only, no
+    // instantiate/run — see Lv2Host::get_all_plugins and
+    // PluginInfo::reports_latency for why (a full scan that ran every
+    // declared-latency plugin segfaulted inside lsp-plugins-lv2.so).
+    // Sent once here; queued in the IPC ring buffer regardless of whether
+    // the server has connected yet.
+    {
+        std::vector<plugins::PluginInfo> catalog = lv2_host.get_all_plugins();
+        nlohmann::json catalog_json;
+        catalog_json["type"] = "plugin_list";
+        catalog_json["plugins"] = nlohmann::json::array();
+        for (const auto& info : catalog) {
+            nlohmann::json pj;
+            pj["uri"] = info.uri;
+            pj["name"] = info.name;
+            pj["author"] = info.author;
+            pj["reportsLatency"] = info.reports_latency;
+            pj["controlPorts"] = nlohmann::json::array();
+            for (const auto& cp : info.control_ports) {
+                pj["controlPorts"].push_back({
+                    {"symbol", cp.symbol},
+                    {"name", cp.name},
+                    {"min", cp.min},
+                    {"max", cp.max},
+                    {"default", cp.default_value}
+                });
+            }
+            catalog_json["plugins"].push_back(pj);
+        }
+        std::cout << "Scanned " << catalog.size() << " LV2 plugins for the Rack Manager catalog." << std::endl;
+        ipc.send_multichannel_metering(catalog_json.dump());
+    }
 
     for (auto& pair : channels) {
         for (const auto& uri : default_rack) {
@@ -133,19 +397,30 @@ int main(int argc, char** argv) {
                 channels[channel_id].aux_sends[bus_id] = value; std::cout << "Set AUX SEND CH " << channel_id << " BUS " << bus_id << " to " << value << std::endl;
             }
         }
-        if (type == "start_record") {
+        if (type == "fx_focus") {
+            // bus_id carries the plugin index here (see IpcClient); -1 == the
+            // UI has no plugin editor open.
+            g_fx_focus_channel.store(channel_id, std::memory_order_relaxed);
+            g_fx_focus_plugin.store(bus_id, std::memory_order_relaxed);
+        } else if (type == "lufs_reset") {
+            g_lufs_reset.store(true, std::memory_order_relaxed);
+        } else if (type == "start_record") {
             recorder.start_recording("/tmp/aes67_deck_master.wav", 2, jack.get_sample_rate());
         } else if (type == "stop_record") {
             recorder.stop_recording();
         } else if (type == "set_talkback_active") {
             talkback.ptt_active = (value > 0.5f);
         } else if (type == "set_talkback_dest") {
-            bool valid = (bus_id == MASTER_ID) || (bus_id >= AUX_BASE && bus_id < AUX_BASE + NUM_AUX);
-            if (valid) {
-                talkback.dest_bus_id = bus_id;
-            } else {
-                std::cerr << "Rejected talkback destination bus " << bus_id << " (Monitor is never a valid target)" << std::endl;
+            // bus_id carries a bitmask here (bit 0 = Master, bit i = Aux i),
+            // not a single bus id — see TalkbackState::dest_bus_mask. Clamp
+            // to the valid bit range so a malformed/future value can never
+            // set a bit for the (nonexistent) Monitor position or beyond.
+            constexpr uint32_t VALID_MASK = (1u << (NUM_AUX + 1)) - 1; // bits 0..NUM_AUX
+            uint32_t mask = static_cast<uint32_t>(bus_id) & VALID_MASK;
+            if (mask != static_cast<uint32_t>(bus_id)) {
+                std::cerr << "Talkback destination mask " << bus_id << " had bits outside Master/Aux range, clamped to " << mask << std::endl;
             }
+            talkback.dest_bus_mask = mask;
         }
     });
 
@@ -156,43 +431,85 @@ int main(int argc, char** argv) {
                 if (type == "set_plugin_bypass") {
                     plugin->bypassed = (value > 0.5f);
                 } else if (type == "set_plugin_param") {
-                    std::string sym = param_id;
-                    std::string uri = plugin->get_uri();
+                    plugin->set_control_value_by_symbol(remap_param_symbol(plugin->get_uri(), param_id), value);
+                }
+            }
+        }
+    });
 
-                    if (uri == "http://calf.sourceforge.net/plugins/Saturator") {
-                        if (sym == "out") sym = "level_out";
-                    } else if (uri == "http://calf.sourceforge.net/plugins/Compressor") {
-                        // exact matches for threshold, ratio, attack, release, makeup, mix
-                    } else if (uri == "http://calf.sourceforge.net/plugins/Deesser") {
-                        if (sym == "freq") sym = "f1_freq";
-                        if (sym == "out") sym = "makeup";
-                    } else if (uri == "http://calf.sourceforge.net/plugins/Equalizer8Band") {
-                        if (sym == "b1") sym = "ls_level";
-                        if (sym == "b2") sym = "p1_level";
-                        if (sym == "b3") sym = "p2_level";
-                        if (sym == "b4") sym = "p3_level";
-                        if (sym == "b5") sym = "p4_level";
-                        if (sym == "b6") sym = "hs_level";
-                        // b7, b8 not used in 8Band? Actually 8Band has p1 to p4, ls, hs. That's 6 bands.
-                    } else if (uri == "http://calf.sourceforge.net/plugins/VintageDelay") {
-                        if (sym == "time_l") sym = "time_l";
-                        if (sym == "time_r") sym = "time_r";
-                        if (sym == "feedback") sym = "feedback";
-                        if (sym == "mix") sym = "mix";
-                        if (sym == "amount") sym = "amount";
-                    } else if (uri == "http://calf.sourceforge.net/plugins/Reverb") {
-                        if (sym == "decay") sym = "decay_time";
-                        if (sym == "room_size") sym = "room_size";
-                        if (sym == "damping") sym = "high_frq_damp";
-                        if (sym == "dry_wet") sym = "amount";
-                    } else if (uri == "http://calf.sourceforge.net/plugins/Limiter") {
-                        if (sym == "limit") sym = "limit";
-                        if (sym == "attack") sym = "attack";
-                        if (sym == "release") sym = "release";
-                        if (sym == "asc") sym = "asc";
+    // Plugin-chain structure changes (add/remove/reorder/bulk-load) — see
+    // PluginCmd's comment. LV2 instantiation (and seeding a fresh
+    // instance's initial params/enabled state, safe here since nothing
+    // else can see it yet) happens on this thread; the actual insert_chain
+    // mutation is deferred to the audio thread via plugin_cmd_ring.
+    ipc.set_plugin_manage_callback([&channels, &lv2_host, plugin_cmd_ring, sr](const nlohmann::json& j) {
+        std::string type = j.value("type", "");
+        int channel_id = j.value("channel", -1);
+        if (channels.find(channel_id) == channels.end()) return;
+
+        auto enqueue = [plugin_cmd_ring](const PluginCmd& cmd) {
+            if (jack_ringbuffer_write_space(plugin_cmd_ring) >= sizeof(PluginCmd)) {
+                jack_ringbuffer_write(plugin_cmd_ring, reinterpret_cast<const char*>(&cmd), sizeof(PluginCmd));
+            } else {
+                std::cerr << "Plugin command ring full, dropping a plugin-chain command" << std::endl;
+            }
+        };
+
+        auto seed_params = [](plugins::PluginInstance* inst, const std::string& uri, const nlohmann::json& params) {
+            if (!params.is_object()) return;
+            for (auto& [key, val] : params.items()) {
+                if (val.is_number()) {
+                    inst->set_control_value_by_symbol(remap_param_symbol(uri, key), val.get<float>());
+                }
+            }
+        };
+
+        if (type == "add_plugin") {
+            std::string uri = j.value("uri", "");
+            auto inst = lv2_host.instantiate_plugin(uri, sr);
+            if (!inst) { std::cerr << "add_plugin: failed to instantiate " << uri << std::endl; return; }
+            inst->bypassed = !j.value("enabled", true);
+            seed_params(inst.get(), uri, j.value("params", nlohmann::json::object()));
+            // No index given (or a huge one) means "append" — the audio
+            // thread clamps this to chain.size() when it applies the
+            // command, so this thread never needs to read that size itself.
+            int index = j.value("index", INT32_MAX);
+            enqueue(PluginCmd{PluginCmdType::Add, channel_id, index, 0, inst.release()});
+        } else if (type == "remove_plugin") {
+            int idx = j.value("pluginIndex", -1);
+            enqueue(PluginCmd{PluginCmdType::Remove, channel_id, idx, 0, nullptr});
+        } else if (type == "reorder_plugin") {
+            int from = j.value("fromIndex", -1);
+            int to = j.value("toIndex", -1);
+            enqueue(PluginCmd{PluginCmdType::Reorder, channel_id, from, to, nullptr});
+        } else if (type == "replace_plugin") {
+            int idx = j.value("pluginIndex", -1);
+            std::string uri = j.value("uri", "");
+            auto inst = lv2_host.instantiate_plugin(uri, sr);
+            if (!inst) { std::cerr << "replace_plugin: failed to instantiate " << uri << std::endl; return; }
+            inst->bypassed = false;
+            seed_params(inst.get(), uri, j.value("params", nlohmann::json::object()));
+            // Enqueued as Remove immediately followed by Add at the same
+            // index — both land in the same drain pass on the audio thread
+            // (nothing else can interleave between them, IPC is the only
+            // producer), so this is effectively atomic from the outside.
+            enqueue(PluginCmd{PluginCmdType::Remove, channel_id, idx, 0, nullptr});
+            enqueue(PluginCmd{PluginCmdType::Add, channel_id, idx, 0, inst.release()});
+        } else if (type == "load_rack") {
+            enqueue(PluginCmd{PluginCmdType::Clear, channel_id, 0, 0, nullptr});
+            if (j.contains("plugins") && j["plugins"].is_array()) {
+                int next_index = 0;
+                for (auto& pj : j["plugins"]) {
+                    std::string uri = pj.value("uri", "");
+                    auto inst = lv2_host.instantiate_plugin(uri, sr);
+                    if (!inst) {
+                        std::cerr << "load_rack: failed to instantiate " << uri << " (skipped)" << std::endl;
+                        continue;
                     }
-
-                    plugin->set_control_value_by_symbol(sym, value);
+                    inst->bypassed = !pj.value("enabled", true);
+                    seed_params(inst.get(), uri, pj.value("params", nlohmann::json::object()));
+                    enqueue(PluginCmd{PluginCmdType::Add, channel_id, next_index, 0, inst.release()});
+                    next_index++;
                 }
             }
         }
@@ -212,6 +529,60 @@ int main(int argc, char** argv) {
         if (inputs.size() < static_cast<size_t>(2 * NUM_CHANNELS + 2) ||
             outputs.size() < static_cast<size_t>(2 + 2 * NUM_AUX + 2)) return;
         if (nframes > 8192) return;
+
+        // Apply any queued plugin-chain mutations before processing any
+        // channel this cycle — insert_chain is only ever touched here, on
+        // the audio thread, which is what makes Add/Remove/Reorder RT-safe
+        // (bounded insert/erase within the reserved capacity below, no
+        // allocation; removed instances are handed off to plugin_trash_ring
+        // rather than destroyed here).
+        while (jack_ringbuffer_read_space(plugin_cmd_ring) >= sizeof(PluginCmd)) {
+            PluginCmd cmd;
+            jack_ringbuffer_read(plugin_cmd_ring, reinterpret_cast<char*>(&cmd), sizeof(PluginCmd));
+
+            auto trash = [plugin_trash_ring](plugins::PluginInstance* raw) {
+                if (!raw) return;
+                if (jack_ringbuffer_write_space(plugin_trash_ring) >= sizeof(void*)) {
+                    jack_ringbuffer_write(plugin_trash_ring, reinterpret_cast<const char*>(&raw), sizeof(void*));
+                } else {
+                    // Trash ring full (should never happen in practice) —
+                    // leak rather than call a non-RT-safe destructor here.
+                    std::cerr << "Plugin trash ring full, leaking an instance" << std::endl;
+                }
+            };
+
+            auto it = channels.find(cmd.channel_id);
+            if (it == channels.end()) {
+                if (cmd.type == PluginCmdType::Add) trash(cmd.instance);
+                continue;
+            }
+            auto& chain = it->second.insert_chain;
+
+            if (cmd.type == PluginCmdType::Add) {
+                if (chain.size() >= MAX_PLUGINS_PER_CHANNEL) {
+                    trash(cmd.instance);
+                } else {
+                    int pos = std::clamp(cmd.index, 0, static_cast<int>(chain.size()));
+                    chain.insert(chain.begin() + pos, std::unique_ptr<plugins::PluginInstance>(cmd.instance));
+                }
+            } else if (cmd.type == PluginCmdType::Remove) {
+                if (cmd.index >= 0 && cmd.index < static_cast<int>(chain.size())) {
+                    trash(chain[cmd.index].release());
+                    chain.erase(chain.begin() + cmd.index);
+                }
+            } else if (cmd.type == PluginCmdType::Reorder) {
+                int from = cmd.index, to = cmd.index2;
+                if (from >= 0 && from < static_cast<int>(chain.size()) &&
+                    to >= 0 && to < static_cast<int>(chain.size()) && from != to) {
+                    auto moved = std::move(chain[from]);
+                    chain.erase(chain.begin() + from);
+                    chain.insert(chain.begin() + to, std::move(moved));
+                }
+            } else if (cmd.type == PluginCmdType::Clear) {
+                for (auto& p : chain) trash(p.release());
+                chain.clear();
+            }
+        }
 
         float* out_L = jack.get_buffer(outputs[0], nframes);
         float* out_R = jack.get_buffer(outputs[1], nframes);
@@ -238,6 +609,49 @@ int main(int argc, char** argv) {
             if (channels[i].solo) { any_solo = true; break; }
         }
 
+        // Per-plugin in/out metering for the UI's currently-open editor.
+        const int fx_ch = g_fx_focus_channel.load(std::memory_order_relaxed);
+        const int fx_pi = g_fx_focus_plugin.load(std::memory_order_relaxed);
+        auto meter_fx = [&](int chan, int plugin_idx, bool is_input,
+                            const float* l, const float* r) {
+            if (plugin_idx != fx_pi || chan != fx_ch) return;
+            float pl = 0.0f, pr = 0.0f;
+            for (jack_nframes_t s = 0; s < nframes; s++) {
+                float a = std::fabs(l[s]); if (a > pl) pl = a;
+                float b = std::fabs(r[s]); if (b > pr) pr = b;
+            }
+            if (is_input) {
+                g_fx_in_peak_l = std::max(g_fx_in_peak_l, pl);
+                g_fx_in_peak_r = std::max(g_fx_in_peak_r, pr);
+
+                // feed the RTA off the mono sum of this plugin's input
+                for (jack_nframes_t s = 0; s < nframes; s++) {
+                    float x = 0.5f * (l[s] + r[s]);
+                    for (int k = 0; k < RTA_BANDS; ++k) {
+                        float sn = x + g_rta_coeff[k] * g_rta_s1[k] - g_rta_s2[k];
+                        g_rta_s2[k] = g_rta_s1[k];
+                        g_rta_s1[k] = sn;
+                    }
+                }
+                g_rta_count += nframes;
+                if (g_rta_count >= RTA_WIN) {
+                    for (int k = 0; k < RTA_BANDS; ++k) {
+                        float power = g_rta_s1[k] * g_rta_s1[k] + g_rta_s2[k] * g_rta_s2[k]
+                                    - g_rta_coeff[k] * g_rta_s1[k] * g_rta_s2[k];
+                        float mag = std::sqrt(std::max(power, 0.0f)) * (2.0f / g_rta_count);
+                        float db = mag > 1e-6f ? 20.0f * std::log10(mag) : -120.0f;
+                        // fast rise, slow fall
+                        g_rta_mag[k] = db > g_rta_mag[k] ? db : g_rta_mag[k] * 0.65f + db * 0.35f;
+                        g_rta_s1[k] = g_rta_s2[k] = 0.0f;
+                    }
+                    g_rta_count = 0;
+                }
+            } else {
+                g_fx_out_peak_l = std::max(g_fx_out_peak_l, pl);
+                g_fx_out_peak_r = std::max(g_fx_out_peak_r, pr);
+            }
+        };
+
         for (int i = 1; i <= NUM_CHANNELS; i++) {
             float* in_buf_L = jack.get_buffer(inputs[(i - 1) * 2], nframes);
             float* in_buf_R = jack.get_buffer(inputs[(i - 1) * 2 + 1], nframes);
@@ -250,9 +664,15 @@ int main(int argc, char** argv) {
             std::memcpy(tmp_R.data(), in_buf_R, sizeof(float) * nframes);
 
             // 2. Process LV2 Insert Chain
+            int p_i = 0;
             for (auto& plugin_ptr : st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
-                if (plugin->bypassed) continue;
+                meter_fx(i, p_i, true, tmp_L.data(), tmp_R.data());
+                if (plugin->bypassed) {
+                    meter_fx(i, p_i, false, tmp_L.data(), tmp_R.data());
+                    p_i++;
+                    continue;
+                }
                 int in_l = plugin->get_audio_input_port(0);
                 int in_r = plugin->get_audio_input_port(1);
                 if (in_r == -1) in_r = in_l;
@@ -271,6 +691,8 @@ int main(int argc, char** argv) {
                 // Copy output back to input buffers for the next plugin in chain
                 std::memcpy(tmp_L.data(), tmp_out_L.data(), sizeof(float) * nframes);
                 std::memcpy(tmp_R.data(), tmp_out_R.data(), sizeof(float) * nframes);
+                meter_fx(i, p_i, false, tmp_L.data(), tmp_R.data());
+                p_i++;
             }
 
             // 3. Apply Fader, Mute, Pan
@@ -318,30 +740,33 @@ int main(int argc, char** argv) {
             st.current_peak_r = std::max(st.current_peak_r, peak_r);
         }
 
-        // Talkback: only while pressed, summed pre-fader/pan into whichever
-        // bus buffer was selected (Master or an Aux bus), so it rides
-        // through that bus's own fader/pan/inserts like any other source.
-        // Monitor is structurally excluded — it's neither MASTER_ID nor in
-        // the Aux range, so there is no code path that can route talkback
-        // there, regardless of what a client requests.
+        // Talkback: only while pressed, summed pre-fader/pan into every bus
+        // buffer selected in the destination mask (Master and/or any Aux
+        // buses), so it rides through each bus's own fader/pan/inserts like
+        // any other source. Monitor is structurally excluded — the mask has
+        // no bit position for it, so there is no code path that can route
+        // talkback there, regardless of what a client requests.
         if (talkback.ptt_active.load(std::memory_order_relaxed)) {
             float* tb_in_L = jack.get_buffer(inputs[TALKBACK_PORT_L], nframes);
             float* tb_in_R = jack.get_buffer(inputs[TALKBACK_PORT_R], nframes);
-            int dest = talkback.dest_bus_id.load(std::memory_order_relaxed);
+            uint32_t dest_mask = talkback.dest_bus_mask.load(std::memory_order_relaxed);
 
-            float* dest_L = nullptr;
-            float* dest_R = nullptr;
-            if (dest == MASTER_ID) {
-                dest_L = out_L; dest_R = out_R;
-            } else if (dest >= AUX_BASE && dest < AUX_BASE + NUM_AUX) {
-                dest_L = bus_out_L[dest - AUX_BASE];
-                dest_R = bus_out_R[dest - AUX_BASE];
-            }
-
-            if (tb_in_L && tb_in_R && dest_L && dest_R) {
-                for (jack_nframes_t s = 0; s < nframes; s++) {
-                    dest_L[s] += tb_in_L[s];
-                    dest_R[s] += tb_in_R[s];
+            if (tb_in_L && tb_in_R && dest_mask != 0) {
+                if (dest_mask & 1u) {
+                    for (jack_nframes_t s = 0; s < nframes; s++) {
+                        out_L[s] += tb_in_L[s];
+                        out_R[s] += tb_in_R[s];
+                    }
+                }
+                for (int b = 0; b < NUM_AUX; b++) {
+                    if (!(dest_mask & (1u << (b + 1)))) continue;
+                    float* dest_L = bus_out_L[b];
+                    float* dest_R = bus_out_R[b];
+                    if (!dest_L || !dest_R) continue;
+                    for (jack_nframes_t s = 0; s < nframes; s++) {
+                        dest_L[s] += tb_in_L[s];
+                        dest_R[s] += tb_in_R[s];
+                    }
                 }
             }
         }
@@ -357,9 +782,15 @@ int main(int argc, char** argv) {
             std::memcpy(tmp_L.data(), buf_L, sizeof(float) * nframes);
             std::memcpy(tmp_R.data(), buf_R, sizeof(float) * nframes);
 
+            int b_p_i = 0;
             for (auto& plugin_ptr : b_st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
-                if (plugin->bypassed) continue;
+                meter_fx(b_id, b_p_i, true, tmp_L.data(), tmp_R.data());
+                if (plugin->bypassed) {
+                    meter_fx(b_id, b_p_i, false, tmp_L.data(), tmp_R.data());
+                    b_p_i++;
+                    continue;
+                }
                 int in_l = plugin->get_audio_input_port(0);
                 int in_r = plugin->get_audio_input_port(1);
                 if (in_r == -1) in_r = in_l;
@@ -376,6 +807,8 @@ int main(int argc, char** argv) {
 
                 std::memcpy(tmp_L.data(), tmp_out_L.data(), sizeof(float) * nframes);
                 std::memcpy(tmp_R.data(), tmp_out_R.data(), sizeof(float) * nframes);
+                meter_fx(b_id, b_p_i, false, tmp_L.data(), tmp_R.data());
+                b_p_i++;
             }
 
             float b_gain = b_st.mute ? 0.0f : (b_st.fader * 2.0f);
@@ -409,9 +842,15 @@ int main(int argc, char** argv) {
             std::memcpy(tmp_L.data(), monitor_L, sizeof(float) * nframes);
             std::memcpy(tmp_R.data(), monitor_R, sizeof(float) * nframes);
 
+            int m_p_i = 0;
             for (auto& plugin_ptr : m_st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
-                if (plugin->bypassed) continue;
+                meter_fx(MONITOR_ID, m_p_i, true, tmp_L.data(), tmp_R.data());
+                if (plugin->bypassed) {
+                    meter_fx(MONITOR_ID, m_p_i, false, tmp_L.data(), tmp_R.data());
+                    m_p_i++;
+                    continue;
+                }
                 int in_l = plugin->get_audio_input_port(0);
                 int in_r = plugin->get_audio_input_port(1);
                 if (in_r == -1) in_r = in_l;
@@ -428,6 +867,8 @@ int main(int argc, char** argv) {
 
                 std::memcpy(tmp_L.data(), tmp_out_L.data(), sizeof(float) * nframes);
                 std::memcpy(tmp_R.data(), tmp_out_R.data(), sizeof(float) * nframes);
+                meter_fx(MONITOR_ID, m_p_i, false, tmp_L.data(), tmp_R.data());
+                m_p_i++;
             }
 
             float m_gain = m_st.mute ? 0.0f : (m_st.fader * 2.0f);
@@ -456,6 +897,79 @@ int main(int argc, char** argv) {
         std::vector<float*> out_bufs = {out_L, out_R};
         recorder.write_audio(out_bufs, nframes);
 
+        // ── BS.1770 loudness on the final Master mix ──
+        if (g_lufs_reset.exchange(false, std::memory_order_relaxed)) {
+            for (double& b : g_lufs_blocks) b = 0.0;
+            g_lufs_block_pos = g_lufs_block_filled = g_lufs_chunks_in_block = 0;
+            g_lufs_block_accum = 0.0;
+        }
+        for (jack_nframes_t s = 0; s < nframes; s++) {
+            float l = out_L[s], r = out_R[s];
+            double kl = kweight(l, g_kw_l);
+            double kr = kweight(r, g_kw_r);
+            g_lufs_sq_accum += kl * kl + kr * kr;
+            float ap = std::max(std::fabs(l), std::fabs(r));
+            if (s > 0) {  // cheap 2x-oversample true-peak estimate
+                ap = std::max(ap, 0.5f * (std::fabs(l) + std::fabs(out_L[s - 1])));
+                ap = std::max(ap, 0.5f * (std::fabs(r) + std::fabs(out_R[s - 1])));
+            }
+            if (ap > g_lufs_tp) g_lufs_tp = ap;
+
+            // Master analyser: Goertzel spectrum + correlation + scatter
+            for (int k = 0; k < MRTA_BANDS; ++k) {
+                float sn = l + r + g_mrta_coeff[k] * g_mrta_s1[k] - g_mrta_s2[k];
+                g_mrta_s2[k] = g_mrta_s1[k];
+                g_mrta_s1[k] = sn;
+            }
+            g_corr_lr += double(l) * r;
+            g_corr_ll += double(l) * l;
+            g_corr_rr += double(r) * r;
+            g_corr_n++;
+            if (--g_gonio_skip <= 0) {
+                g_gonio[g_gonio_pos * 2] = l;
+                g_gonio[g_gonio_pos * 2 + 1] = r;
+                g_gonio_pos = (g_gonio_pos + 1) % GONIO_POINTS;
+                g_gonio_skip = g_gonio_stride;
+            }
+        }
+        g_mrta_count += nframes;
+        if (g_mrta_count >= MRTA_WIN) {
+            for (int k = 0; k < MRTA_BANDS; ++k) {
+                float p = g_mrta_s1[k] * g_mrta_s1[k] + g_mrta_s2[k] * g_mrta_s2[k]
+                        - g_mrta_coeff[k] * g_mrta_s1[k] * g_mrta_s2[k];
+                float mag = std::sqrt(std::max(p, 0.0f)) * (2.0f / g_mrta_count);
+                float db = mag > 1e-6f ? 20.0f * std::log10(mag) : -120.0f;
+                g_mrta_mag[k] = db > g_mrta_mag[k] ? db : g_mrta_mag[k] * 0.7f + db * 0.3f;
+                g_mrta_s1[k] = g_mrta_s2[k] = 0.0f;
+            }
+            g_mrta_count = 0;
+        }
+        if (g_corr_n >= g_lufs_chunk_frames) {
+            double denom = std::sqrt(g_corr_ll * g_corr_rr);
+            float c = denom > 1e-12 ? float(g_corr_lr / denom) : 0.0f;
+            g_corr_val = g_corr_val * 0.6f + c * 0.4f;
+            g_corr_lr = g_corr_ll = g_corr_rr = 0.0; g_corr_n = 0;
+        }
+
+        g_lufs_accum_n += nframes;
+        if (g_lufs_accum_n >= g_lufs_chunk_frames) {
+            double chunkMs = g_lufs_sq_accum / g_lufs_accum_n;   // (z_L + z_R) mean square
+            g_lufs_chunks[g_lufs_chunk_pos] = chunkMs;
+            g_lufs_chunk_pos = (g_lufs_chunk_pos + 1) % LUFS_ST_CHUNKS;
+            if (g_lufs_chunk_filled < LUFS_ST_CHUNKS) g_lufs_chunk_filled++;
+            g_lufs_sq_accum = 0.0; g_lufs_accum_n = 0;
+
+            // every 4 chunks (~400 ms) close an integrated block
+            g_lufs_block_accum += chunkMs;
+            if (++g_lufs_chunks_in_block >= 4) {
+                g_lufs_blocks[g_lufs_block_pos] = g_lufs_block_accum / 4.0;
+                g_lufs_block_pos = (g_lufs_block_pos + 1) % LUFS_BLOCK_RING;
+                if (g_lufs_block_filled < LUFS_BLOCK_RING) g_lufs_block_filled++;
+                g_lufs_block_accum = 0.0;
+                g_lufs_chunks_in_block = 0;
+            }
+        }
+
         frame_counter++;
         if (frame_counter > 2) {
             int offset = snprintf(meter_json.data(), meter_json.size(), "{\"type\":\"metering\",\"channels\":{");
@@ -479,7 +993,83 @@ int main(int argc, char** argv) {
                 pair.second.current_peak_r *= decay;
                 first = false;
             }
-            snprintf(meter_json.data() + offset, meter_json.size() - offset, "}}");
+            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+
+            // Per-plugin in/out for the editor the UI has open (fx_focus).
+            const int fc = g_fx_focus_channel.load(std::memory_order_relaxed);
+            const int fp = g_fx_focus_plugin.load(std::memory_order_relaxed);
+            if (fc >= 0 && fp >= 0) {
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    ",\"fx\":{\"channel\":%d,\"pluginIndex\":%d,\"inL\":%.1f,\"inR\":%.1f,\"outL\":%.1f,\"outR\":%.1f,\"rta\":[",
+                    fc, fp,
+                    calc_db(g_fx_in_peak_l), calc_db(g_fx_in_peak_r),
+                    calc_db(g_fx_out_peak_l), calc_db(g_fx_out_peak_r));
+                for (int k = 0; k < RTA_BANDS; ++k) {
+                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                        "%s%.1f", k ? "," : "", g_rta_mag[k]);
+                }
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]}");
+            }
+            g_fx_in_peak_l *= decay;  g_fx_in_peak_r *= decay;
+            g_fx_out_peak_l *= decay; g_fx_out_peak_r *= decay;
+
+            // ── Master loudness (BS.1770): momentary / short-term / integrated ──
+            {
+                auto meanOfLast = [](const double* ring, int filled, int pos, int n) {
+                    n = std::min(n, filled);
+                    if (n <= 0) return 0.0;
+                    double sum = 0.0;
+                    for (int i = 0; i < n; i++) {
+                        int idx = (pos - 1 - i + LUFS_ST_CHUNKS * 4) % LUFS_ST_CHUNKS;
+                        sum += ring[idx];
+                    }
+                    return sum / n;
+                };
+                float m = lufs_db(meanOfLast(g_lufs_chunks, g_lufs_chunk_filled, g_lufs_chunk_pos, 4));
+                float st = lufs_db(meanOfLast(g_lufs_chunks, g_lufs_chunk_filled, g_lufs_chunk_pos, LUFS_ST_CHUNKS));
+
+                // Integrated: two-stage gate over the 400 ms block ring.
+                float integ = -120.0f;
+                if (g_lufs_block_filled > 0) {
+                    const double absGateMs = std::pow(10.0, (-70.0 + 0.691) / 10.0);
+                    double sum1 = 0.0; int n1 = 0;
+                    for (int i = 0; i < g_lufs_block_filled; i++) {
+                        double b = g_lufs_blocks[i];
+                        if (b > absGateMs) { sum1 += b; n1++; }
+                    }
+                    if (n1 > 0) {
+                        double relGateMs = std::pow(10.0, ((-0.691 + 10.0 * std::log10(sum1 / n1)) - 10.0 + 0.691) / 10.0);
+                        double sum2 = 0.0; int n2 = 0;
+                        for (int i = 0; i < g_lufs_block_filled; i++) {
+                            double b = g_lufs_blocks[i];
+                            if (b > absGateMs && b > relGateMs) { sum2 += b; n2++; }
+                        }
+                        if (n2 > 0) integ = lufs_db(sum2 / n2);
+                    }
+                }
+                float tp = g_lufs_tp > 1e-6f ? 20.0f * std::log10(g_lufs_tp) : -120.0f;
+                g_lufs_tp *= 0.92f;  // slow decay so a transient peak lingers
+
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    ",\"lufs\":{\"m\":%.1f,\"s\":%.1f,\"i\":%.1f,\"tp\":%.1f}", m, st, integ, tp);
+            }
+
+            // ── Master analyser: spectrum, correlation, goniometer scatter ──
+            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                ",\"master\":{\"corr\":%.2f,\"rta\":[", g_corr_val);
+            for (int k = 0; k < MRTA_BANDS; ++k) {
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    "%s%.1f", k ? "," : "", g_mrta_mag[k]);
+            }
+            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "],\"gonio\":[");
+            for (int i = 0; i < GONIO_POINTS; ++i) {
+                int idx = (g_gonio_pos + i) % GONIO_POINTS;
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    "%s%.3f,%.3f", i ? "," : "", g_gonio[idx * 2], g_gonio[idx * 2 + 1]);
+            }
+            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]}");
+
+            snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 
             ipc.send_multichannel_metering(meter_json.data());
             frame_counter = 0;

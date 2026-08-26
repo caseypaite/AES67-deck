@@ -9,6 +9,7 @@ ui/dist/
 server/patchbay_config.json
 server/output_routing.json
 server/talkback_config.json
+server/mixer_state.json
 
 # Saved DAW scenes (user session data)
 scenes/*.json

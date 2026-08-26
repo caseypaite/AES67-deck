@@ -22,7 +22,7 @@ const MiniAnalogKnob = ({ label, value, min, max, onChange, colorHex = '#e0e0e0'
         startY.current = e.clientY;
         startVal.current = value;
         const move = (me: MouseEvent) => {
-          let newVal = startVal.current - (me.clientY - startY.current) * ((max - min) * 0.005);
+          const newVal = startVal.current - (me.clientY - startY.current) * ((max - min) * 0.005);
           onChange(Math.max(min, Math.min(max, newVal)));
         };
         const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
@@ -148,10 +148,15 @@ export const ChannelStrip = ({ id }: { id: number }) => {
   const dbValue = db === -Infinity ? '-∞' : db.toFixed(1);
   const topPos = `calc(${(1.0 - channel.fader)} * (100% - 48px))`;
 
+  // Master and Monitor get a double-width VU meter (24px vs the usual
+  // 12px) for better readability on the two buses an operator watches
+  // most closely — the strip itself grows by that same +12px so the wider
+  // meter doesn't crowd the fader/labels next to it.
   let stripClass = "w-[65px] bg-[#626e7a] border-[#424e5a]";
-  if (isMaster) stripClass = "w-[75px] bg-[#4a2a2a] border-[#3a1a1a]";
+  if (isMaster) stripClass = "w-[87px] bg-[#4a2a2a] border-[#3a1a1a]";
   if (isBus) stripClass = "w-[65px] bg-[#3a4a5a] border-[#2a3a4a]";
-  if (isMonitor) stripClass = "w-[75px] bg-[#2a4a3a] border-[#1a3a2a]";
+  if (isMonitor) stripClass = "w-[87px] bg-[#2a4a3a] border-[#1a3a2a]";
+  const vuMeterWidthClass = (isMaster || isMonitor) ? "w-[24px]" : "w-[12px]";
 
   return (
     <div 
@@ -205,7 +210,7 @@ export const ChannelStrip = ({ id }: { id: number }) => {
         {/* Meters & Fader */}
         <div className="flex gap-3 mb-2 w-full justify-start flex-1 z-10 min-h-0 pl-0.5">
           {/* Separate VU Meter */}
-          <div className="flex gap-[1px] bg-[#111] p-[1px] border border-[#222] shadow-[inset_0_2px_10px_rgba(0,0,0,1)] rounded-sm h-full w-[12px] shrink-0">
+          <div className={`flex gap-[1px] bg-[#111] p-[1px] border border-[#222] shadow-[inset_0_2px_10px_rgba(0,0,0,1)] rounded-sm h-full shrink-0 ${vuMeterWidthClass}`}>
             <VuMeter level={channel.meterL} />
             <VuMeter level={channel.meterR} />
           </div>
@@ -217,7 +222,7 @@ export const ChannelStrip = ({ id }: { id: number }) => {
               isDragging.current = true;
               const rect = e.currentTarget.getBoundingClientRect();
               const usableHeight = rect.height - 48; // Fader cap height is 48px
-              let val = 1.0 - (e.clientY - rect.top - 24) / usableHeight;
+              const val = 1.0 - (e.clientY - rect.top - 24) / usableHeight;
               setChannelValue(id, 'fader', Math.max(0.0, Math.min(1.0, val)));
             }}
             onDoubleClick={(e) => { e.stopPropagation(); setChannelValue(id, 'fader', 0.75); }}

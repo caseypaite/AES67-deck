@@ -72,12 +72,13 @@ interface PatchbayState {
   micDevices: MicDevice[];
 
   // Talkback mic: source is the system's audio input (mic), destination is
-  // Master or one of the 8 Aux buses — never Monitor. micSourceName/
-  // micAlsaPortName are set together with talkbackSourcePorts when the
-  // operator picks a mic from the dropdown (null if they typed ports by
-  // hand instead) — see setTalkbackMic.
+  // any combination of Master and the 8 Aux buses — never Monitor — so it
+  // can fan out to several at once. micSourceName/micAlsaPortName are set
+  // together with talkbackSourcePorts when the operator picks a mic from
+  // the dropdown (null if they typed ports by hand instead) — see
+  // setTalkbackMic.
   talkbackSourcePorts: string[];
-  talkbackDestBusId: number;
+  talkbackDestBusIds: number[];
   talkbackMicSourceName: string | null;
   talkbackMicAlsaPortName: string | null;
 
@@ -104,7 +105,9 @@ interface PatchbayState {
 
   setMicDevices: (devices: MicDevice[]) => void;
   setTalkbackSourcePorts: (ports: string[]) => void;
-  setTalkbackDestBusId: (busId: number) => void;
+  // Adds/removes one bus from the destination set (checkbox-style), rather
+  // than replacing it — talkback can be sent to several buses at once.
+  toggleTalkbackDestBusId: (busId: number) => void;
   // Picks a device from the mic dropdown: fills in ports + the ALSA
   // source/port pair together, replacing whatever was there (dropdown vs.
   // manually-typed ports are mutually exclusive at any moment).
@@ -162,7 +165,7 @@ export const usePatchbayStore = create<PatchbayState>()(
   micDevices: [],
 
   talkbackSourcePorts: [],
-  talkbackDestBusId: 100,
+  talkbackDestBusIds: [100],
   talkbackMicSourceName: null,
   talkbackMicAlsaPortName: null,
 
@@ -314,7 +317,11 @@ export const usePatchbayStore = create<PatchbayState>()(
 
   setMicDevices: (devices) => set({ micDevices: devices }),
   setTalkbackSourcePorts: (ports) => set({ talkbackSourcePorts: ports, talkbackMicSourceName: null, talkbackMicAlsaPortName: null }),
-  setTalkbackDestBusId: (busId) => set({ talkbackDestBusId: busId }),
+  toggleTalkbackDestBusId: (busId) => set(state => ({
+    talkbackDestBusIds: state.talkbackDestBusIds.includes(busId)
+      ? state.talkbackDestBusIds.filter(id => id !== busId)
+      : [...state.talkbackDestBusIds, busId]
+  })),
   setTalkbackMic: (device) => set({
     talkbackSourcePorts: device.ports,
     talkbackMicSourceName: device.sourceName,
@@ -329,14 +336,22 @@ export const usePatchbayStore = create<PatchbayState>()(
       // whole page fails to render.
       merge: (persisted, current) => {
         const state = { ...current, ...(persisted as Partial<PatchbayState>) };
-        const withPorts = (s: any): Aes67Stream => ({ ...s, ports: Array.isArray(s.ports) ? s.ports : [] });
+        const withPorts = (s: Partial<Aes67Stream>): Aes67Stream =>
+          ({ ...s, ports: Array.isArray(s.ports) ? s.ports : [] } as Aes67Stream);
         state.streams = (state.streams || []).map(withPorts);
         state.manualStreams = (state.manualStreams || []).map(withPorts);
         state.discoveredDestinations = (state.discoveredDestinations || []).map(withPorts);
         state.manualDestinations = (state.manualDestinations || []).map(withPorts);
         state.outputMappings = buildOutputMappings(state.outputMappings);
         state.talkbackSourcePorts = Array.isArray(state.talkbackSourcePorts) ? state.talkbackSourcePorts : [];
-        state.talkbackDestBusId = typeof state.talkbackDestBusId === 'number' ? state.talkbackDestBusId : 100;
+        // Backfill from the pre-multi-destination single `talkbackDestBusId`
+        // field for state persisted before this existed.
+        const legacyState = state as unknown as Record<string, unknown>;
+        const legacyDestBusId = legacyState.talkbackDestBusId;
+        state.talkbackDestBusIds = Array.isArray(state.talkbackDestBusIds) && state.talkbackDestBusIds.length > 0
+          ? state.talkbackDestBusIds
+          : (typeof legacyDestBusId === 'number' ? [legacyDestBusId] : [100]);
+        delete legacyState.talkbackDestBusId;
         state.talkbackMicSourceName = typeof state.talkbackMicSourceName === 'string' ? state.talkbackMicSourceName : null;
         state.talkbackMicAlsaPortName = typeof state.talkbackMicAlsaPortName === 'string' ? state.talkbackMicAlsaPortName : null;
         state.micDevices = Array.isArray(state.micDevices) ? state.micDevices : [];

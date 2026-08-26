@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { usePatchbayStore } from './usePatchbayStore';
+import { calfDefaultParams } from '../data/calfPlugins';
 
 export interface PluginNode {
   id: string;
@@ -49,7 +50,7 @@ interface MixerState {
   selectedChannelId: number | null;
 
   setActiveView: (view: 'mixer' | 'daw' | 'patchbay') => void;
-  setChannelValue: (id: number, key: keyof Channel, value: any) => void;
+  setChannelValue: <K extends keyof Channel>(id: number, key: K, value: Channel[K]) => void;
   renameChannel: (id: number, name: string) => void;
   setAuxSend: (channelId: number, busId: number, level: number) => void;
   toggleTransport: (action: 'play' | 'stop' | 'record') => void;
@@ -62,8 +63,39 @@ interface MixerState {
   setPluginParam: (channelId: number, pluginId: string, paramKey: string, value: number) => void;
   setPluginEnabled: (channelId: number, pluginId: string, enabled: boolean) => void;
 
+  // Per-plugin in/out level for the FX editor the operator currently has
+  // open. The engine only meters the focused slot (announced via fx_focus),
+  // and rides the result out on the `fx` key of the `metering` message.
+  fxMeter: { channel: number; pluginIndex: number; inL: number; inR: number; outL: number; outR: number; rta?: number[] } | null;
+  setFxFocus: (channelId: number | null, pluginIndex: number | null) => void;
+
+  // ITU-R BS.1770 loudness on the Master output (engine `lufs` key):
+  // momentary (400 ms), short-term (3 s), integrated (gated), true peak — LUFS/dBTP.
+  lufs: { m: number; s: number; i: number; tp: number } | null;
+  resetLufs: () => void;
+
+  // Master-bus analyser for the mastering panel (engine `master` key):
+  // log-spaced spectrum (dBFS), L/R correlation [-1,1], goniometer scatter.
+  masterAnalysis: { rta: number[]; corr: number; gonio: number[] } | null;
+
+  // Replace a channel's whole plugin chain (used by mastering presets).
+  applyRack: (channelId: number, plugins: { uri: string; enabled?: boolean; params?: Record<string, number> }[]) => void;
+
+  // Rack Manager: named, reusable FX chain presets — save the currently
+  // selected channel's plugin list under a name, or load one onto it
+  // (replacing whatever's there now, in both the UI and the live engine).
+  rackPresets: string[];
+  saveRackPreset: (channelId: number, name: string) => void;
+  loadRackPreset: (name: string) => void;
+  deleteRackPreset: (name: string) => void;
+  listRackPresets: () => void;
+
   connectWebSocket: () => void;
   scenes: string[];
+
+  // Full system LV2 plugin catalog for the FX Rack's "Add Effect" browser,
+  // populated once from the engine's startup scan (plugin_list/plugin_list_loaded).
+  availablePlugins: SystemPluginInfo[];
 }
 
 export const positionToDb = (y: number): number => {
@@ -90,36 +122,64 @@ export interface PluginRegistryEntry {
   defaultParams: Record<string, number>;
 }
 
+// One plugin from the engine's full system LV2 scan (engine/src/plugins/Lv2Host,
+// relayed via server's plugin_list/plugin_list_loaded messages). Distinct from
+// PluginRegistryEntry: control ports come from the plugin's real LV2 metadata
+// rather than a hand-curated param map, so symbols are used as param keys
+// directly instead of going through the curated remap table.
+export interface SystemPluginControlPort {
+  symbol: string;
+  name: string;
+  min: number;
+  max: number;
+  default: number;
+}
+
+export interface SystemPluginInfo {
+  uri: string;
+  name: string;
+  author: string;
+  reportsLatency: boolean;
+  controlPorts: SystemPluginControlPort[];
+}
+
+// Calf entries seed their full, real LV2 port set from data/calfPlugins.ts
+// (symbols + defaults straight from the .ttl). LSP entries keep a rough
+// hand map until they get the same treatment.
+const calf = (name: string, uri: string, category: PluginCategory): PluginRegistryEntry => ({
+  name, uri, category, defaultParams: calfDefaultParams(uri),
+});
+
 export const PLUGIN_REGISTRY: PluginRegistryEntry[] = [
   // Saturation
-  { name: 'Calf Saturator', uri: 'http://calf.sourceforge.net/plugins/Saturator', category: 'Saturation', defaultParams: { drive: 5, blend: 5, out: 5 } },
-  { name: 'Calf Crusher', uri: 'http://calf.sourceforge.net/plugins/Crusher', category: 'Saturation', defaultParams: { drive: 5, blend: 5, out: 5 } }, // using same mapped params for UI compat
+  calf('Calf Saturator', 'http://calf.sourceforge.net/plugins/Saturator', 'Saturation'),
+  calf('Calf Crusher', 'http://calf.sourceforge.net/plugins/Crusher', 'Saturation'),
   { name: 'LSP Articulator', uri: 'http://lsp-plug.in/plugins/lv2/articulator_stereo', category: 'Saturation', defaultParams: { drive: 5, blend: 5, out: 5 } },
-  
+
   // Dynamics
   { name: 'LSP Compressor', uri: 'http://lsp-plug.in/plugins/lv2/compressor_stereo', category: 'Dynamics', defaultParams: { threshold: -20, ratio: 4, attack: 20, release: 200, makeup: 0, mix: 100 } },
-  { name: 'Calf Compressor', uri: 'http://calf.sourceforge.net/plugins/Compressor', category: 'Dynamics', defaultParams: { threshold: -20, ratio: 4, attack: 20, release: 200, makeup: 0, mix: 100 } },
-  
+  calf('Calf Compressor', 'http://calf.sourceforge.net/plugins/Compressor', 'Dynamics'),
+
   // De-Esser
-  { name: 'Calf De-Esser', uri: 'http://calf.sourceforge.net/plugins/Deesser', category: 'De-Esser', defaultParams: { threshold: -20, freq: 6000, ratio: 3, out: 0 } },
+  calf('Calf De-Esser', 'http://calf.sourceforge.net/plugins/Deesser', 'De-Esser'),
   { name: 'LSP De-Esser', uri: 'http://lsp-plug.in/plugins/lv2/de_esser_stereo', category: 'De-Esser', defaultParams: { threshold: -20, freq: 6000, ratio: 3, out: 0 } },
-  
+
   // Equalizer
   { name: 'LSP 8-Band EQ', uri: 'http://lsp-plug.in/plugins/lv2/para_equalizer_x8_stereo', category: 'Equalizer', defaultParams: { b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0, b7: 0, b8: 0 } },
-  { name: 'Calf 8-Band EQ', uri: 'http://calf.sourceforge.net/plugins/Equalizer8Band', category: 'Equalizer', defaultParams: { b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0, b7: 0, b8: 0 } },
-  { name: 'Calf 5-Band EQ', uri: 'http://calf.sourceforge.net/plugins/Equalizer5Band', category: 'Equalizer', defaultParams: { b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0, b7: 0, b8: 0 } },
+  calf('Calf 8-Band EQ', 'http://calf.sourceforge.net/plugins/Equalizer8Band', 'Equalizer'),
+  calf('Calf 5-Band EQ', 'http://calf.sourceforge.net/plugins/Equalizer5Band', 'Equalizer'),
 
   // Delay
   { name: 'LSP Delay', uri: 'http://lsp-plug.in/plugins/lv2/delay_stereo', category: 'Delay', defaultParams: { time_l: 250, time_r: 250, feedback: 30, mix: 20 } },
-  { name: 'Calf Vintage Delay', uri: 'http://calf.sourceforge.net/plugins/VintageDelay', category: 'Delay', defaultParams: { time_l: 250, time_r: 250, feedback: 30, mix: 20 } },
+  calf('Calf Vintage Delay', 'http://calf.sourceforge.net/plugins/VintageDelay', 'Delay'),
 
   // Reverb
-  { name: 'Calf Reverb', uri: 'http://calf.sourceforge.net/plugins/Reverb', category: 'Reverb', defaultParams: { decay: 2, high_cut: 5000, mix: 20, out: 0 } },
+  calf('Calf Reverb', 'http://calf.sourceforge.net/plugins/Reverb', 'Reverb'),
   { name: 'LSP Room Builder', uri: 'http://lsp-plug.in/plugins/lv2/room_builder_stereo', category: 'Reverb', defaultParams: { decay: 2, high_cut: 5000, mix: 20, out: 0 } },
-  
+
   // Limiter
   { name: 'LSP Limiter', uri: 'http://lsp-plug.in/plugins/lv2/limiter_stereo', category: 'Limiter', defaultParams: { limit: -0.1, threshold: -3, release: 50, gain: 0 } },
-  { name: 'Calf Limiter', uri: 'http://calf.sourceforge.net/plugins/Limiter', category: 'Limiter', defaultParams: { limit: -0.1, threshold: -3, release: 50, gain: 0 } },
+  calf('Calf Limiter', 'http://calf.sourceforge.net/plugins/Limiter', 'Limiter'),
 ];
 
 // Channels, buses, and master all start with an empty effect rack. Users
@@ -170,6 +230,11 @@ function buildChannels(): Record<number, Channel> {
 
 export const useMixerStore = create<MixerState>((set, get) => ({
   scenes: [],
+  rackPresets: [],
+  availablePlugins: [],
+  fxMeter: null,
+  lufs: null,
+  masterAnalysis: null,
   channels: buildChannels(),
   activeView: 'mixer',
   transportState: 'stopped',
@@ -185,8 +250,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     const ws = get().ws;
     if (ws && ws.readyState === WebSocket.OPEN) {
       if (key === 'fader') {
-         const gain = positionToAmplitude(value);
-         ws.send(JSON.stringify({ type: 'set_fader', channel: id, value: gain / 2.0 }));
+         const gain = positionToAmplitude(value as number);
+         // Include faderPosition (normalised 0..1) so the server can persist
+         // the UI-side value accurately without a lossy amplitude inversion.
+         ws.send(JSON.stringify({ type: 'set_fader', channel: id, value: gain / 2.0, faderPosition: value }));
       }
       if (key === 'pan') ws.send(JSON.stringify({ type: 'set_pan', channel: id, value }));
       if (key === 'mute') ws.send(JSON.stringify({ type: 'set_mute', channel: id, value: value ? 1 : 0 }));
@@ -218,12 +285,24 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         params = entry ? { ...entry.defaultParams } : {};
       }
       const plugin: PluginNode = { ...pluginDef, id: crypto.randomUUID(), params };
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        // No index sent — the engine appends when it's omitted, matching
+        // where this new plugin lands in the array below.
+        state.ws.send(JSON.stringify({ type: 'add_plugin', channel: channelId, uri: plugin.uri, enabled: plugin.enabled, params: plugin.params }));
+      }
       return { channels: { ...state.channels, [channelId]: { ...state.channels[channelId], plugins: [...state.channels[channelId].plugins, plugin] } } };
     });
   },
 
   removePlugin: (channelId, pluginId) => {
-    set((state) => ({ channels: { ...state.channels, [channelId]: { ...state.channels[channelId], plugins: state.channels[channelId].plugins.filter(p => p.id !== pluginId) } } }));
+    set((state) => {
+      const channel = state.channels[channelId];
+      const pluginIndex = channel.plugins.findIndex(p => p.id === pluginId);
+      if (state.ws && state.ws.readyState === WebSocket.OPEN && pluginIndex !== -1) {
+        state.ws.send(JSON.stringify({ type: 'remove_plugin', channel: channelId, pluginIndex }));
+      }
+      return { channels: { ...state.channels, [channelId]: { ...channel, plugins: channel.plugins.filter(p => p.id !== pluginId) } } };
+    });
   },
 
   replacePlugin: (channelId, pluginId, newUri) => {
@@ -232,12 +311,18 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       const entry = PLUGIN_REGISTRY.find(e => e.uri === newUri);
       if (!entry) return state;
 
+      const pluginIndex = channel.plugins.findIndex(p => p.id === pluginId);
+      if (state.ws && state.ws.readyState === WebSocket.OPEN && pluginIndex !== -1) {
+        state.ws.send(JSON.stringify({ type: 'replace_plugin', channel: channelId, pluginIndex, uri: entry.uri, params: entry.defaultParams }));
+      }
+
       const plugins = channel.plugins.map(p => {
         if (p.id === pluginId) {
           return {
             ...p,
             uri: entry.uri,
             name: entry.name.split(' ')[1] || entry.name, // Keep short name if possible
+            enabled: true,
             params: { ...entry.defaultParams }
           };
         }
@@ -250,11 +335,41 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   reorderPlugin: (channelId, startIndex, endIndex) => {
     set((state) => {
       const channel = state.channels[channelId];
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'reorder_plugin', channel: channelId, fromIndex: startIndex, toIndex: endIndex }));
+      }
       const result = Array.from(channel.plugins);
       const [removed] = result.splice(startIndex, 1);
       result.splice(endIndex, 0, removed);
       return { channels: { ...state.channels, [channelId]: { ...channel, plugins: result } } };
     });
+  },
+
+  saveRackPreset: (channelId, name) => {
+    const ws = get().ws;
+    const channel = get().channels[channelId];
+    if (!ws || ws.readyState !== WebSocket.OPEN || !channel) return;
+    ws.send(JSON.stringify({ type: 'save_rack_preset', name, plugins: channel.plugins }));
+  },
+
+  loadRackPreset: (name) => {
+    const ws = get().ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Server replies with rack_preset_data; the handler in connectWebSocket
+    // applies it to whichever channel is selected at that moment.
+    ws.send(JSON.stringify({ type: 'load_rack_preset', name }));
+  },
+
+  deleteRackPreset: (name) => {
+    const ws = get().ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'delete_rack_preset', name }));
+  },
+
+  listRackPresets: () => {
+    const ws = get().ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'list_rack_presets' }));
   },
 
   setPluginParam: (channelId, pluginId, paramKey, value) => {
@@ -288,6 +403,48 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     });
   },
 
+  setFxFocus: (channelId, pluginIndex) => {
+    // Clear any stale reading immediately; the engine's next metering frame
+    // (or lack of an `fx` key) refreshes it.
+    set({ fxMeter: null });
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'fx_focus',
+        channel: channelId ?? -1,
+        pluginIndex: pluginIndex ?? -1,
+      }));
+    }
+  },
+
+  resetLufs: () => {
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'lufs_reset' }));
+  },
+
+  applyRack: (channelId, plugins) => {
+    const nodes: PluginNode[] = plugins
+      .filter(p => typeof p.uri === 'string')
+      .map(p => ({
+        id: crypto.randomUUID(),
+        name: PLUGIN_REGISTRY.find(e => e.uri === p.uri)?.name || 'Plugin',
+        uri: p.uri,
+        enabled: p.enabled !== false,
+        params: p.params || {},
+      }));
+    set(state => ({
+      channels: { ...state.channels, [channelId]: { ...state.channels[channelId], plugins: nodes } },
+    }));
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'load_rack',
+        channel: channelId,
+        plugins: nodes.map(p => ({ uri: p.uri, enabled: p.enabled, params: p.params })),
+      }));
+    }
+  },
+
   toggleTransport: (action) => {
     const currentState = get().transportState;
     let nextState = currentState;
@@ -312,7 +469,35 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type === 'scenes_list') {
+        if (data.type === 'mixer_state_loaded') {
+          // Server sends this on connect with the full persisted mixer state.
+          // Apply it to all known channels without sending back to WS or engine.
+          const incoming = data.state as Record<string, {
+            fader?: number; pan?: number; mute?: boolean; solo?: boolean;
+            auxSends?: Record<string, number>;
+          }>;
+          set(state => {
+            const channels = { ...state.channels };
+            for (const [chIdStr, ch] of Object.entries(incoming)) {
+              const cid = Number(chIdStr);
+              if (!channels[cid]) continue;
+              const updated = { ...channels[cid] };
+              if (typeof ch.fader === 'number') updated.fader = ch.fader;
+              if (typeof ch.pan   === 'number') updated.pan   = ch.pan;
+              if (typeof ch.mute  === 'boolean') updated.mute  = ch.mute;
+              if (typeof ch.solo  === 'boolean') updated.solo  = ch.solo;
+              if (ch.auxSends) {
+                const sends = { ...updated.auxSends };
+                for (const [busId, val] of Object.entries(ch.auxSends)) {
+                  sends[Number(busId)] = val;
+                }
+                updated.auxSends = sends;
+              }
+              channels[cid] = updated;
+            }
+            return { channels };
+          });
+        } else if (data.type === 'scenes_list') {
           set({ scenes: data.scenes });
         } else if (data.type === 'scene_data') {
           const { mixer, patchbay } = data.state;
@@ -323,23 +508,64 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             if (get().ws && get().ws?.readyState === WebSocket.OPEN) {
                get().ws?.send(JSON.stringify({ type: 'sync_patchbay_matrix', mappings: patchbay.mappings }));
                
-               // Apply mixer states
-               Object.values(mixer.channels).forEach((ch: any) => {
-                 get().ws?.send(JSON.stringify({ type: 'set_fader', channelId: ch.id, value: ch.fader }));
-                 get().ws?.send(JSON.stringify({ type: 'set_pan', channelId: ch.id, value: ch.pan }));
-                 get().ws?.send(JSON.stringify({ type: 'set_mute', channelId: ch.id, value: ch.mute }));
-                 get().ws?.send(JSON.stringify({ type: 'set_solo', channelId: ch.id, value: ch.solo }));
-                 
-                 ch.plugins?.forEach((p: any) => {
-                    get().ws?.send(JSON.stringify({ type: 'set_plugin_bypass', channelId: ch.id, pluginId: p.id, bypassed: p.bypassed }));
-                    Object.entries(p.params || {}).forEach(([pId, pVal]) => {
-                       get().ws?.send(JSON.stringify({ type: 'set_plugin_param', channelId: ch.id, pluginId: p.id, paramId: pId, value: pVal }));
-                    });
-                 });
+               // Apply mixer states — persisted by save_scene from this
+               // app's own Channel objects, so the shape is trusted here
+               // rather than re-validated at load time. Field names below
+               // must match the engine's actual IPC protocol (channel +
+               // pluginIndex, not channelId/pluginId — see setChannelValue
+               // and setPluginParam/setPluginEnabled above for the same
+               // shapes in normal, already-working operation).
+               Object.values(mixer.channels as Record<number, Channel>).forEach((ch) => {
+                 get().ws?.send(JSON.stringify({ type: 'set_fader', channel: ch.id, value: ch.fader }));
+                 get().ws?.send(JSON.stringify({ type: 'set_pan', channel: ch.id, value: ch.pan }));
+                 get().ws?.send(JSON.stringify({ type: 'set_mute', channel: ch.id, value: ch.mute ? 1 : 0 }));
+                 get().ws?.send(JSON.stringify({ type: 'set_solo', channel: ch.id, value: ch.solo ? 1 : 0 }));
+
+                 // load_rack actually instantiates each plugin in the live
+                 // engine (see engine/src/main.cpp's PluginCmd) — sending
+                 // per-index set_plugin_bypass/set_plugin_param here instead
+                 // would silently no-op, since the engine wouldn't have any
+                 // plugin slots at those indices yet.
+                 get().ws?.send(JSON.stringify({
+                   type: 'load_rack',
+                   channel: ch.id,
+                   plugins: (ch.plugins || []).map(p => ({ uri: p.uri, enabled: p.enabled, params: p.params }))
+                 }));
                });
             }
           });
           console.log(`Scene ${data.name} loaded and applied.`);
+        } else if (data.type === 'rack_presets_list') {
+          set({ rackPresets: data.presets || [] });
+        } else if (data.type === 'rack_preset_data') {
+          // The server only echoes back the preset's name + plugin list, not
+          // which channel asked for it — apply to whatever's selected right
+          // now, which is the only channel the Rack Manager UI could have
+          // been driven from.
+          const targetChannelId = get().selectedChannelId;
+          if (targetChannelId === null) return;
+          const rawPlugins: Partial<PluginNode>[] = Array.isArray(data.plugins) ? data.plugins : [];
+          const plugins: PluginNode[] = rawPlugins
+            .filter((p): p is Partial<PluginNode> & { uri: string } => typeof p.uri === 'string')
+            .map((p) => ({
+              id: crypto.randomUUID(),
+              name: p.name || PLUGIN_REGISTRY.find(e => e.uri === p.uri)?.name || 'Plugin',
+              uri: p.uri,
+              enabled: p.enabled !== false,
+              params: (p.params && typeof p.params === 'object') ? p.params : {}
+            }));
+          set((state) => ({
+            channels: { ...state.channels, [targetChannelId]: { ...state.channels[targetChannelId], plugins } }
+          }));
+          const ws = get().ws;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'load_rack',
+              channel: targetChannelId,
+              plugins: plugins.map(p => ({ uri: p.uri, enabled: p.enabled, params: p.params }))
+            }));
+          }
+          console.log(`Rack preset "${data.name}" loaded onto channel ${targetChannelId}.`);
         } else if (data.type === 'patchbay_config_loaded') {
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
              usePatchbayStore.setState({ mappings: data.mappings });
@@ -352,20 +578,23 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           // same-browser reload already gets this right via localStorage
           // persistence regardless.
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
-            const outputs = (data.outputs || {}) as Record<string, string[]>;
+            const outputs = (data.outputs || {}) as Record<string, { ports: string[]; mono?: boolean }>;
             const state = usePatchbayStore.getState();
             const allDestinations = [...state.discoveredDestinations, ...state.manualDestinations];
-            Object.entries(outputs).forEach(([busIdStr, ports]) => {
-              if (!Array.isArray(ports) || ports.length === 0) return;
+            Object.entries(outputs).forEach(([busIdStr, entry]) => {
+              if (!entry || !Array.isArray(entry.ports) || entry.ports.length === 0) return;
+              const { ports, mono } = entry;
               const busId = Number(busIdStr);
               const match = allDestinations.find(d =>
                 d.ports.length > 0 && (
-                  (ports.length >= 2 && d.ports[0] === ports[0] && d.ports[1] === ports[1]) ||
-                  (ports.length === 1 && d.ports.includes(ports[0]))
+                  mono
+                    ? ports.length === d.ports.length && ports.every((p, i) => d.ports[i] === p)
+                    : (ports.length >= 2 && d.ports[0] === ports[0] && d.ports[1] === ports[1]) ||
+                      (ports.length === 1 && d.ports.includes(ports[0]))
                 )
               );
               if (match) {
-                const destChannel = ports.length >= 2 ? 0 : match.ports.indexOf(ports[0]) + 1;
+                const destChannel = mono ? -1 : (ports.length >= 2 ? 0 : match.ports.indexOf(ports[0]) + 1);
                 state.setOutputMapping(busId, match.id, destChannel);
               }
             });
@@ -380,7 +609,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
              usePatchbayStore.setState({
                talkbackSourcePorts: data.sourcePorts || [],
-               talkbackDestBusId: typeof data.destBusId === 'number' ? data.destBusId : 100,
+               talkbackDestBusIds: Array.isArray(data.destBusIds) && data.destBusIds.length > 0 ? data.destBusIds : [100],
                talkbackMicSourceName: typeof data.micSourceName === 'string' ? data.micSourceName : null,
                talkbackMicAlsaPortName: typeof data.micAlsaPortName === 'string' ? data.micAlsaPortName : null
              });
@@ -388,6 +617,36 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         } else if (data.type === 'mic_devices_loaded') {
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
             usePatchbayStore.getState().setMicDevices(data.devices || []);
+          });
+        } else if (data.type === 'plugin_list' || data.type === 'plugin_list_loaded') {
+          set({ availablePlugins: Array.isArray(data.plugins) ? data.plugins : [] });
+        } else if (data.type === 'set_fader' && typeof data.channel === 'number') {
+          // Broadcast from another client — apply locally only, no WS echo.
+          const faderVal = typeof data.faderPosition === 'number' ? data.faderPosition : data.value;
+          set(state => {
+            if (!state.channels[data.channel]) return state;
+            return { channels: { ...state.channels, [data.channel]: { ...state.channels[data.channel], fader: faderVal } } };
+          });
+        } else if (data.type === 'set_pan' && typeof data.channel === 'number') {
+          set(state => {
+            if (!state.channels[data.channel]) return state;
+            return { channels: { ...state.channels, [data.channel]: { ...state.channels[data.channel], pan: data.value } } };
+          });
+        } else if (data.type === 'set_mute' && typeof data.channel === 'number') {
+          set(state => {
+            if (!state.channels[data.channel]) return state;
+            return { channels: { ...state.channels, [data.channel]: { ...state.channels[data.channel], mute: !!data.value } } };
+          });
+        } else if (data.type === 'set_solo' && typeof data.channel === 'number') {
+          set(state => {
+            if (!state.channels[data.channel]) return state;
+            return { channels: { ...state.channels, [data.channel]: { ...state.channels[data.channel], solo: !!data.value } } };
+          });
+        } else if (data.type === 'set_aux_send' && typeof data.channel === 'number' && typeof data.busId === 'number') {
+          set(state => {
+            const ch = state.channels[data.channel];
+            if (!ch) return state;
+            return { channels: { ...state.channels, [data.channel]: { ...ch, auxSends: { ...ch.auxSends, [data.busId]: data.value } } } };
           });
         } else if (data.type === 'metering') {
           if (data.channels) {
@@ -404,11 +663,20 @@ export const useMixerStore = create<MixerState>((set, get) => ({
                 return { channels: nextChannels };
              });
           }
+          // `fx` is present only while the engine has a focused plugin slot
+          // (fx_focus). Absent ⇒ nothing focused ⇒ clear so the editor falls
+          // back to the host channel meter.
+          set({ fxMeter: data.fx ?? null });
+          if (data.lufs) set({ lufs: data.lufs });
+          if (data.master) set({ masterAnalysis: data.master });
         } else if (data.type === 'aes67_discovery') {
           const { upsertStream } = usePatchbayStore.getState();
           upsertStream(data.name, data.address);
         }
-      } catch (e) {}
+      } catch (e) {
+        // Malformed or partial WebSocket frame — drop it, matching the
+        // server's own "invalid JSON, drop it" handling on its side.
+      }
     };
     ws.onclose = () => {
       set({ ws: null });

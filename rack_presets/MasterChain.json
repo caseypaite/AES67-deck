@@ -1,0 +1,35 @@
+[
+  {
+    "uri": "http://calf.sourceforge.net/plugins/Compressor",
+    "name": "Calf Compressor",
+    "enabled": true,
+    "params": {
+      "threshold": 0.06069896990105887,
+      "ratio": 2.514228555162681,
+      "knee": 8,
+      "attack": 20,
+      "release": 250,
+      "detection": 0,
+      "stereo_link": 0,
+      "makeup": 3.9449308179734377,
+      "mix": 1,
+      "level_in": 1
+    }
+  },
+  {
+    "uri": "http://calf.sourceforge.net/plugins/Limiter",
+    "name": "Calf Limiter",
+    "enabled": false,
+    "params": {
+      "limit": 1,
+      "attack": 5,
+      "release": 50,
+      "asc": 1,
+      "asc_coeff": 0.5,
+      "oversampling": 2,
+      "auto_level": 1,
+      "level_in": 1,
+      "level_out": 1
+    }
+  }
+]

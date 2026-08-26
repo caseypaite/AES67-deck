@@ -11,12 +11,96 @@ if (!fs.existsSync(SCENES_DIR)) {
   fs.mkdirSync(SCENES_DIR);
 }
 
+// FX chain presets — a named, reusable "rack": the plugin list (uri, name,
+// enabled, params) for one channel's insert chain, save/loadable onto any
+// other channel. Separate from scenes (which snapshot the whole mixer).
+const RACK_PRESETS_DIR = path.join(process.cwd(), '..', 'rack_presets');
+if (!fs.existsSync(RACK_PRESETS_DIR)) {
+  fs.mkdirSync(RACK_PRESETS_DIR);
+}
+
 const SOCKET_PATH = '/tmp/aes67_deck.sock';
 const WSS_PORT = parseInt(process.env.PORT || '8081', 10);
 
 const PATCHBAY_CONFIG_PATH = 'patchbay_config.json';
 const OUTPUT_ROUTING_PATH = 'output_routing.json';
 const TALKBACK_CONFIG_PATH = 'talkback_config.json';
+const MIXER_STATE_PATH = 'mixer_state.json';
+
+// In-memory snapshot of all fader-level mixer state. Written to
+// mixer_state.json on every change (debounced 500ms) and replayed to the
+// engine on reconnect and to each UI client on connect, so all clients stay
+// in sync and the console resumes correctly after any restart.
+interface ChannelMixerState {
+  fader?: number;   // normalised UI position 0..1
+  pan?: number;
+  mute?: boolean;
+  solo?: boolean;
+  auxSends?: Record<string, number>;
+}
+type MixerStateMap = Record<string, ChannelMixerState>;
+
+let mixerState: MixerStateMap = {};
+let mixerStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function loadMixerState() {
+  try {
+    if (fs.existsSync(MIXER_STATE_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(MIXER_STATE_PATH, 'utf8'));
+      if (raw && typeof raw === 'object') mixerState = raw;
+      console.log(`Loaded mixer state for ${Object.keys(mixerState).length} channels from disk.`);
+    }
+  } catch (e) {
+    console.error('Error loading mixer_state.json, starting fresh', e);
+  }
+}
+
+function saveMixerState() {
+  if (mixerStateSaveTimer) clearTimeout(mixerStateSaveTimer);
+  mixerStateSaveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(MIXER_STATE_PATH, JSON.stringify(mixerState, null, 2));
+    } catch (e) {
+      console.error('Error saving mixer_state.json', e);
+    }
+  }, 500);
+}
+
+// Build IPC command lines to replay the full persisted mixer state to the
+// engine (faders, pans, mutes, solos, aux sends). Called on every engine
+// (re)connect so the live audio matches what was last saved.
+function buildEngineRestoreCommands(): string[] {
+  const lines: string[] = [];
+  for (const [chId, ch] of Object.entries(mixerState)) {
+    const channel = Number(chId);
+    if (!Number.isFinite(channel)) continue;
+    if (typeof ch.fader === 'number') {
+      // Replicate positionToAmplitude from the UI store.
+      const y = ch.fader;
+      let db: number;
+      if (y >= 0.75)      db = 0    + ((y - 0.75) / 0.25) * 10;
+      else if (y >= 0.50) db = -10  + ((y - 0.50) / 0.25) * 10;
+      else if (y >= 0.30) db = -20  + ((y - 0.30) / 0.20) * 10;
+      else if (y >= 0.15) db = -40  + ((y - 0.15) / 0.15) * 20;
+      else if (y > 0)     db = -100 + (y  / 0.15)  * 60;
+      else                db = -Infinity;
+      const gain = db === -Infinity ? 0 : Math.pow(10, db / 20);
+      lines.push(JSON.stringify({ type: 'set_fader', channel, value: gain / 2.0 }));
+    }
+    if (typeof ch.pan === 'number')
+      lines.push(JSON.stringify({ type: 'set_pan', channel, value: ch.pan }));
+    if (typeof ch.mute === 'boolean')
+      lines.push(JSON.stringify({ type: 'set_mute', channel, value: ch.mute ? 1 : 0 }));
+    if (typeof ch.solo === 'boolean')
+      lines.push(JSON.stringify({ type: 'set_solo', channel, value: ch.solo ? 1 : 0 }));
+    if (ch.auxSends)
+      for (const [busId, level] of Object.entries(ch.auxSends))
+        lines.push(JSON.stringify({ type: 'set_aux_send', channel, busId: Number(busId), value: level }));
+  }
+  return lines;
+}
+
+loadMixerState();
 
 // Fixed console topology (mirrors engine/src/main.cpp's constants exactly —
 // this is not runtime-configurable, since the engine only registers JACK
@@ -34,9 +118,24 @@ function isValidTalkbackDest(busId: any): boolean {
   return busId === MASTER_ID || (Number.isInteger(busId) && busId >= AUX_BASE && busId < AUX_BASE + NUM_AUX);
 }
 
+// Packs a set of destination bus ids into the bitmask the engine's
+// TalkbackState::dest_bus_mask expects: bit 0 = Master (100), bit i
+// (1..NUM_AUX) = Aux (100+i). Invalid ids are dropped rather than rejecting
+// the whole set.
+function talkbackDestMask(destBusIds: number[]): number {
+  let mask = 0;
+  for (const id of destBusIds) {
+    if (id === MASTER_ID) mask |= 1;
+    else if (isValidTalkbackDest(id)) mask |= (1 << (id - AUX_BASE + 1));
+  }
+  return mask;
+}
+
 interface TalkbackConfig {
   sourcePorts: string[];
-  destBusId: number;
+  // Master and/or any of the 8 Aux buses — talkback can fan out to several
+  // at once. Never Monitor.
+  destBusIds: number[];
   // Set when sourcePorts came from picking a device in the mic dropdown
   // rather than typing ports by hand. micAlsaPortName, when present, is an
   // ALSA port id (e.g. an external mic-jack input) that needs to be made
@@ -49,7 +148,7 @@ interface TalkbackConfig {
 
 function getTalkbackConfig(): TalkbackConfig {
   let sourcePorts: string[] = [];
-  let destBusId = MASTER_ID;
+  let destBusIds = [MASTER_ID];
   let micSourceName: string | null = null;
   let micAlsaPortName: string | null = null;
   try {
@@ -58,14 +157,21 @@ function getTalkbackConfig(): TalkbackConfig {
       if (Array.isArray(raw.sourcePorts) && raw.sourcePorts.every((p: any) => typeof p === 'string')) {
         sourcePorts = raw.sourcePorts;
       }
-      if (isValidTalkbackDest(raw.destBusId)) destBusId = raw.destBusId;
+      if (Array.isArray(raw.destBusIds)) {
+        // Current (multi-destination) shape.
+        const filtered = raw.destBusIds.filter((id: any) => isValidTalkbackDest(id));
+        if (filtered.length > 0) destBusIds = filtered;
+      } else if (isValidTalkbackDest(raw.destBusId)) {
+        // Config written before multi-destination talkback existed.
+        destBusIds = [raw.destBusId];
+      }
       if (typeof raw.micSourceName === 'string') micSourceName = raw.micSourceName;
       if (typeof raw.micAlsaPortName === 'string') micAlsaPortName = raw.micAlsaPortName;
     }
   } catch (e) {
     console.error('Error reading talkback config, using defaults', e);
   }
-  return { sourcePorts, destBusId, micSourceName, micAlsaPortName };
+  return { sourcePorts, destBusIds, micSourceName, micAlsaPortName };
 }
 
 // Set up WebSocket server
@@ -90,6 +196,14 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
   ws.send(JSON.stringify({ type: 'mic_devices_loaded', devices: lastMicDevices }));
+  if (lastPluginCatalog.length > 0) {
+    ws.send(JSON.stringify({ type: 'plugin_list_loaded', plugins: lastPluginCatalog }));
+  }
+
+  // Send current mixer state so this client starts in sync with all others.
+  if (Object.keys(mixerState).length > 0) {
+    ws.send(JSON.stringify({ type: 'mixer_state_loaded', state: mixerState }));
+  }
 
   ws.on('close', () => {
     connectedWsClients = connectedWsClients.filter(client => client !== ws);
@@ -102,7 +216,19 @@ wss.on('connection', (ws) => {
       const payloadStr = message.toString();
       const data = JSON.parse(payloadStr);
       // Only forward allowed types to prevent arbitrary data injection
-      const allowedTypes = ['set_fader', 'set_pan', 'set_mute', 'set_solo', 'set_aux_send', 'start_record', 'stop_record', 'set_plugin_param', 'set_plugin_bypass', 'set_talkback_active'];
+      const allowedTypes = [
+        'set_fader', 'set_pan', 'set_mute', 'set_solo', 'set_aux_send', 'start_record', 'stop_record',
+        'set_plugin_param', 'set_plugin_bypass', 'set_talkback_active',
+        // Which plugin editor the UI has open — drives the engine's
+        // per-plugin in/out metering (the `fx` key on `metering`).
+        'fx_focus',
+        // Restart the Master integrated-loudness measurement.
+        'lufs_reset',
+        // Plugin-chain structure — engine applies these to the live
+        // insert_chain (see engine/src/main.cpp's PluginCmd); the server
+        // just forwards, same trust model as the params/bypass types above.
+        'add_plugin', 'remove_plugin', 'reorder_plugin', 'replace_plugin', 'load_rack'
+      ];
       if (data.type === 'save_scene') {
         const safeName = data.name.replace(/[^a-zA-Z0-9_-]/g, '_');
         fs.writeFileSync(path.join(SCENES_DIR, `${safeName}.json`), JSON.stringify(data.state, null, 2));
@@ -119,6 +245,44 @@ wss.on('connection', (ws) => {
         if (fs.existsSync(p)) {
           const state = JSON.parse(fs.readFileSync(p, 'utf8'));
           ws.send(JSON.stringify({ type: 'scene_data', state, name: data.name }));
+        }
+      } else if (data.type === 'save_rack_preset') {
+        if (!Array.isArray(data.plugins)) {
+          console.error('Rejected save_rack_preset: plugins is not an array');
+        } else {
+          const safeName = String(data.name || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+          // Only the fields a rack preset actually needs — never the
+          // per-instance runtime `id` (a fresh UUID gets assigned wherever
+          // this preset is loaded next).
+          const plugins = data.plugins.map((p: any) => ({
+            uri: p.uri,
+            name: p.name,
+            enabled: p.enabled !== false,
+            params: (p.params && typeof p.params === 'object') ? p.params : {}
+          }));
+          fs.writeFileSync(path.join(RACK_PRESETS_DIR, `${safeName}.json`), JSON.stringify(plugins, null, 2));
+          const presets = fs.readdirSync(RACK_PRESETS_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
+          connectedWsClients.forEach(c => {
+             if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'rack_presets_list', presets }));
+          });
+        }
+      } else if (data.type === 'list_rack_presets') {
+        const presets = fs.readdirSync(RACK_PRESETS_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
+        ws.send(JSON.stringify({ type: 'rack_presets_list', presets }));
+      } else if (data.type === 'delete_rack_preset') {
+        const safeName = String(data.name || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const p = path.join(RACK_PRESETS_DIR, `${safeName}.json`);
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+        const presets = fs.readdirSync(RACK_PRESETS_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
+        connectedWsClients.forEach(c => {
+           if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'rack_presets_list', presets }));
+        });
+      } else if (data.type === 'load_rack_preset') {
+        const safeName = String(data.name || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const p = path.join(RACK_PRESETS_DIR, `${safeName}.json`);
+        if (fs.existsSync(p)) {
+          const plugins = JSON.parse(fs.readFileSync(p, 'utf8'));
+          ws.send(JSON.stringify({ type: 'rack_preset_data', plugins, name: data.name }));
         }
       } else if (data.type === 'sync_patchbay_matrix') {
         const merged = mergePatchbayMappings(data.mappings);
@@ -138,16 +302,17 @@ wss.on('connection', (ws) => {
         })();
       } else if (data.type === 'sync_talkback_config') {
         const sourcePorts = Array.isArray(data.sourcePorts) ? data.sourcePorts.filter((p: any) => typeof p === 'string') : [];
-        const destBusId = isValidTalkbackDest(data.destBusId) ? data.destBusId : getTalkbackConfig().destBusId;
+        const filteredDestBusIds = Array.isArray(data.destBusIds) ? data.destBusIds.filter((id: any) => isValidTalkbackDest(id)) : [];
+        const destBusIds = filteredDestBusIds.length > 0 ? filteredDestBusIds : getTalkbackConfig().destBusIds;
         const micSourceName = typeof data.micSourceName === 'string' ? data.micSourceName : null;
         const micAlsaPortName = typeof data.micAlsaPortName === 'string' ? data.micAlsaPortName : null;
-        const cfg: TalkbackConfig = { sourcePorts, destBusId, micSourceName, micAlsaPortName };
+        const cfg: TalkbackConfig = { sourcePorts, destBusIds, micSourceName, micAlsaPortName };
         fs.writeFileSync(TALKBACK_CONFIG_PATH, JSON.stringify(cfg));
 
         (async () => {
           await applyTalkbackRouting(cfg);
           if (engineSocket) {
-            engineSocket.write(JSON.stringify({ type: 'set_talkback_dest', channel: TALKBACK_ID, busId: destBusId }) + '\n');
+            engineSocket.write(JSON.stringify({ type: 'set_talkback_dest', channel: TALKBACK_ID, busId: talkbackDestMask(destBusIds) }) + '\n');
           }
         })();
 
@@ -156,10 +321,44 @@ wss.on('connection', (ws) => {
           if (c.readyState === WebSocket.OPEN) c.send(loadedMsg);
         });
       } else if (data.type && allowedTypes.includes(data.type)) {
+        // Intercept mixer state changes: update in-memory snapshot, persist
+        // to disk (debounced), and fan-out to all other connected clients.
+        const ch = String(data.channel);
+        if (data.type === 'set_fader' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          // Prefer faderPosition (normalised 0..1 UI value) added by the
+          // UI store; fall back to raw amplitude value if absent.
+          mixerState[ch].fader = typeof data.faderPosition === 'number' ? data.faderPosition : data.value;
+          saveMixerState();
+        } else if (data.type === 'set_pan' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          mixerState[ch].pan = data.value;
+          saveMixerState();
+        } else if (data.type === 'set_mute' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          mixerState[ch].mute = !!data.value;
+          saveMixerState();
+        } else if (data.type === 'set_solo' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          mixerState[ch].solo = !!data.value;
+          saveMixerState();
+        } else if (data.type === 'set_aux_send' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          if (!mixerState[ch].auxSends) mixerState[ch].auxSends = {};
+          mixerState[ch].auxSends![String(data.busId)] = data.value;
+          saveMixerState();
+          console.log('Forwarding set_aux_send to IPC:', payloadStr);
+        }
+        // Forward to engine
         if (engineSocket) {
-          if (data.type === 'set_aux_send') console.log('Forwarding set_aux_send to IPC:', payloadStr);
           engineSocket.write(payloadStr + '\n');
         }
+        // Broadcast to all OTHER clients for live multi-client sync.
+        connectedWsClients.forEach(other => {
+          if (other !== ws && other.readyState === WebSocket.OPEN) {
+            other.send(payloadStr);
+          }
+        });
       }
     } catch (e) {
       // Invalid JSON or format, drop it
@@ -182,6 +381,39 @@ const ipcServer = net.createServer((socket) => {
   console.log('C++ Engine connected via IPC');
   engineSocket = socket;
 
+  // The engine is a JACK client: anything that restarts the JACK server out
+  // from under it (e.g. `systemctl restart pipewire`) kills its process
+  // (JackClient's shutdown callback calls std::exit) and every pw-link it
+  // held. A fresh engine process comes back with a blank port graph, and
+  // nothing was re-driving pw-link against it — the UI's "Apply" is what
+  // normally does that, but only on demand. Re-apply everything persisted
+  // to disk on every (re)connect so the signal chain self-heals whether
+  // this is the first boot or a recovery, with no manual step required.
+  (async () => {
+    await handlePatchbaySync(getPatchbayMappings());
+    await applyOutputRouting(getOutputRouting());
+    await applyMonitorRouting();
+    const talkbackCfg = getTalkbackConfig();
+    await applyTalkbackRouting(talkbackCfg);
+    // applyTalkbackRouting only wires the mic source side (pw-link); the
+    // destination mask lives in the engine's own TalkbackState and defaults
+    // to Master-only on a fresh process, so it needs resending explicitly
+    // or a recovered engine would silently diverge from what's persisted.
+    if (engineSocket) {
+      engineSocket.write(JSON.stringify({ type: 'set_talkback_dest', channel: TALKBACK_ID, busId: talkbackDestMask(talkbackCfg.destBusIds) }) + '\n');
+    }
+    // Restore fader/pan/mute/solo/aux positions to the engine from the
+    // persisted mixer_state.json so it resumes at the right levels.
+    const restoreLines = buildEngineRestoreCommands();
+    for (const line of restoreLines) {
+      if (engineSocket) engineSocket.write(line + '\n');
+    }
+    if (restoreLines.length > 0) {
+      console.log(`Mixer state restored to engine: ${restoreLines.length} commands sent.`);
+    }
+    console.log('Routing re-applied after engine (re)connect');
+  })();
+
   let buffer = '';
 
   socket.on('data', (data) => {
@@ -191,6 +423,14 @@ const ipcServer = net.createServer((socket) => {
 
     for (const line of lines) {
       if (line.trim().length > 0) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.type === 'plugin_list' && Array.isArray(parsed.plugins)) {
+            lastPluginCatalog = parsed.plugins;
+          }
+        } catch {
+          // Not JSON or not a message we care about caching; still forward below.
+        }
         connectedWsClients.forEach(ws => {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(line);
@@ -217,14 +457,10 @@ ipcServer.listen(SOCKET_PATH, () => {
   console.log(`IPC Server listening on ${SOCKET_PATH}`);
 });
 
-// Monitor and Talkback's source/destination wiring is fixed/persisted, not
-// something the operator re-applies by hand — get it live as soon as the
-// server (and hopefully PipeWire) is up, not only after the next manual
-// "Apply Routing" click.
-(async () => {
-  await applyMonitorRouting();
-  await applyTalkbackRouting(getTalkbackConfig());
-})();
+// Full routing (patchbay + output endpoints + Monitor + Talkback) is now
+// re-applied from the "C++ Engine connected via IPC" handler above on every
+// engine (re)connect, which covers both first boot and recovery after the
+// engine restarts — see the comment there.
 
 // --- aes67-linux-daemon polling: "AES67 destinations" ---
 // This app's Master/Aux buses only ever produce local PipeWire audio;
@@ -436,6 +672,9 @@ async function fetchMicDevices(): Promise<MicDevice[]> {
 }
 
 let lastMicDevices: MicDevice[] = [];
+// System LV2 plugin catalog, sent once by the engine at startup and cached
+// here so it can be replayed to any UI client that connects afterward.
+let lastPluginCatalog: any[] = [];
 
 async function pollMicDevices() {
   lastMicDevices = await fetchMicDevices();
@@ -549,14 +788,37 @@ function mergePatchbayMappings(incoming: any): Record<string, any> {
 const HARDWARE_OUT_L = 'alsa_output.pci-0000_06_00.6.pro-output-0:playback_AUX0';
 const HARDWARE_OUT_R = 'alsa_output.pci-0000_06_00.6.pro-output-0:playback_AUX1';
 
+// A bus's output-endpoint assignment: the destination ports plus whether
+// they carry an identical mono downmix rather than a distinct L/R pair.
+// `mono` only means something when there are 2+ ports — a single-port
+// endpoint is inherently mono either way, `mono` or not.
+interface OutputEndpoint {
+  ports: string[];
+  mono?: boolean;
+}
+
+function isOutputEndpoint(v: any): v is OutputEndpoint {
+  return v && typeof v === 'object' && Array.isArray(v.ports) && v.ports.every((p: any) => typeof p === 'string');
+}
+
 // Merges an incoming (possibly partial) output-endpoint payload for Master
 // (100) and the 8 Aux buses (101..108) on top of whatever is currently
 // persisted, so a client that only touched one bus can't wipe the rest.
-function mergeOutputRouting(incoming: any): Record<string, string[]> {
-  let merged: Record<string, string[]> = {};
+function mergeOutputRouting(incoming: any): Record<string, OutputEndpoint> {
+  let merged: Record<string, OutputEndpoint> = {};
   try {
     if (fs.existsSync(OUTPUT_ROUTING_PATH)) {
-      merged = JSON.parse(fs.readFileSync(OUTPUT_ROUTING_PATH, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(OUTPUT_ROUTING_PATH, 'utf8'));
+      for (const busId in raw) {
+        const v = raw[busId];
+        if (Array.isArray(v) && v.every((p: any) => typeof p === 'string')) {
+          // Config written before mono output support existed — a bare
+          // port list was always the stereo pairing.
+          merged[busId] = { ports: v };
+        } else if (isOutputEndpoint(v)) {
+          merged[busId] = { ports: v.ports, mono: !!v.mono };
+        }
+      }
     }
   } catch (e) {
     console.error('Error reading existing output routing config, starting fresh', e);
@@ -570,16 +832,16 @@ function mergeOutputRouting(incoming: any): Record<string, string[]> {
         console.error(`Rejected invalid output bus id in sync: ${JSON.stringify(rawBusId)}`);
         continue;
       }
-      const ports = incoming[rawBusId];
-      if (!Array.isArray(ports) || !ports.every((p: any) => typeof p === 'string')) {
-        console.error(`Rejected invalid output ports for bus ${busId}`);
+      const entry = incoming[rawBusId];
+      if (!isOutputEndpoint(entry)) {
+        console.error(`Rejected invalid output endpoint for bus ${busId}`);
         continue;
       }
-      if (ports.length === 0) {
+      if (entry.ports.length === 0) {
         // Explicit empty list clears this bus's assignment.
         delete merged[String(busId)];
       } else {
-        merged[String(busId)] = ports;
+        merged[String(busId)] = { ports: entry.ports, mono: !!entry.mono };
       }
     }
   }
@@ -587,8 +849,12 @@ function mergeOutputRouting(incoming: any): Record<string, string[]> {
   return merged;
 }
 
-function getOutputRouting(): Record<string, string[]> {
+function getOutputRouting(): Record<string, OutputEndpoint> {
   return mergeOutputRouting(null);
+}
+
+function getPatchbayMappings(): Record<string, any> {
+  return mergePatchbayMappings(null);
 }
 
 // Runs pw-link with an argv array (never a shell string) so no piece of a
@@ -719,7 +985,7 @@ async function handlePatchbaySync(mappings: any) {
 // Applies Master (100) and each of the 8 Aux buses' (101..108) output
 // endpoint assignment. Unlike Monitor, neither has a forced default — if
 // nothing is assigned, that bus just isn't routed anywhere.
-async function applyOutputRouting(routing: Record<string, string[]>) {
+async function applyOutputRouting(routing: Record<string, OutputEndpoint>) {
   for (let busId = MASTER_ID; busId <= MASTER_ID + NUM_AUX; busId++) {
     const outL = busId === MASTER_ID ? 'AES67_Deck:out_L' : `AES67_Deck:bus_${busId}_L`;
     const outR = busId === MASTER_ID ? 'AES67_Deck:out_R' : `AES67_Deck:bus_${busId}_R`;
@@ -727,15 +993,22 @@ async function applyOutputRouting(routing: Record<string, string[]>) {
     await disconnectAllOutputsOf(outL);
     await disconnectAllOutputsOf(outR);
 
-    const dest = routing[String(busId)];
-    if (!dest || dest.length === 0) continue;
+    const entry = routing[String(busId)];
+    if (!entry || entry.ports.length === 0) continue;
 
-    if (dest.length >= 2) {
-      await pwLink([outL, dest[0]]);
-      await pwLink([outR, dest[1]]);
+    if (entry.mono) {
+      // Mono: every destination port gets the identical downmix — both bus
+      // channels feed each port, rather than a distinct L/R pairing.
+      for (const p of entry.ports) {
+        await pwLink([outL, p]);
+        await pwLink([outR, p]);
+      }
+    } else if (entry.ports.length >= 2) {
+      await pwLink([outL, entry.ports[0]]);
+      await pwLink([outR, entry.ports[1]]);
     } else {
-      await pwLink([outL, dest[0]]);
-      await pwLink([outR, dest[0]]);
+      await pwLink([outL, entry.ports[0]]);
+      await pwLink([outR, entry.ports[0]]);
     }
   }
 

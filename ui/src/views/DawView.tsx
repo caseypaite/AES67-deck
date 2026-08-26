@@ -1,6 +1,6 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { useMixerStore } from '../stores/useMixerStore';
-import { useDawStore, DawClip } from '../stores/useDawStore';
+import { useDawStore } from '../stores/useDawStore';
 
 export const DawView = () => {
   const allChannels = useMixerStore(state => state.channels);
@@ -136,27 +136,30 @@ export const DawView = () => {
     const rect = e.currentTarget.getBoundingClientRect();
     const scrollLeft = scrollRef.current ? scrollRef.current.scrollLeft : 0;
     
-    const updateScrub = (ev: MouseEvent) => {
+    // Only clientX is needed, so this accepts either the native MouseEvent
+    // from the window listener below or the React.MouseEvent from the
+    // initial mousedown, with no unsafe cast needed for either.
+    const updateScrub = (ev: { clientX: number }) => {
       const clickX = ev.clientX - rect.left + scrollLeft;
       const newSec = Math.max(0, clickX / zoom);
-      
+
       // If snapping is on, maybe we want to snap playhead too? Optional.
       // Let's snap playhead if shift is NOT held, to match standard DAW behavior?
       // Actually, playhead scrubbing usually doesn't snap unless explicitly moving it on grid.
       // We'll snap playhead during scrub.
       setPlayheadPosition(snap(newSec));
     };
-    
+
     const up = () => {
       window.removeEventListener('mousemove', updateScrub);
       window.removeEventListener('mouseup', up);
     };
     window.addEventListener('mousemove', updateScrub);
     window.addEventListener('mouseup', up);
-    updateScrub(e as any);
+    updateScrub(e);
   };
 
-  const handleBackgroundClick = (e: React.MouseEvent) => {
+  const handleBackgroundClick = () => {
     clearSelection();
   };
 
@@ -352,7 +355,7 @@ export const DawView = () => {
                               const deltaX = ev.clientX - initialX;
                               const deltaSec = deltaX / zoom;
                               
-                              let rawNewStart = initialStart + deltaSec;
+                              const rawNewStart = initialStart + deltaSec;
                               let newStart = snap(rawNewStart);
                               newStart = Math.max(0, Math.min(initialStart + initialLength - 0.1, newStart));
                               
@@ -378,8 +381,8 @@ export const DawView = () => {
                               const deltaX = ev.clientX - initialX;
                               const deltaSec = deltaX / zoom;
                               
-                              let rawEnd = initialStart + initialLength + deltaSec;
-                              let newEnd = snap(rawEnd);
+                              const rawEnd = initialStart + initialLength + deltaSec;
+                              const newEnd = snap(rawEnd);
                               
                               const newLength = Math.max(0.1, newEnd - initialStart);
                               updateClip(clip.id, { length: newLength });
