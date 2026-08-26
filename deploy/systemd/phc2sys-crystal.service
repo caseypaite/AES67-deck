@@ -1,0 +1,21 @@
+[Unit]
+Description=Discipline CLOCK_REALTIME from the free-running I217 PHC (AES67 media reference)
+Documentation=file:///home/ck/aes67-deck/deploy/README.md
+# Only one thing may own CLOCK_REALTIME. While this runs, chrony must not.
+Conflicts=chrony.service
+After=time-sync.target
+Before=ptp4l-aes67-gm.service
+
+[Service]
+Type=simple
+# -s source (PHC)  -c client (system clock).  -O 0: PHC free-runs ~UTC, no TAI jump.
+# Modest servo (-R 1) so the system clock rides the crystal's short-term stability.
+ExecStart=/usr/sbin/phc2sys -s /dev/ptp0 -c CLOCK_REALTIME -O 0 -R 1 -m
+Restart=on-failure
+RestartSec=2
+# Wall-clock will drift from UTC at the crystal's ppm error. Re-align on
+# demand with:  sudo systemctl stop phc2sys-crystal && sudo chronyd -q && ...
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

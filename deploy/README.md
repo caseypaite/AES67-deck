@@ -49,3 +49,41 @@ Or disable Secure Boot in firmware and skip the enrollment.
 `daemon.conf` `interface_name` should be an interface with a **hardware
 PTP clock** (`ethtool -T <if>` shows `hardware-*` timestamping) for proper
 AES67 sync. Software-timestamping NICs work but with worse jitter.
+
+## PTP / clocking
+
+The RAVENNA driver runs the AES67 media clock as a **PTP slave** — it needs
+a grandmaster on the wire or streams won't lock. The media clock wants a
+stable *frequency* reference, not wall-clock time; NTP-disciplined
+`CLOCK_REALTIME` injects slews (and `makestep` discontinuities → clicks).
+
+On `ck-aes67` the on-board Intel I217 NIC (`eno1`) is damaged but its
+**PHC (`/dev/ptp0`) still free-runs** — a usable hardware crystal. Two ways
+to use it (mutually exclusive):
+
+- **Path 1 — self-contained deck.** Once the RAVENNA module loads, check
+  whether the Merging driver registers a steerable PHC (`/dev/ptp1`). If
+  so: `phc2sys -s /dev/ptp0 -c /dev/ptp1` locks the media clock straight
+  to the crystal — no `ptp4l`, no network PTP. Cleanest.
+- **Path 2 — this box is the AES67 clock master** (staged, disabled, via
+  `install-ptp.sh`): `phc2sys-crystal.service` makes `CLOCK_REALTIME`
+  follow `/dev/ptp0` (and stops chrony — `Conflicts=`), then
+  `ptp4l-aes67-gm.service` distributes it as a GM on `enp3s0`
+  (`linuxptp/aes67-gm.conf`, software timestamping).
+
+**Enable order for Path 2:** `sudo systemctl enable --now
+phc2sys-crystal` (chrony stops), then `sudo systemctl enable --now
+ptp4l-aes67-gm`. `aes67-gm.conf` `domainNumber` must equal `daemon.conf`
+`ptp_domain`. Wall-clock then drifts from UTC at the crystal's ppm error —
+re-align on demand by stopping `phc2sys-crystal` and running `chronyd -q`.
+
+**Do not** run `phc2sys -s CLOCK_REALTIME -c /dev/ptp0` (that pipes NTP
+jitter *into* the reference), and `eno1` does **not** need to be `up` for
+`/dev/ptp0` to tick (confirmed).
+
+**When the replacement HW-PTP NIC arrives:** point `aes67-gm.conf`
+`[enp3s0]` and `daemon.conf` `interface_name` at it, set `time_stamping =
+hardware`. The I217 PHC then becomes a holdover backup.
+
+`ptp/phc-stability-check.py <dev> <seconds>` characterises a free-running
+PHC (rate offset + jitter vs the undisciplined TSC) before you rely on it.

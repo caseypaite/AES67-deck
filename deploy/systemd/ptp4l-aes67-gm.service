@@ -1,0 +1,15 @@
+[Unit]
+Description=AES67 media-clock PTP grandmaster (enp3s0, software timestamping)
+Documentation=file:///home/ck/aes67-deck/deploy/README.md
+After=network-online.target phc2sys-crystal.service
+Wants=network-online.target
+Requires=phc2sys-crystal.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/aes67-gm.conf --step_threshold=1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
