@@ -17,6 +17,7 @@ i5-4570 / 4 GB). Adjust the NIC name and host specifics for your machine.
 | `modules/aes67.conf` | `/etc/modules-load.d/` | load `MergingRavennaALSA` at boot |
 | `systemd/aes67-deck-{server,engine}.service` | `~/.config/systemd/user/` | run the stack as lingering user services |
 | `nginx/aes67-deck` | `/etc/nginx/sites-available/` | serve the built UI on port 80 |
+| `watch/aes67-watch.{sh,service}` | `/usr/local/bin/`, `/etc/systemd/system/` | log PTP lock + AES67 stream discovery to `/var/log/aes67-watch.log` |
 
 ## Order
 
@@ -83,16 +84,22 @@ grandmaster role but the driver never sees it (tested on `ck-aes67`). So:
   driver registers no `/dev/ptp` clock (it uses an internal hrtimer).
 
 Working options for the grandmaster:
-1. A dedicated small box on the LAN (e.g. a Raspberry Pi) running
+1. **A Dante device in AES67 mode** — it runs a PTPv2 GM on domain 0.
+   Verified on `ck-aes67` 2026-08-26: the RAVENNA driver locked to an
+   Audinate GMID (`00-1D-C1-…`) and a Dante `L24/48000/2`, `ptime:1`
+   source (`239.69.x.x`) was received end-to-end into the mixer engine.
+   Just `playout_delay ≥ 96` in `daemon.conf` (software-timestamped
+   slave needs the buffer headroom).
+2. A dedicated small box on the LAN (e.g. a Raspberry Pi) running
    `ptp4l -i eth0 -f gm.conf` on domain 0.
-2. A **second NIC in this box** running `ptp4l` GM, plugged into the same
+3. A **second NIC in this box** running `ptp4l` GM, plugged into the same
    switch as `enp3s0` — the switch floods the PTP multicast back to
    `enp3s0`'s port, so it arrives as wire ingress and PRE_ROUTING sees it.
    With the replacement HW-PTP NIC this is the clean single-box setup:
    `ptp4l` GM on the new NIC (hardware timestamping, clocked off the free-
    running I217 PHC at `/dev/ptp0` — 0.002 ppm skew, verified), RAVENNA on
    `enp3s0`.
-3. A PTP-capable switch / hardware master / another AES67 device as GM.
+4. A PTP-capable switch / hardware master as GM.
 
 `aes67-gm.conf` `domainNumber` must equal `daemon.conf` `ptp_domain`
 (both 0). `eno1` does **not** need to be `up` for `/dev/ptp0` to tick.

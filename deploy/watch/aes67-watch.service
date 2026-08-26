@@ -1,0 +1,14 @@
+[Unit]
+Description=AES67 bring-up watcher (logs PTP lock + stream discovery)
+After=aes67-daemon.service
+Wants=aes67-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aes67-watch.sh
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
