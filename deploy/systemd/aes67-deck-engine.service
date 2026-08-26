@@ -1,0 +1,18 @@
+[Unit]
+Description=AES67-Deck DSP engine (JACK client)
+After=aes67-deck-server.service pipewire.service wireplumber.service
+Wants=aes67-deck-server.service pipewire.service wireplumber.service
+# engine exits by design when JACK/PipeWire drops — just restart forever
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/aes67-deck/engine/build/aes67_deck_engine
+Restart=always
+RestartSec=1
+LimitMEMLOCK=infinity
+LimitRTPRIO=95
+Nice=-10
+
+[Install]
+WantedBy=default.target

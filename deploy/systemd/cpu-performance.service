@@ -1,0 +1,12 @@
+[Unit]
+Description=Lock CPU frequency governor to performance (RT audio)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash -c 'for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance > "$c"; done'
+ExecStart=/usr/bin/bash -c 'test -w /sys/devices/system/cpu/intel_pstate/no_turbo && echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo || true'
+
+[Install]
+WantedBy=multi-user.target

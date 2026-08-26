@@ -1,0 +1,17 @@
+[Unit]
+Description=AES67-Deck WebSocket / IPC server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aes67-deck/server
+ExecStart=/usr/bin/node dist/index.js
+Environment=PORT=8081
+Environment=AES67_DAEMON_URL=http://localhost:8080
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
