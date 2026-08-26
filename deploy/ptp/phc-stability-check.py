@@ -1,51 +1,62 @@
 #!/usr/bin/env python3
-"""Characterise a free-running PHC against CLOCK_MONOTONIC_RAW (undisciplined
-TSC). Reports the rate offset between the two crystals and the short-term
-jitter around that linear drift. Erratic residuals => suspect clock block."""
-import os, sys, time, statistics
+"""Characterise a free-running PHC as a frequency reference, using chrony's
+`refclock PHC` driver as the measurement instrument — it reads the PHC with
+PTP_SYS_OFFSET_EXTENDED and filters it, and `chronyc sourcestats` then
+reports the frequency skew and residual std-dev directly.
+
+A homegrown clock_gettime loop can't do this reliably: compared against
+CLOCK_REALTIME it measures chrony's NTP corrections, not the crystal;
+compared against CLOCK_MONOTONIC_RAW it measures scheduler preemption on a
+non-RT box. This script sidesteps both.
+
+The probe is `noselect` — it never disciplines the system clock — and is
+removed afterwards, restoring chrony to its normal sources.
+
+    sudo ./phc-stability-check.py /dev/ptp0 120
+"""
+import subprocess, sys, time, os
 
 dev = sys.argv[1] if len(sys.argv) > 1 else "/dev/ptp0"
-dur = int(sys.argv[2]) if len(sys.argv) > 2 else 240
-interval = 2.0
+settle = int(sys.argv[2]) if len(sys.argv) > 2 else 120
+conf = "/etc/chrony/conf.d/zz-phc-probe.conf"
 
-fd = os.open(dev, os.O_RDONLY)
-PHC = ((~fd) << 3) | 3          # FD_TO_CLOCKID
-RAW = time.CLOCK_MONOTONIC_RAW
+if os.geteuid() != 0:
+    sys.exit("run with sudo")
 
-def pair():
-    # bracket the PHC read with RAW reads to bound the sampling error
-    a = time.clock_gettime_ns(RAW)
-    p = time.clock_gettime_ns(PHC)
-    b = time.clock_gettime_ns(RAW)
-    return (a + b) // 2, p, b - a
 
-r0, p0, _ = pair()
-xs, ys, errs = [], [], []
-print(f"# sampling {dev} vs CLOCK_MONOTONIC_RAW for {dur}s ...", flush=True)
-end = r0 + dur * 1_000_000_000
-while time.clock_gettime_ns(RAW) < end:
-    r, p, e = pair()
-    xs.append(r - r0); ys.append(p - p0); errs.append(e)
-    time.sleep(interval)
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, text=True, capture_output=True).stdout.strip()
 
-n = len(xs)
-mx = sum(xs) / n; my = sum(ys) / n
-sxx = sum((x - mx) ** 2 for x in xs)
-slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
-ppm = (slope - 1) * 1e6
-resid = [y - (slope * (x - mx) + my) for x, y in zip(xs, ys)]
-drift = [y - x for x, y in zip(xs, ys)]          # accumulated PHC-RAW gap
 
-print(f"samples          : {n} over {xs[-1]/1e9:.1f}s")
-print(f"read window err  : median {statistics.median(errs):.0f} ns, max {max(errs):.0f} ns")
-print(f"rate offset      : {ppm:+.3f} ppm  (PHC vs TSC crystal)")
-print(f"fit residual     : rms {statistics.pstdev(resid):.0f} ns, peak {max(abs(r) for r in resid):.0f} ns")
-mono = all(drift[i] <= drift[i+1] for i in range(len(drift)-1)) or \
-       all(drift[i] >= drift[i+1] for i in range(len(drift)-1))
-print(f"drift monotonic  : {mono}")
-step = max(abs(drift[i+1]-drift[i]) for i in range(len(drift)-1))
-print(f"largest step     : {step:.0f} ns between consecutive 2s samples")
-for i in range(0, n, max(1, n // 12)):
-    print(f"  t={xs[i]/1e9:6.1f}s  gap={drift[i]:+d} ns")
-verdict = "HEALTHY" if (abs(ppm) < 120 and statistics.pstdev(resid) < 2000 and step < 20000) else "SUSPECT — inspect before relying on it"
-print(f"verdict          : {verdict}")
+open(conf, "w").write(f"refclock PHC {dev} poll 0 dpoll -2 filter 16 noselect\n")
+try:
+    sh("systemctl restart chrony")
+    print(f"# probing {dev} for {settle}s via chrony refclock ...", flush=True)
+    time.sleep(settle)
+    stats = sh("chronyc -n sourcestats")
+    src = sh("chronyc -n sources")
+finally:
+    os.remove(conf)
+    sh("systemctl restart chrony")
+
+phc_stats = next((l for l in stats.splitlines() if l.startswith("PHC")), None)
+phc_src = next((l for l in src.splitlines() if "PHC" in l), None)
+print(stats.splitlines()[0] if stats else "")
+print(phc_stats or "(no PHC row — not enough samples, raise the duration)")
+print(phc_src or "")
+
+if phc_stats:
+    # PHC0  NP NR Span Frequency FreqSkew Offset StdDev
+    f = phc_stats.split()
+    freq_skew = float(f[5]); std_dev = f[7]
+    def to_ns(s):
+        s = s.strip()
+        for suf, mul in (("us", 1000), ("ns", 1), ("ms", 1_000_000), ("s", 1e9)):
+            if s.endswith(suf):
+                return float(s[:-len(suf)]) * mul
+        return float(s)
+    sd = to_ns(std_dev)
+    v = ("HEALTHY — good frequency reference" if freq_skew < 0.05 and sd < 200 else
+         "USABLE — a bit noisy, fine for software-timestamped PTP" if freq_skew < 0.5 and sd < 2000 else
+         "SUSPECT — freq skew / std-dev high for a hardware clock")
+    print(f"\nfreq skew {freq_skew:g} ppm, residual std-dev {sd:.0f} ns  =>  {v}")
