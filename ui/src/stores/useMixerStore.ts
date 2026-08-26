@@ -464,7 +464,13 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   connectWebSocket: () => {
     if (get().ws) return; // Prevent double-connection
 
-    const ws = new WebSocket('ws://localhost:8081');
+    // Derive the server host from the page origin so the UI works when
+    // served from the appliance to a remote browser (tablet/laptop), not
+    // just from localhost. Overridable via VITE_WS_URL at build time.
+    const wsUrl =
+      import.meta.env.VITE_WS_URL ||
+      `ws://${typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : 'localhost'}:8081`;
+    const ws = new WebSocket(wsUrl);
     set({ ws });
     ws.onmessage = (event) => {
       try {
