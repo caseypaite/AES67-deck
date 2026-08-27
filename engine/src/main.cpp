@@ -651,7 +651,7 @@ int main(int argc, char** argv) {
     std::vector<float> tmp_R(8192, 0.0f);
     std::vector<float> tmp_out_L(8192, 0.0f);
     std::vector<float> tmp_out_R(8192, 0.0f);
-    std::vector<char> meter_json(8192, 0);
+    std::vector<char> meter_json(32768, 0);   // headroom for live-record peak batches
 
     jack.set_process_callback([&](jack_nframes_t nframes) {
         auto inputs = jack.get_input_ports();
@@ -1223,6 +1223,26 @@ int main(int argc, char** argv) {
                     "%s%.3f,%.3f", i ? "," : "", g_gonio[idx * 2], g_gonio[idx * 2 + 1]);
             }
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]}");
+
+            // ── Live-record peak envelope: the per-block min/max pairs of each
+            //    armed tap accumulated since the last frame, for the growing
+            //    UI waveform. Flat [min,max,min,max,...] per channel. ──
+            if (mtr.is_recording()) {
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, ",\"recPeaks\":{");
+                bool rf = true;
+                float pk[192];
+                for (int ch : mtr.armed()) {
+                    const int npairs = mtr.poll_tap_peaks(ch, pk, 96);
+                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                        "%s\"%d\":[", rf ? "" : ",", ch);
+                    for (int i = 0; i < npairs * 2 && offset < (int)meter_json.size() - 16; ++i)
+                        offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                            "%s%.4f", i ? "," : "", pk[i]);
+                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]");
+                    rf = false;
+                }
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+            }
 
             // ── Transport position (engine-owned clock; UI/server follow) ──
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,

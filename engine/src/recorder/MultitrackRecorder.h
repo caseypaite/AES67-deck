@@ -47,6 +47,38 @@ public:
         const float* chans[2] = { l, r };
         w->write_audio(chans, 2, nframes);
         frames_tapped_.fetch_add(nframes, std::memory_order_relaxed);
+
+        // Live-waveform envelope: one min/max pair per PEAK_BUCKET frames pushed
+        // to a small per-channel ring, so the resolution is independent of the
+        // graph quantum. The process thread is the only reader/writer (it also
+        // builds the metering frame that drains this), so no atomics.
+        TapRing& tr = tap_[ch_id];
+        for (int base = 0; base < nframes; base += PEAK_BUCKET) {
+            const int end = base + PEAK_BUCKET < nframes ? base + PEAK_BUCKET : nframes;
+            float mn = 0.0f, mx = 0.0f;
+            for (int i = base; i < end; ++i) {
+                const float a = l[i], b = r[i];
+                if (a < mn) mn = a; else if (a > mx) mx = a;
+                if (b < mn) mn = b; else if (b > mx) mx = b;
+            }
+            const int nw = (tr.w + 1) % PEAK_RING;
+            if (nw != tr.r) { tr.mn[tr.w] = mn; tr.mx[tr.w] = mx; tr.w = nw; }
+        }
+    }
+
+    // RT thread (metering builder). Drains up to `cap` accumulated min/max
+    // pairs into out[] as [min,max,min,max,...]; returns the pair count.
+    int poll_tap_peaks(int ch_id, float* out, int cap) {
+        if (ch_id < 1 || ch_id > MAX_CH) return 0;
+        TapRing& tr = tap_[ch_id];
+        int n = 0;
+        while (tr.r != tr.w && n < cap) {
+            out[n * 2] = tr.mn[tr.r];
+            out[n * 2 + 1] = tr.mx[tr.r];
+            tr.r = (tr.r + 1) % PEAK_RING;
+            ++n;
+        }
+        return n;
     }
 
     uint64_t frames_tapped() const { return frames_tapped_.load(std::memory_order_relaxed); }
@@ -74,6 +106,15 @@ private:
     std::array<std::unique_ptr<WavpackWriter>, MAX_CH + 1> writers_{}; // index by ch id
     std::atomic<bool> recording_{false};
     std::atomic<uint64_t> frames_tapped_{0};
+
+    // Live-waveform peak envelope: one min/max pair per PEAK_BUCKET frames
+    // (~5 ms @ 48k), per channel. Single-thread (process) ring; the metering
+    // builder drains it. PEAK_RING covers ~1 s so a slow metering frame
+    // (large quantum) can't lose points.
+    static constexpr int PEAK_BUCKET = 256;
+    static constexpr int PEAK_RING = 256;
+    struct TapRing { float mn[PEAK_RING] = {}; float mx[PEAK_RING] = {}; int w = 0; int r = 0; };
+    TapRing tap_[MAX_CH + 1];
     std::string dir_;
     std::vector<int> armed_;
     uint64_t origin_frame_ = 0;
