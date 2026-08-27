@@ -245,7 +245,7 @@ export const FxRackCard = () => {
   return (
     <div className="flex h-full w-full">
       {/* ── Rack Card (square / fixed width = full panel height) ── */}
-      <div className="metal-face-rack metal-grain relative flex flex-col border-r-2 border-black/70 shrink-0"
+      <div className="metal-face-rack metal-grain relative flex flex-col border-r-2 border-black/70 shrink-0 h-full min-h-0"
            style={{ width: 'var(--rack-width, 200px)' }}>
 
         {/* Nameplate header */}
@@ -313,8 +313,9 @@ export const FxRackCard = () => {
           </div>
         </div>
 
-        {/* Plugin slots */}
-        <div className="flex-1 overflow-y-auto custom-scrollbar p-1.5 flex flex-col gap-1.5 metal-well">
+        {/* Plugin slots — min-h-0 so this scrolls internally instead of
+            growing the card (which would push INSERT EFFECT out of view). */}
+        <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar p-1.5 flex flex-col gap-1.5 metal-well">
           {plugins.length === 0 && (
             <div className="flex-1 flex flex-col items-center justify-center text-gray-600 text-[9px] font-black tracking-widest text-center gap-1 border border-dashed border-white/10 rounded m-1">
               <div>EMPTY RACK</div>
