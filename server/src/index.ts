@@ -581,6 +581,7 @@ wss.on('connection', (ws) => {
         connectedWsClients.forEach(c => {
           if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
         });
+        pushTimelineToEngine(name, project);
       } else if (data.type === 'new_project') {
         const name = sanitizeProjectName(data.name);
         ensureProject(name);
@@ -593,6 +594,7 @@ wss.on('connection', (ws) => {
             c.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
           }
         });
+        pushTimelineToEngine(name, project);
       } else if (data.type === 'save_project') {
         const name = sanitizeProjectName(data.name);
         const p = data.project || {};
@@ -603,6 +605,7 @@ wss.on('connection', (ws) => {
           loop: p.loop && typeof p.loop === 'object' ? p.loop : undefined,
         };
         saveProjectDebounced(name, project);
+        if (name === activeProjectName) pushTimelineToEngine(name, project);
         // Fan out so other connected clients converge on the same arrangement.
         connectedWsClients.forEach(c => {
           if (c !== ws && c.readyState === WebSocket.OPEN) {
@@ -734,7 +737,37 @@ function handleTakeFinished(msg: any): boolean {
     overrun: !!msg.overrun,
     clips,
   }));
+  // The committed clips aren't in project.json yet (the UI persists them via
+  // save_project), so fold them in here for the engine schedule.
+  pushTimelineToEngine(activeProjectName, undefined, clips);
   return true;
+}
+
+// Resolve the active project's clips to absolute source paths + frame
+// positions and push them to the engine as the playback schedule.
+function pushTimelineToEngine(name: string, project?: DawProject, extraClips: any[] = []): void {
+  if (!engineSocket) return;
+  const proj = project || loadProject(name);
+  const allClips = [...(proj.clips || []), ...extraClips];
+  const dir = projectDir(name);
+  const specs: any[] = [];
+  for (const c of allClips) {
+    if (!c || !c.takeDir || !c.file) continue;
+    const sr = Number(c.sampleRate) > 0 ? Number(c.sampleRate) : 48000;
+    const start = Number(c.start) || 0;
+    const length = Number(c.length) || 0;
+    const sourceOffset = Number(c.sourceOffset) || 0;
+    if (length <= 0) continue;
+    specs.push({
+      trackId: Number(c.trackId),
+      timelineStart: Math.round(start * sr),
+      length: Math.round(length * sr),
+      fileStart: Math.round(sourceOffset * sr),
+      gain: typeof c.gain === 'number' ? c.gain : 1.0,
+      path: path.resolve(dir, 'takes', String(c.takeDir), String(c.file)),
+    });
+  }
+  engineSocket.write(JSON.stringify({ type: 'set_timeline', clips: specs }) + '\n');
 }
 
 const ipcServer = net.createServer((socket) => {
@@ -783,6 +816,9 @@ const ipcServer = net.createServer((socket) => {
     if (restoreLines.length > 0) {
       console.log(`Mixer state restored to engine: ${restoreLines.length} commands sent.`);
     }
+    // Replay the active project's timeline so playback works after an engine
+    // restart, same self-heal contract as routing.
+    pushTimelineToEngine(activeProjectName);
     console.log('Routing re-applied after engine (re)connect');
   })();
 

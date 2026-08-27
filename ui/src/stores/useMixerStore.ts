@@ -705,6 +705,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             const t = data.transport;
             // Engine transport is authoritative for both position and state.
             useDawStore.getState().applyTransport(t.frame, t.state, t.sr);
+            if (t.pbUnderrun) useDawStore.getState().flagPlaybackUnderrun();
             const st = t.state === 2 ? 'recording' : t.state === 1 ? 'playing' : 'stopped';
             if (get().transportState !== st) set({ transportState: st });
           }

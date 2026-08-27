@@ -16,6 +16,7 @@ export const DawView = () => {
   const setZoom = useDawStore(state => state.setZoom);
   const recordOriginSec = useDawStore(state => state.recordOriginSec);
   const lastOverrun = useDawStore(state => state.lastOverrun);
+  const playbackUnderrun = useDawStore(state => state.playbackUnderrun);
 
   // Selection & Clipboard
   const selectedClipIds = useDawStore(state => state.selectedClipIds);
@@ -317,17 +318,25 @@ export const DawView = () => {
                             const initialX = e.clientX;
                             const initialStart = clip.start;
                             const initialLength = clip.length;
-                            
+                            const initialOffset = clip.sourceOffset || 0;
+
                             const move = (ev: MouseEvent) => {
                               const deltaX = ev.clientX - initialX;
                               const deltaSec = deltaX / zoom;
-                              
+
                               const rawNewStart = initialStart + deltaSec;
                               let newStart = snap(rawNewStart);
                               newStart = Math.max(0, Math.min(initialStart + initialLength - 0.1, newStart));
-                              
-                              const newLength = initialLength - (newStart - initialStart);
-                              updateClip(clip.id, { start: newStart, length: newLength });
+
+                              const shift = newStart - initialStart;
+                              const newLength = initialLength - shift;
+                              // Left-trim also advances into the source file so
+                              // the audio under the clip stays put.
+                              updateClip(clip.id, {
+                                start: newStart,
+                                length: newLength,
+                                sourceOffset: Math.max(0, initialOffset + shift),
+                              });
                             };
                             const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
                             window.addEventListener('mousemove', move);
@@ -369,9 +378,9 @@ export const DawView = () => {
         </div>
       </div>
 
-      {lastOverrun && (
+      {(lastOverrun || playbackUnderrun) && (
         <div className="absolute bottom-6 left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400">
-          ⚠ Last take dropped audio — disk could not keep up
+          ⚠ {lastOverrun ? 'Last take dropped audio — disk could not keep up' : 'Playback dropout — disk could not keep up'}
         </div>
       )}
 

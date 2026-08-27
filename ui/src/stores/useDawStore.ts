@@ -11,12 +11,14 @@ export interface DawClip {
   color: string;
   name: string;
   // Source info — present on recorded / imported clips. Phase 2 playback
-  // reads these; Phase 1 just carries them through persistence.
+  // reads these.
   takeDir?: string;
   file?: string;
   originFrame?: number;
   endFrame?: number;
   sampleRate?: number;
+  sourceOffset?: number; // seconds into the source file the clip starts (left-trim)
+  gain?: number;         // linear playback gain, default 1
 }
 
 export interface DawMarker {
@@ -54,6 +56,7 @@ interface DawState {
   gridSize: number;               // seconds
 
   lastOverrun: boolean;           // last committed take reported a disk overrun
+  playbackUnderrun: boolean;      // the timeline reader couldn't keep playback fed
 
   setZoom: (zoom: number) => void;
   setPlayheadPosition: (pos: number) => void;
@@ -64,6 +67,7 @@ interface DawState {
   setGridSize: (size: number) => void;
 
   applyTransport: (frame: number, state: number, sr: number) => void;
+  flagPlaybackUnderrun: () => void;
 
   addClip: (clip: DawClip) => void;
   updateClip: (id: string, updates: Partial<DawClip>) => void;
@@ -152,14 +156,16 @@ export const useDawStore = create<DawState>()(
       gridSize: 1.0,
 
       lastOverrun: false,
+      playbackUnderrun: false,
 
       setZoom: (zoom) => set({ zoom: Math.max(2, Math.min(100, zoom)) }),
+      flagPlaybackUnderrun: () => { if (!get().playbackUnderrun) set({ playbackUnderrun: true }); },
 
       setPlayheadPosition: (pos) => set({ playheadPosition: Math.max(0, pos) }),
 
       locate: (sec) => {
         const s = Math.max(0, sec);
-        set({ playheadPosition: s, _engineSec: s, _engineWall: performance.now() });
+        set({ playheadPosition: s, _engineSec: s, _engineWall: performance.now(), playbackUnderrun: false });
         wsSend({ type: 'transport_locate', frame: Math.round(s * get().sampleRate) });
       },
 
@@ -270,7 +276,13 @@ export const useDawStore = create<DawState>()(
               const length2 = clip.start + clip.length - pos;
               nextClips[id] = { ...clip, length: length1 };
               const newId = uuid();
-              nextClips[newId] = { ...clip, id: newId, start: pos, length: length2 };
+              nextClips[newId] = {
+                ...clip,
+                id: newId,
+                start: pos,
+                length: length2,
+                sourceOffset: (clip.sourceOffset || 0) + length1,
+              };
               newSelection.push(newId);
             }
           });
