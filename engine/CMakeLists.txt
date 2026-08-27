@@ -30,6 +30,7 @@ add_executable(aes67_deck_engine
     src/plugins/Lv2Host.cpp
     src/ipc/IpcClient.cpp
     src/recorder/DiskWriter.cpp
+    src/recorder/MultitrackRecorder.cpp
 )
 
 target_link_libraries(aes67_deck_engine

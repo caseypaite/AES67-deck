@@ -35,6 +35,13 @@ void IpcClient::set_plugin_manage_callback(std::function<void(const nlohmann::js
 void IpcClient::set_plugin_callback(std::function<void(const std::string&, int, int, const std::string&, float)> cb) {
     plugin_callback_ = cb;
 }
+void IpcClient::set_transport_callback(std::function<void(const nlohmann::json&)> cb) {
+    transport_callback_ = cb;
+}
+
+void IpcClient::send_json(const std::string& json_payload) {
+    send_multichannel_metering(json_payload);
+}
 
 void IpcClient::send_metering(float l, float r) {
     // Legacy fallback, you can update this to full multichannel metering string
@@ -145,6 +152,10 @@ void IpcClient::run() {
                         // fixed-shape callbacks above handle — hand the whole
                         // parsed message through.
                         if (plugin_manage_callback_) plugin_manage_callback_(j);
+                    } else if (type == "transport_play" || type == "transport_stop" ||
+                               type == "transport_locate" || type == "transport_set_loop" ||
+                               type == "start_multitrack_record" || type == "stop_multitrack_record") {
+                        if (transport_callback_) transport_callback_(j);
                     } else {
                         int channel = j.value("channel", -1);
                         if (channel != -1) {

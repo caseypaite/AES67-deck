@@ -16,6 +16,7 @@
 #include "ipc/IpcClient.h"
 #include "ipc/json.hpp"
 #include "recorder/DiskWriter.h"
+#include "recorder/MultitrackRecorder.h"
 
 using namespace aes67_deck;
 
@@ -250,6 +251,21 @@ struct TalkbackState {
     std::atomic<uint32_t> dest_bus_mask{1u}; // bit 0 (Master) set by default
 };
 
+// Sample-accurate transport clock. The engine owns it; the server and UI
+// follow it (position rides out on the `transport` key of the metering
+// frame). Written from the IPC thread (locate / play / stop / loop) and the
+// audio thread (advance), read on the audio thread every callback — relaxed
+// atomics are fine, a one-block-stale read here has no correctness cost.
+struct Transport {
+    std::atomic<uint64_t> frame{0};
+    std::atomic<int> state{0};              // 0 stopped, 1 playing, 2 recording
+    std::atomic<int64_t> locate_to{-1};     // IPC thread sets; audio thread consumes and resets to -1
+    std::atomic<uint64_t> loop_start{0};
+    std::atomic<uint64_t> loop_end{0};
+    std::atomic<bool> loop_enabled{false};
+};
+static Transport g_transport;
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -260,6 +276,7 @@ int main(int argc, char** argv) {
     audio::JackClient jack("AES67_Deck");
     ipc::IpcClient ipc("/tmp/aes67_deck.sock");
     recorder::DiskWriter recorder;
+    recorder::MultitrackRecorder mtr;
     plugins::Lv2Host lv2_host;
 
     // Scan system for LV2 plugins
@@ -424,6 +441,88 @@ int main(int argc, char** argv) {
         }
     });
 
+    // Transport + multitrack record. Runs on the IPC thread: it opens/closes
+    // take files here (never on the audio thread) and flips the transport
+    // atomics the audio callback reads. take_started / take_finished replies
+    // ride the same IPC tx path as metering.
+    ipc.set_transport_callback([&mtr, &jack, &ipc](const nlohmann::json& j) {
+        const std::string type = j.value("type", "");
+
+        if (type == "transport_play") {
+            // Don't clobber an in-progress recording (state 2).
+            if (g_transport.state.load(std::memory_order_relaxed) != 2)
+                g_transport.state.store(1, std::memory_order_relaxed);
+
+        } else if (type == "transport_stop") {
+            if (mtr.is_recording()) {
+                mtr.stop();
+                nlohmann::json done{{"type", "take_finished"}, {"dir", mtr.dir()},
+                                    {"originFrame", mtr.origin_frame()},
+                                    {"endFrame", g_transport.frame.load(std::memory_order_relaxed)},
+                                    {"sampleRate", mtr.sample_rate()},
+                                    {"armed", mtr.armed()},
+                                    {"overrun", mtr.had_overrun()}};
+                ipc.send_json(done.dump());
+            }
+            g_transport.state.store(0, std::memory_order_relaxed);
+
+        } else if (type == "transport_locate") {
+            int64_t f = j.value("frame", (int64_t)0);
+            if (f < 0) f = 0;
+            g_transport.locate_to.store(f, std::memory_order_relaxed);
+
+        } else if (type == "transport_set_loop") {
+            uint64_t s = j.value("start", (uint64_t)0);
+            uint64_t e = j.value("end", (uint64_t)0);
+            g_transport.loop_start.store(s, std::memory_order_relaxed);
+            g_transport.loop_end.store(e, std::memory_order_relaxed);
+            g_transport.loop_enabled.store(j.value("enabled", false) && e > s,
+                                          std::memory_order_relaxed);
+
+        } else if (type == "start_multitrack_record") {
+            const std::string dir = j.value("dir", "");
+            std::vector<int> armed;
+            if (j.contains("armed") && j["armed"].is_array()) {
+                for (const auto& v : j["armed"]) if (v.is_number_integer()) armed.push_back(v.get<int>());
+            }
+            if (dir.empty() || armed.empty()) {
+                std::cerr << "start_multitrack_record: need dir + non-empty armed[]" << std::endl;
+                return;
+            }
+            // The take's project-time zero is wherever the transport is right
+            // now (accurate to within one audio block).
+            const uint64_t origin = g_transport.frame.load(std::memory_order_relaxed);
+            const int sr_i = static_cast<int>(jack.get_sample_rate());
+            if (!mtr.start(dir, armed, sr_i, origin)) {
+                nlohmann::json err{{"type", "take_failed"}, {"dir", dir}};
+                ipc.send_json(err.dump());
+                return;
+            }
+            g_transport.state.store(2, std::memory_order_relaxed);
+            nlohmann::json started{{"type", "take_started"}, {"dir", mtr.dir()},
+                                   {"originFrame", origin}, {"sampleRate", sr_i},
+                                   {"armed", mtr.armed()}};
+            ipc.send_json(started.dump());
+
+        } else if (type == "stop_multitrack_record") {
+            if (mtr.is_recording()) {
+                mtr.stop();
+                nlohmann::json done{{"type", "take_finished"}, {"dir", mtr.dir()},
+                                    {"originFrame", mtr.origin_frame()},
+                                    {"endFrame", g_transport.frame.load(std::memory_order_relaxed)},
+                                    {"sampleRate", mtr.sample_rate()},
+                                    {"armed", mtr.armed()},
+                                    {"overrun", mtr.had_overrun()}};
+                ipc.send_json(done.dump());
+            }
+            // Leave the transport running (state 1) so playback of what was
+            // just captured can start immediately; an explicit transport_stop
+            // parks it.
+            if (g_transport.state.load(std::memory_order_relaxed) == 2)
+                g_transport.state.store(1, std::memory_order_relaxed);
+        }
+    });
+
     ipc.set_plugin_callback([&channels](const std::string& type, int channel_id, int p_idx, const std::string& param_id, float value) {
         if (channels.find(channel_id) != channels.end()) {
             if (p_idx >= 0 && p_idx < channels[channel_id].insert_chain.size()) {
@@ -529,6 +628,16 @@ int main(int argc, char** argv) {
         if (inputs.size() < static_cast<size_t>(2 * NUM_CHANNELS + 2) ||
             outputs.size() < static_cast<size_t>(2 + 2 * NUM_AUX + 2)) return;
         if (nframes > 8192) return;
+
+        // ── Transport ── consume a pending locate, then read this block's
+        // start frame (its value for the whole callback). Advancing happens
+        // at the end so `block_start_frame` is the position of sample 0.
+        {
+            int64_t loc = g_transport.locate_to.exchange(-1, std::memory_order_relaxed);
+            if (loc >= 0) g_transport.frame.store(static_cast<uint64_t>(loc), std::memory_order_relaxed);
+        }
+        const uint64_t block_start_frame = g_transport.frame.load(std::memory_order_relaxed);
+        const int transport_state = g_transport.state.load(std::memory_order_relaxed);
 
         // Apply any queued plugin-chain mutations before processing any
         // channel this cycle — insert_chain is only ever touched here, on
@@ -658,6 +767,10 @@ int main(int argc, char** argv) {
             if (!in_buf_L || !in_buf_R) continue;
 
             ChannelState& st = channels[i];
+
+            // Multitrack record tap: raw pre-insert channel input (plan D1).
+            // No-op unless this channel is armed in the current take.
+            mtr.write(i, in_buf_L, in_buf_R, static_cast<int>(nframes));
 
             // 1. Copy Stereo input to temporary buffers
             std::memcpy(tmp_L.data(), in_buf_L, sizeof(float) * nframes);
@@ -894,8 +1007,8 @@ int main(int argc, char** argv) {
             m_st.current_peak_r = std::max(m_st.current_peak_r, m_peak_r);
         }
 
-        std::vector<float*> out_bufs = {out_L, out_R};
-        recorder.write_audio(out_bufs, nframes);
+        const float* master_bufs[2] = { out_L, out_R };
+        recorder.write_audio(master_bufs, 2, nframes);
 
         // ── BS.1770 loudness on the final Master mix ──
         if (g_lufs_reset.exchange(false, std::memory_order_relaxed)) {
@@ -1069,10 +1182,28 @@ int main(int argc, char** argv) {
             }
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]}");
 
+            // ── Transport position (engine-owned clock; UI/server follow) ──
+            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d}",
+                static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
+                g_transport.state.load(std::memory_order_relaxed),
+                static_cast<int>(jack.get_sample_rate()));
+
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 
             ipc.send_multichannel_metering(meter_json.data());
             frame_counter = 0;
+        }
+
+        // ── Transport ── advance the clock past the block just processed.
+        if (transport_state != 0) {
+            uint64_t next = block_start_frame + nframes;
+            if (g_transport.loop_enabled.load(std::memory_order_relaxed)) {
+                const uint64_t ls = g_transport.loop_start.load(std::memory_order_relaxed);
+                const uint64_t le = g_transport.loop_end.load(std::memory_order_relaxed);
+                if (le > ls && next >= le) next = ls + (next - le) % (le - ls);
+            }
+            g_transport.frame.store(next, std::memory_order_relaxed);
         }
     });
 

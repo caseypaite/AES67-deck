@@ -34,6 +34,7 @@ bool DiskWriter::start_recording(const std::string& filepath, int channels, int 
 
     interleave_buffer_.resize(8192 * channels); // max nframes is usually 1024 to 8192
     jack_ringbuffer_reset(ringbuffer_);
+    overrun_.store(false, std::memory_order_relaxed);
     is_recording_ = true;
     return true;
 }
@@ -44,9 +45,13 @@ void DiskWriter::stop_recording() {
 }
 
 void DiskWriter::write_audio(const std::vector<float*>& channel_buffers, int nframes) {
-    if (!is_recording_) return;
+    write_audio(channel_buffers.data(), static_cast<int>(channel_buffers.size()), nframes);
+}
 
-    if (nframes * channels_ > interleave_buffer_.size()) return;
+void DiskWriter::write_audio(const float* const* channel_buffers, int nchannels, int nframes) {
+    if (!is_recording_) return;
+    if (nchannels != channels_) return;
+    if (static_cast<size_t>(nframes) * channels_ > interleave_buffer_.size()) return;
 
     // Interleave
     for (int i = 0; i < nframes; ++i) {
@@ -55,12 +60,12 @@ void DiskWriter::write_audio(const std::vector<float*>& channel_buffers, int nfr
         }
     }
 
-    size_t bytes_to_write = nframes * channels_ * sizeof(float);
+    size_t bytes_to_write = static_cast<size_t>(nframes) * channels_ * sizeof(float);
     if (jack_ringbuffer_write_space(ringbuffer_) >= bytes_to_write) {
         jack_ringbuffer_write(ringbuffer_, (const char*)interleave_buffer_.data(), bytes_to_write);
     } else {
-        // OVERFLOW (Disk too slow!)
-        // In a pro DAW we would flag this in the UI
+        // OVERFLOW (Disk too slow!) — surface via overrun_
+        overrun_.store(true, std::memory_order_relaxed);
     }
 }
 

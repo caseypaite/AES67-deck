@@ -17,14 +17,24 @@ public:
     bool start_recording(const std::string& filepath, int channels, int sample_rate);
     void stop_recording();
 
+    // Set true (and latched until the next start_recording) if the RT thread
+    // ever found the ringbuffer full — i.e. the disk could not keep up.
+    bool had_overrun() const { return overrun_.load(std::memory_order_relaxed); }
+
     // Call from audio thread
     void write_audio(const std::vector<float*>& channel_buffers, int nframes);
+    // Same, but from a caller-owned pointer array — no std::vector, so it
+    // allocates nothing on the RT thread. `channel_buffers[c]` for c in
+    // 0..nchannels-1; nchannels must equal the value passed to
+    // start_recording().
+    void write_audio(const float* const* channel_buffers, int nchannels, int nframes);
 
 private:
     void disk_thread_func();
 
     std::atomic<bool> is_recording_;
     std::atomic<bool> thread_running_;
+    std::atomic<bool> overrun_{false};
     std::thread thread_;
     jack_ringbuffer_t* ringbuffer_;
 
