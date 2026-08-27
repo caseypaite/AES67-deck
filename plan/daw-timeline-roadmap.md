@@ -169,13 +169,19 @@ No new audio features for the user; this is the foundation. Three parallel track
 
 ### 2c. UI — waveform rendering
 
-- Replace the mock SVG (`DawView.tsx:338-340`) with a `<canvas>` per clip drawn
-  from `.peaks`, styled as the `<Scope>` recessed display from
-  `docs/ui-design.md` §2.6 (dark glass, phosphor trace in the track accent).
-- Redraw on zoom/scroll only; pick the peak tier closest to current
-  `zoom` (px/s). Virtualise — only draw clips intersecting the viewport
-  (the `w-[100000px]` lane at `DawView.tsx:247` currently mounts everything).
-- Clip gain handle + fade-in/out triangles (drag), written back to the schedule.
+Done as part of the arrange-surface rewrite in **"UI architecture"** below, not
+as DOM-per-clip. In short:
+
+- The whole arrange area (lanes, grid, clips, waveforms, playhead, selection,
+  markers) is **one `<canvas>`**, not the current div-per-clip tree
+  (`DawView.tsx:258-401`) over a `w-[100000px]` spacer (`:247`).
+- Waveforms draw from `.peaks` at the tier closest to the current `zoom` (px/s);
+  the canvas only repaints on change (edit / zoom / scroll / playhead tick).
+- Clip gain line + fade-in/out corner handles are drawn on the surface and
+  hit-tested in canvas space; drags write back to the schedule.
+- Framed by the `<Scope>` recessed-display chrome from `docs/ui-design.md` §2.6
+  (bezel, glass, vignette) — but the chrome is static; only the screen interior
+  redraws.
 
 **Phase 2 verification**
 
@@ -271,6 +277,109 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
 
 ---
 
+## UI architecture — dense, responsive, cheap (Reaper as reference)
+
+The timeline must feel like REAPER: **maximum information per pixel, zero input
+latency, no wasted motion** — and it has to do that on the appliance's i5-4570
+driving a 1080p touchscreen while the engine has the CPU it needs. The current
+`DawView.tsx` is the opposite on the perf axis: it re-renders the whole React
+tree every animation frame (`setPlayheadPosition` in the rAF loop `:79`),
+mounts every clip as a nested div + inline SVG (`:280-396`) over a
+`w-[100000px]` spacer (`:247`), animates the playhead via `left:` (layout, not
+transform, `:252`), and paints three stacked `repeating-linear-gradient` grid
+layers across 100 000 px (`:231-232`, `:265`). That doesn't scale to a real
+project and it steals frames from meters and FX graphs.
+
+### What to take from REAPER
+
+- **One custom-drawn surface, not widgets.** REAPER's arrange view is a single
+  drawn canvas; tracks/items/waveforms/grid/markers/playhead are all painted,
+  not composed from OS controls. Do the same: the arrange area is **one
+  `<canvas>`**, DOM is reserved for chrome (toolbar, track-panel controls,
+  dialogs).
+- **Track-height-adaptive controls (the TCP).** REAPER's track panel reflows —
+  a tall track shows name + record/mon/mute/solo/pan/volume/FX; a short track
+  collapses to just name + arm. Our track header (`DawView.tsx:179-216`) is
+  fixed; make its layout a function of `trackHeights[id]` with 3–4 breakpoints.
+- **Mouse-context editing.** Position in the item decides the verb: middle =
+  move, top-edge = fade handle, bottom-corners = clip gain, near-end = trim,
+  Shift/Alt/Ctrl modify. One pointer handler, hit-zone lookup — no per-edge
+  invisible divs (`:347-395` today).
+- **Multi-format ruler.** REAPER shows timecode + minutes:seconds + (optionally)
+  bars simultaneously. Our ruler is grid lines only (`:224-234`).
+- **Everything has a key.** An actions map (locate, split at cursor, toggle
+  snap, zoom to selection, nudge, marker add/next/prev, set loop from
+  selection…) with a single keydown dispatcher, extending the four keys wired
+  today (`:100-124`). One place, data-driven, later user-rebindable.
+- **Instant feedback, no easing.** Drags, trims and zoom track the pointer
+  1:1 — no transitions on interactive geometry. Reserve motion for scene-recall
+  fader moves (per `ui-design.md` §2.2), never timeline edits.
+- **Dark, flat, functional interior.** REAPER's arrange is low-contrast greys,
+  thin lines, small type. This does **not** fight `docs/ui-design.md`: the
+  timeline is explicitly a *recessed screen* (§2.6) — rack chrome frames it, the
+  screen interior is flat and dense. Add that carve-out to `ui-design.md`.
+
+### Rendering architecture
+
+- **Arrange surface = `<canvas>`** sized to the viewport (not the content).
+  Scroll/zoom are a view transform `{scrollX, pxPerSec, scrollY}`, not a giant
+  scrolled element. A `SurfaceModel` (plain module, no React) holds view state +
+  clip geometry and exposes `hitTest(x,y)` and `draw(ctx, dirtyRect)`.
+- **Imperative render loop, decoupled from React.** One `requestAnimationFrame`
+  loop owned by the surface. React renders the surface container **once**;
+  playhead/selection/drag updates mutate `SurfaceModel` and mark a dirty rect —
+  they never call `setState`. The store is read once on mount and subscribed
+  via `useDawStore.subscribe` (transient updates), so a clip edit repaints the
+  canvas without re-rendering the component.
+- **Playhead** = a 1px line drawn on the surface (or a separate 1px overlay
+  canvas translated with `transform: translate3d`), position predicted from the
+  local clock between engine `transport` frames (1a) and corrected on each
+  metering frame. No layout, no React, one compositor-only property.
+- **Dirty-rect repaint.** Playhead tick repaints only the two thin columns it
+  vacated/entered. A clip drag repaints the affected lanes. Full repaint only on
+  zoom/scroll/resize.
+- **Peak tiles, cached.** Load `.peaks` (2b) per take once; keep the tier for
+  the current zoom in memory; draw waveforms straight from the min/max arrays.
+  Recompute nothing on scroll.
+- **Web Worker for anything O(samples).** Client-side peak scans for imported
+  files, waveform tile downsampling → a worker, transferable `ArrayBuffer`s
+  back. The main thread never touches raw audio.
+- **Virtualise by construction.** Because the surface is viewport-sized, only
+  visible lanes × visible time-range are ever drawn or hit-tested. 32 tracks ×
+  a 2-hour show costs the same as one screen.
+- **Cheap CSS elsewhere.** No `box-shadow`/`filter: blur`/`backdrop-filter` on
+  anything inside a scroll or drag path (the `.metal-*` kit in `index.css`
+  stays on static chrome only). `content-visibility: auto` on off-screen
+  panels. `transform`/`opacity` are the only animated properties.
+- **Touch + density.** Visual density stays REAPER-tight; hit zones are padded
+  to ≥ 32 px in canvas hit-testing (invisible slop, not bigger graphics), and a
+  press-and-hold = right-click-menu equivalent. Test every interaction on the
+  actual touchscreen, not a mouse.
+
+### Performance budget (appliance: i5-4570, 1080p, engine running)
+
+- Idle timeline (transport stopped): **0 rAF work**, 0 repaints.
+- Rolling transport: ≤ 1 ms/frame on the main thread for the surface; steady
+  60 fps with meters + an open FX graph also animating.
+- Clip drag / trim: pointer-to-paint ≤ 1 frame.
+- Zoom to a 2-hour, 32-track project: full repaint ≤ 8 ms.
+- No main-thread task > 16 ms during record or playback (watch with the
+  Performance panel on the target box, not the dev laptop).
+
+### Build order (slots into the phases above)
+
+1. **Phase 1d**: while removing the fake playhead/clips, stand up the
+   `SurfaceModel` + canvas shell and the rAF loop; port the existing grid,
+   lanes, clips, playhead and drag/trim/slice onto it (visual parity, no new
+   features). Fixes the perf problems before they get bigger.
+2. **Phase 2c**: waveforms + fades + clip gain drawn on the surface; peak
+   worker.
+3. **Phase 3b/3d**: markers and the multi-format ruler on the surface.
+4. **Phase 4**: mouse-context verb model + full actions/keymap once the
+   surface owns all interaction.
+
+---
+
 ## Integration options — how the pieces talk
 
 **Transport clock ownership.** The engine must own it (sample-accurate, drives
@@ -321,8 +430,13 @@ thread).
 - `ui/src/stores/useDawStore.ts` — persist + server sync, drop mock clips
 - `ui/src/stores/useMixerStore.ts` — `toggleTransport` sends `transport_*`,
   consume `transport` from metering frame
-- `ui/src/views/DawView.tsx` — remove rAF/clip-fake, playhead from engine,
-  timecode selector
+- `ui/src/views/DawView.tsx` — remove rAF/clip-fake; mount the canvas shell
+- new `ui/src/daw/SurfaceModel.ts` — view transform, clip geometry, hit-test,
+  dirty-rect draw; the rAF loop; engine-clock playhead
+- new `ui/src/daw/ArrangeSurface.tsx` — canvas container, pointer dispatch
+- new `ui/src/daw/TrackPanel.tsx` — height-adaptive TCP (replaces the track
+  headers in `DawView.tsx:179-216`)
+- `docs/ui-design.md` — carve-out: timeline screen interior is flat/dense
 
 **Phase 2**
 - `engine/src/main.cpp` + new `engine/src/playback/PlaybackVoice.{h,cpp}` —
@@ -330,8 +444,9 @@ thread).
 - `server/src/index.ts` — clip-schedule diff/push, peak-file generator, take
   peak serving
 - new `server/src/peaks.ts` (offline scan)
-- `ui/src/views/DawView.tsx` — canvas waveforms, clip gain/fades, virtualisation
-- new `ui/src/components/analog/Scope.tsx` waveform variant
+- `ui/src/daw/SurfaceModel.ts` — waveform tiles, fade/clip-gain geometry
+- new `ui/src/daw/peakWorker.ts` — client-side peak scan / tile downsample
+- new `ui/src/components/analog/Scope.tsx` — static bezel/glass chrome frame
 
 **Phase 3**
 - `engine/` — LTC gen/decode, PTP-ToD timecode source
@@ -343,7 +458,8 @@ thread).
 **Phase 4+**
 - `ui/src/stores/useDawStore.ts` — undo stack, comping model
 - `engine/` — crossfade envelope, realtime bounce route
-- `ui/src/views/DawView.tsx` — comping lanes, ripple/group, automation lanes
+- `ui/src/daw/` — mouse-context verb model, actions/keymap, comping lanes,
+  ripple/group, automation lanes (all on the surface)
 
 ---
 
@@ -359,3 +475,10 @@ thread).
 4. Does virtual soundcheck need per-channel *pre and post* insert captured
    (double disk load) so the operator can re-EQ, or is one tap enough?
 5. Should scene recall be blocked / warned while a project transport is rolling?
+6. Canvas arrange surface: hand-rolled 2D context (fine for lines + waveforms,
+   no deps, matches "light on the system"), or a thin retained-mode helper?
+   Recommendation: raw `2d` context — WebGL/PixiJS is overkill for this and adds
+   weight. Revisit only if profiling on the appliance says otherwise.
+7. Accessibility / fallback: the canvas surface needs a keyboard path for every
+   action (it has no DOM tree to tab through). The actions/keymap (Phase 4)
+   covers operators; is anything else required for the kiosk?
