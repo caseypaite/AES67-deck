@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <sndfile.h>
+#include <wavpack/wavpack.h>
 #include <jack/ringbuffer.h>
 
 namespace aes67_deck {
@@ -67,13 +68,30 @@ private:
     void reader_loop();
     void produce_track(int track_id, uint64_t pos, uint32_t n, float* interleaved_dst);
 
+    // Reads a take file (libsndfile WAV/FLAC or WavPack .wv) as interleaved
+    // stereo float, mono sources duplicated. Reader thread only.
     struct TrackReader {
         SNDFILE* sf = nullptr;
         SF_INFO info{};
+        WavpackContext* wv = nullptr;
+        int wv_channels = 0;
+        bool wv_float = false;
+        float wv_scale = 1.0f;               // int WavPack -> float
+        std::vector<int32_t> wv_scratch;     // decode buffer
+
         std::string open_path;
-        int64_t cursor = -1; // frame position of sf, -1 = unknown
+        int64_t cursor = -1;                 // frame position, -1 = unknown
         jack_ringbuffer_t* ring = nullptr;
-        ~TrackReader() { if (sf) sf_close(sf); if (ring) jack_ringbuffer_free(ring); }
+
+        void close();
+        bool open(const std::string& path);  // false on failure
+        int channels() const { return wv ? wv_channels : info.channels; }
+        void seek(int64_t frame);
+        // Fill `out` with up to `frames` interleaved-stereo frames from the
+        // current position; returns frames actually produced.
+        uint32_t read_stereo(float* out, uint32_t frames);
+
+        ~TrackReader() { close(); if (ring) jack_ringbuffer_free(ring); }
     };
 
     const int sample_rate_;

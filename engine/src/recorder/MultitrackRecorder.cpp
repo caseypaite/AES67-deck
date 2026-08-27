@@ -30,8 +30,8 @@ bool MultitrackRecorder::start(const std::string& dir, const std::vector<int>& a
         if (writers_[ch_id]) continue; // dup in the armed list
 
         char name[32];
-        std::snprintf(name, sizeof(name), "ch%02d.wav", ch_id);
-        auto w = std::make_unique<DiskWriter>();
+        std::snprintf(name, sizeof(name), "ch%02d.%s", ch_id, file_ext());
+        auto w = std::make_unique<WavpackWriter>();
         if (!w->start_recording(base + name, 2, sample_rate_)) {
             std::cerr << "MultitrackRecorder: failed to open " << base + name << std::endl;
             continue;

@@ -16,12 +16,14 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LILV REQUIRED lilv-0)
 pkg_check_modules(SNDFILE REQUIRED sndfile)
 pkg_check_modules(JACK REQUIRED jack)
+pkg_check_modules(WAVPACK REQUIRED wavpack)
 
 include_directories(
     src
     ${LILV_INCLUDE_DIRS}
     ${SNDFILE_INCLUDE_DIRS}
     ${JACK_INCLUDE_DIRS}
+    ${WAVPACK_INCLUDE_DIRS}
 )
 
 add_executable(aes67_deck_engine
@@ -31,6 +33,7 @@ add_executable(aes67_deck_engine
     src/ipc/IpcClient.cpp
     src/recorder/DiskWriter.cpp
     src/recorder/MultitrackRecorder.cpp
+    src/recorder/WavpackWriter.cpp
     src/playback/TimelinePlayer.cpp
 )
 
@@ -38,5 +41,6 @@ target_link_libraries(aes67_deck_engine
     ${LILV_LIBRARIES}
     ${SNDFILE_LIBRARIES}
     ${JACK_LIBRARIES}
+    ${WAVPACK_LIBRARIES}
     pthread
 )

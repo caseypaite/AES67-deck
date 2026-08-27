@@ -5,13 +5,13 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include "DiskWriter.h"
+#include "WavpackWriter.h"
 
 namespace aes67_deck {
 namespace recorder {
 
-// One take = one directory of per-channel stereo float WAVs
-// (projects/<name>/takes/<timestamp>/ch<NN>.wav), written by a DiskWriter per
+// One take = one directory of per-channel lossless WavPack files, 32-bit float
+// (projects/<name>/takes/<timestamp>/ch<NN>.wv), written by a WavpackWriter per
 // armed channel. Files are opened/closed on the IPC thread (start()/stop());
 // the audio thread only calls write(), which is lock-free and allocation-free.
 //
@@ -42,7 +42,7 @@ public:
     void write(int ch_id, const float* l, const float* r, int nframes) {
         if (!recording_.load(std::memory_order_acquire)) return;
         if (ch_id < 1 || ch_id > MAX_CH) return;
-        DiskWriter* w = writers_[ch_id].get();
+        WavpackWriter* w = writers_[ch_id].get();
         if (!w) return;
         const float* chans[2] = { l, r };
         w->write_audio(chans, 2, nframes);
@@ -54,14 +54,17 @@ public:
     // True if any armed channel's disk writer reported a ringbuffer overrun.
     bool had_overrun() const {
         for (int c = 1; c <= MAX_CH; ++c) {
-            const DiskWriter* w = writers_[c].get();
+            const WavpackWriter* w = writers_[c].get();
             if (w && w->had_overrun()) return true;
         }
         return false;
     }
 
+    // Take-file extension (no dot), for the take manifest / clip naming.
+    static constexpr const char* file_ext() { return "wv"; }
+
 private:
-    std::array<std::unique_ptr<DiskWriter>, MAX_CH + 1> writers_{}; // index by ch id
+    std::array<std::unique_ptr<WavpackWriter>, MAX_CH + 1> writers_{}; // index by ch id
     std::atomic<bool> recording_{false};
     std::atomic<uint64_t> frames_tapped_{0};
     std::string dir_;

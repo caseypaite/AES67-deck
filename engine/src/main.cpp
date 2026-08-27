@@ -489,6 +489,7 @@ int main(int argc, char** argv) {
                                     {"endFrame", g_transport.frame.load(std::memory_order_relaxed)},
                                     {"sampleRate", mtr.sample_rate()},
                                     {"armed", mtr.armed()},
+                                    {"ext", mtr.file_ext()},
                                     {"overrun", mtr.had_overrun()}};
                 ipc.send_json(done.dump());
             }
@@ -529,7 +530,7 @@ int main(int argc, char** argv) {
             g_transport.state.store(2, std::memory_order_relaxed);
             nlohmann::json started{{"type", "take_started"}, {"dir", mtr.dir()},
                                    {"originFrame", origin}, {"sampleRate", sr_i},
-                                   {"armed", mtr.armed()}};
+                                   {"armed", mtr.armed()}, {"ext", mtr.file_ext()}};
             ipc.send_json(started.dump());
 
         } else if (type == "stop_multitrack_record") {
@@ -540,6 +541,7 @@ int main(int argc, char** argv) {
                                     {"endFrame", g_transport.frame.load(std::memory_order_relaxed)},
                                     {"sampleRate", mtr.sample_rate()},
                                     {"armed", mtr.armed()},
+                                    {"ext", mtr.file_ext()},
                                     {"overrun", mtr.had_overrun()}};
                 ipc.send_json(done.dump());
             }
