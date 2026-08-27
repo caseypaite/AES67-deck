@@ -499,6 +499,47 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     const ws = new WebSocket(wsUrl);
     set({ ws });
     setWs(ws);
+
+    // Metering arrives faster than the screen refreshes and the pure-viz
+    // parts (channel meters, FX in/out + RTA, LUFS, Master analyser) are
+    // last-value-wins — coalesce them onto one animation frame so a burst
+    // can't drive a render storm. Transport and live-record peaks are applied
+    // immediately below: the playhead must stay smooth and every recPeaks
+    // batch is unique data that must not be dropped.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let pendingMeter: any = null;
+    let meterRaf = 0;
+    const raf: (cb: () => void) => number =
+      typeof requestAnimationFrame === 'function'
+        ? (cb) => requestAnimationFrame(cb)
+        : (cb) => setTimeout(cb, 16) as unknown as number;
+    const flushMeter = () => {
+      meterRaf = 0;
+      const data = pendingMeter;
+      pendingMeter = null;
+      if (!data) return;
+      if (data.channels) {
+        set((state) => {
+          const nextChannels = { ...state.channels };
+          const levelsMap = data.channels as Record<string, { l: number; r: number }>;
+          Object.keys(levelsMap).forEach((key) => {
+            const cid = parseInt(key, 10);
+            if (nextChannels[cid]) {
+              const levels = levelsMap[key];
+              nextChannels[cid] = { ...nextChannels[cid], meterL: levels.l, meterR: levels.r };
+            }
+          });
+          return { channels: nextChannels };
+        });
+      }
+      // `fx` is present only while the engine has a focused plugin slot
+      // (fx_focus). Absent ⇒ nothing focused ⇒ clear so the editor falls
+      // back to the host channel meter.
+      set({ fxMeter: data.fx ?? null });
+      if (data.lufs) set({ lufs: data.lufs });
+      if (data.master) set({ masterAnalysis: data.master });
+    };
+
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -686,26 +727,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             return { channels: { ...state.channels, [data.channel]: { ...ch, auxSends: { ...ch.auxSends, [data.busId]: data.value } } } };
           });
         } else if (data.type === 'metering') {
-          if (data.channels) {
-             set((state) => {
-                const nextChannels = { ...state.channels };
-                const levelsMap = data.channels as Record<string, { l: number; r: number }>;
-                Object.keys(levelsMap).forEach(key => {
-                   const cid = parseInt(key, 10);
-                   if (nextChannels[cid]) {
-                      const levels = levelsMap[key];
-                      nextChannels[cid] = { ...nextChannels[cid], meterL: levels.l, meterR: levels.r };
-                   }
-                });
-                return { channels: nextChannels };
-             });
-          }
-          // `fx` is present only while the engine has a focused plugin slot
-          // (fx_focus). Absent ⇒ nothing focused ⇒ clear so the editor falls
-          // back to the host channel meter.
-          set({ fxMeter: data.fx ?? null });
-          if (data.lufs) set({ lufs: data.lufs });
-          if (data.master) set({ masterAnalysis: data.master });
+          // Pure-viz state: coalesce onto the next animation frame.
+          pendingMeter = data;
+          if (!meterRaf) meterRaf = raf(flushMeter);
+          // Everything below is applied immediately — not throttled.
           if (data.recPeaks) useDawStore.getState().pushRecPeaks(data.recPeaks);
           if (data.transport?.buf && data.transport?.sr) {
             const ms = Math.round((2 * data.transport.buf / data.transport.sr) * 1000 * 10) / 10;
@@ -755,6 +780,12 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       }
     };
     ws.onclose = () => {
+      if (meterRaf) {
+        if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(meterRaf);
+        else clearTimeout(meterRaf);
+        meterRaf = 0;
+      }
+      pendingMeter = null;
       set({ ws: null });
       setWs(null);
       setTimeout(() => get().connectWebSocket(), 1000);

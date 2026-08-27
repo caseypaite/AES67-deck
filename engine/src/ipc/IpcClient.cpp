@@ -4,8 +4,12 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <cerrno>
 #include <cstring>
+#include <string>
 #include <vector>
+#include <algorithm>
 #include "json.hpp"
 
 namespace aes67_deck {
@@ -76,6 +80,10 @@ void IpcClient::stop() {
 
 void IpcClient::run() {
     std::vector<char> tx_scratch(64 * 1024);
+    // Bytes pulled from the lock-free ring buffer but not yet fully written to
+    // the socket. A non-blocking send() can accept a partial write (or none);
+    // the leftover has to survive to the next loop or the JSON stream tears.
+    std::string tx_pending;
     using json = nlohmann::json;
 
     while (running_) {
@@ -174,15 +182,52 @@ void IpcClient::run() {
             sock_fd_ = -1;
         }
 
-        // Write outgoing telemetry
+        // ── Drain the lock-free ring buffer into the pending send buffer ──
         size_t avail = jack_ringbuffer_read_space(tx_buffer_);
-        if (avail > 0 && sock_fd_ >= 0) {
-            size_t to_read = std::min(avail, tx_scratch.size());
-            jack_ringbuffer_read(tx_buffer_, tx_scratch.data(), to_read);
-            send(sock_fd_, tx_scratch.data(), to_read, MSG_NOSIGNAL);
+        while (avail > 0) {
+            size_t chunk = std::min(avail, tx_scratch.size());
+            jack_ringbuffer_read(tx_buffer_, tx_scratch.data(), chunk);
+            tx_pending.append(tx_scratch.data(), chunk);
+            avail -= chunk;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // If the server has stalled, cap the backlog by dropping whole oldest
+        // lines rather than growing without bound — telemetry is
+        // last-value-wins, so stale frames are worthless.
+        constexpr size_t TX_PENDING_CAP = 1024 * 1024;
+        if (tx_pending.size() > TX_PENDING_CAP) {
+            size_t drop = tx_pending.size() - TX_PENDING_CAP / 2;
+            size_t nl = tx_pending.find('\n', drop);
+            tx_pending.erase(0, nl == std::string::npos ? tx_pending.size() : nl + 1);
+        }
+
+        // ── Flush as much as the socket will take, honouring partial writes ──
+        while (!tx_pending.empty() && sock_fd_ >= 0) {
+            ssize_t sent = send(sock_fd_, tx_pending.data(), tx_pending.size(), MSG_NOSIGNAL);
+            if (sent > 0) {
+                tx_pending.erase(0, static_cast<size_t>(sent));
+            } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;                       // socket buffer full — retry after poll()
+            } else {
+                // EPIPE / ECONNRESET / 0 — peer is gone; drop the connection.
+                close(sock_fd_);
+                sock_fd_ = -1;
+                tx_pending.clear();
+                break;
+            }
+        }
+
+        // Block until the socket is readable (incoming command) or writable
+        // again if we still owe it bytes — instead of a blind 10 ms sleep.
+        if (sock_fd_ >= 0) {
+            struct pollfd pfd;
+            pfd.fd = sock_fd_;
+            pfd.events = POLLIN | (tx_pending.empty() ? 0 : POLLOUT);
+            pfd.revents = 0;
+            poll(&pfd, 1, 10);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 }
 

@@ -646,7 +646,11 @@ int main(int argc, char** argv) {
         }
     });
 
-    std::atomic<int> frame_counter{0};
+    // Telemetry cadence — gated on elapsed frames, not block count, so the
+    // metering rate stays ~40 Hz regardless of the JACK/PipeWire quantum
+    // (a small quantum was pushing this to ~125 Hz and swamping the UI).
+    const int meter_interval_frames = std::max<int>(1, static_cast<int>(sr / 40.0));
+    int frame_counter = 0;   // frames accumulated since the last metering emit
     std::vector<float> tmp_L(8192, 0.0f);
     std::vector<float> tmp_R(8192, 0.0f);
     std::vector<float> tmp_out_L(8192, 0.0f);
@@ -1125,8 +1129,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        frame_counter++;
-        if (frame_counter > 2) {
+        frame_counter += static_cast<int>(nframes);
+        if (frame_counter >= meter_interval_frames) {
             int offset = snprintf(meter_json.data(), meter_json.size(), "{\"type\":\"metering\",\"channels\":{");
 
             auto calc_db = [](float peak) {

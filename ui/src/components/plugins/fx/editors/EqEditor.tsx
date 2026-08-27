@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { gainToDb, dbToGain } from '../../../../data/calfPlugins';
 import { FxEditorProps, KNOB_SIZE, useCalfParams } from '../fxShared';
 import { AnalogKnob } from '../../../analog/AnalogKnob';
@@ -33,10 +33,17 @@ export const EqEditor = ({ plugin, channelId, accent, live }: FxEditorProps) => 
   const groups = spec.bandSelector!.bands;
   const [sel, setSel] = useState(groups[0]);
 
-  const prefixOf = (g: string): string => {
-    const p = spec.params.find(x => x.group === g && /_(active|freq)$/.test(x.symbol));
-    return p ? p.symbol.replace(/_(active|freq)$/, '') : '';
-  };
+  // group → param-symbol prefix. Static per plugin spec — resolve once, not
+  // on every (throttled ~60 Hz) metering re-render.
+  const prefixMap = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const g of groups) {
+      const p = spec.params.find(x => x.group === g && /_(active|freq)$/.test(x.symbol));
+      m[g] = p ? p.symbol.replace(/_(active|freq)$/, '') : '';
+    }
+    return m;
+  }, [spec, groups]);
+  const prefixOf = (g: string): string => prefixMap[g] ?? '';
   const typeOf = (pfx: string): EqBandType =>
     pfx === 'hp' ? 'hp' : pfx === 'lp' ? 'lp' : pfx === 'ls' ? 'ls' : pfx === 'hs' ? 'hs' : 'peak';
 
