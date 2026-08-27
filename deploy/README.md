@@ -32,6 +32,46 @@ i5-4570 / 4 GB). Adjust the NIC name and host specifics for your machine.
 4. Handle Secure Boot (enroll the MOK key or disable SB in BIOS), then
    **reboot** to pick up the low-latency cmdline and load the module.
 
+## Local patches to `~/aes67-linux-daemon`
+
+`build-daemon.sh` builds from a working copy of the upstream
+[`bondagit/aes67-linux-daemon`](https://github.com/bondagit/aes67-linux-daemon)
+at `~/aes67-linux-daemon`. That checkout carries two local commits on
+`master` (not upstreamed — `master` otherwise tracks `origin/master`
+exactly):
+
+- **`systemd/install.sh` — run the daemon as the appliance user, not a
+  dedicated system user.** Upstream's `install.sh` does
+  `useradd ... aes67-daemon` (a `/sbin/nologin` system account) and
+  installs all state/config owned by it. The appliance drives the entire
+  stack from one lingering user account that already owns the
+  PipeWire/JACK graph and the RAVENNA ALSA device, so the daemon has to
+  run as that same user. The patch drops the `useradd`, installs
+  `/var/lib/aes67-daemon`, the scripts dir, `daemon.conf` and
+  `status.json` owned by `${SUDO_USER:-$USER}`, rewrites `User=` in the
+  installed `aes67-daemon.service` via `sed`, and warns if run directly
+  as root.
+
+  Note `build-daemon.sh` in this repo does **not** call upstream's
+  `install.sh` — it installs the daemon itself (step 4) and creates
+  `aes67-daemon` via `systemd-sysusers`. If you switch to running the
+  daemon as a systemd **user** service alongside the rest of the stack,
+  apply the same `User=`/ownership change to step 4 here.
+
+- **`3rdparty/ravenna-alsa-lkm` submodule bumped `b8dd5cd → e8579da`
+  (Merging RAVENNA ALSA v2.1).** Needed for:
+  - **CPU-pinned audio timer on kernel ≥ 6.15** — the appliance runs
+    `linux-lowlatency` with `preempt=full`; the older submodule's timer
+    code doesn't build / behave correctly on 6.15+.
+  - `kill_clock_timer` actually stopping the timer (was a no-op upstream).
+  - ST-2022-7 (seamless redundant streams) support in the driver.
+
+  The DKMS package built by `build-daemon.sh` is versioned `2.1` and
+  copies `driver/` + `common/` straight from this submodule, so the bump
+  takes effect on the next `build-daemon.sh` run. An untracked
+  `driver/MergingRavennaALSA.mod` build artifact inside the submodule is
+  expected and harmless.
+
 ## Secure Boot
 
 The RAVENNA module is out-of-tree. Two ways to let it load:
