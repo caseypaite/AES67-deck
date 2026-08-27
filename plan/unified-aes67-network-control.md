@@ -1,4 +1,4 @@
-# Unified AES67 network control + full console broadcast
+# Unified AES67 network control + mix-bus broadcast
 
 ## Context
 
@@ -11,23 +11,41 @@ kernel module over netlink and does SAP/mDNS discovery; it is never in the audio
 path — so everything it does is reachable through its REST API and can be driven
 from inside the deck.
 
-Second need: the deck's mix buses and channels never reach the network. Only a
-2-channel `AES67_Sink` PipeWire node exists (`deploy/pipewire/20-aes67-ravenna-bridge.conf`).
-The operator wants every channel and bus transmitted as AES67 so other devices
-(IEMs, OB truck, recorders, distribution) can subscribe.
+Second need — two halves, and the original plan over-weighted one of them:
 
-**Decisions taken** (from planning Q&A):
-- Channel direct-outs are **post-insert-FX, post-fader/mute, pre-pan**.
-- **Stereo** everything: 32×2 channels + 8×2 Aux + Master + Monitor = **84 network channels**.
+- **Receiving is starved.** Both the `AES67_Sink` *and* `AES67_Source` PipeWire
+  nodes are 2-channel (`deploy/pipewire/20-aes67-ravenna-bridge.conf:22,42`), so
+  the console can pull exactly one stereo stream off the network. Each discovered
+  stream also needs its PipeWire `ports[]` typed in by hand
+  (`ui/src/stores/usePatchbayStore.ts:14`). For a 32-input deck over AES67 this
+  is the real bottleneck.
+- **Transmitting only needs the mix products.** Every input the deck mixes is
+  already an independent AES67 stream published by the device that originates it;
+  anything downstream that wants a channel subscribes to that *upstream* source
+  directly through its own controller. The deck does not need to re-transmit a
+  post-fader copy of each channel. What only the deck can originate is its mix
+  products — the 8 Aux buses, Master, and Monitor (post-insert-FX, post-fader) —
+  and the engine **already exposes every one of them** as a JACK output port
+  (`out_L/R`, `bus_101..108_L/R`, `monitor_L/R` — `engine/src/main.cpp:374`).
+
+**Decisions taken** (from planning Q&A + this re-analysis):
+- Transmit the **20 mix-product channels only** (8×2 Aux + Master + Monitor).
+  No per-channel direct-out broadcast — it duplicates data already on the wire
+  and is the single most invasive/expensive part of the design (RT per-sample tap
+  in the channel loop, engine rebuild, 84-ch playout, ~100 Mbit/s + ~12 000 pkt/s
+  with software PTP on the i5-4570). Deferred as an opt-in group (see 2e).
+- **Phase 2 needs no engine change** — all 20 ports already exist.
+- Widen the **receive** side and auto-wire subscribed sinks into mixer channels.
 - Daemon TX Sources are **auto-provisioned** by the server on a fixed multicast
   plan; the new UI lets the operator enable/disable and rename each group.
 - Delivered in two phases; **Phase 1 (config UI) ships and is verified before Phase 2**.
 
-RAVENNA driver limits are fine: the DKMS build does **not** define
-`AES67_LIMITED_BUILD`, so `MAX_NUMBEROFOUTPUTS = 128`
-(`3rdparty/ravenna-alsa-lkm/common/MergingRAVENNACommon.h:70`) and the ALSA PCM
-advertises `channels_max = 128` (`driver/audio_driver.c:1240`). Each RTP stream is
-capped at 64 channels (`RTP_stream_info.h:49`); we use ≤8-channel Sources.
+RAVENNA driver limits are comfortable: the DKMS build does **not** define
+`AES67_LIMITED_BUILD`, so the ALSA PCM advertises `channels_max = 128` each way
+(`3rdparty/ravenna-alsa-lkm/common/MergingRAVENNACommon.h:70`,
+`driver/audio_driver.c:1240`). A 20-ch playout + 32-ch capture on the shared
+`hw:RAVENNA` PCM is well within that and far below the original 84. Each RTP
+stream is capped at 64 channels (`RTP_stream_info.h:49`); we use ≤8-ch Sources.
 
 ---
 
@@ -123,101 +141,132 @@ No engine involvement, no new IPC. WSS/store wiring only.
 
 ---
 
-## Phase 2 — Broadcast all 84 channels
+## Phase 2 — Network I/O for the mix (no per-channel re-broadcast)
 
-### 2a. Engine (`engine/src/main.cpp`) — 32 stereo direct-out ports
+Two independent pieces, neither touching the engine: widen **receive** so the
+console can subscribe to many input streams and have them land on mixer
+channels automatically, and transmit the **20 mix-product channels** as AES67.
 
-- After the `monitor_L/R` registration (`main.cpp:381`), append 64 output ports
-  `direct_1_L`,`direct_1_R` … `direct_32_L`,`direct_32_R`. Appending keeps every
-  existing output index (`MONITOR_PORT_L/R` etc.) unchanged.
-- Record `const int DIRECT_BASE = 2 + 2*NUM_AUX + 2;` (= 20).
-- In the per-channel loop (`main.cpp:655`), after `gain`/`muted` are computed and
-  **before** the pan multiply, write the post-fader/pre-pan signal:
-  `direct_L[s] = tmp_L[s] * gain; direct_R[s] = tmp_R[s] * gain;`
-  (`tmp_L/R` at that point is already post-insert-FX). Fetch the two buffers via
-  `jack.get_buffer(outputs[DIRECT_BASE + (i-1)*2 + {0,1}], nframes)`; `memset`
-  them when the channel is skipped.
-- Update the `outputs.size()` guard (`main.cpp:530`) to expect
-  `2 + 2*NUM_AUX + 2 + 2*NUM_CHANNELS`.
-- No new IPC command — the ports simply exist and the server links them.
+### 2a. PipeWire — widen both directions (`deploy/pipewire/20-aes67-ravenna-bridge.conf`)
 
-### 2b. PipeWire — widen the sink (`deploy/pipewire/20-aes67-ravenna-bridge.conf`)
+Both nodes open the same `hw:RAVENNA` PCM (one playback substream, one capture):
 
-`hw:RAVENNA` is a single PCM, so the 2-ch `AES67_Sink` becomes **one 84-ch
-node**:
-- `audio.channels = 84`, `audio.position = [ AUX0 AUX1 … AUX83 ]`
-  (ports `AES67_Sink:playback_AUX0..83`).
-- Keep `period-size = 48`, `period-num = 2`, `disable-tsched` (driver requires
-  period == tic frame size — see the file's own comment and
-  `docs/latency-tuning.md`).
-- `AES67_Source` (capture) stays 2-ch — RX is unchanged this phase.
-- **Verify** the driver accepts an 84-ch playback `hw_params` while capture runs
-  2-ch (`cat /proc/asound/card0/pcm0p/sub0/hw_params` after start). This is the
-  main technical risk; fall back to fewer channels / mono if it rejects.
+- `AES67_Sink` (playout): `audio.channels = 20`,
+  `audio.position = [ AUX0 … AUX19 ]` → ports `AES67_Sink:playback_AUX0..19`.
+- `AES67_Source` (capture): `audio.channels = 32`,
+  `audio.position = [ AUX0 … AUX31 ]` → ports `AES67_Source:capture_AUX0..31`.
+  (Fall back to 16 if the driver balks; 32 is the target.)
+- Keep `period-size = 48`, `period-num = 2`, `disable-batch`, `disable-tsched`,
+  `S32LE` — driver requires period == tic frame size (see the file's own comment
+  and `docs/latency-tuning.md`).
+- **Verify** the driver accepts a 20-ch playback + 32-ch capture `hw_params`
+  (`cat /proc/asound/card0/pcm0p/sub0/hw_params` and `pcm0c/sub0/hw_params`
+  after start). Lower risk than the original 84-ch — both are well under
+  `channels_max = 128` — but still the one thing to confirm on the appliance
+  before the rest of Phase 2 lands.
 
-### 2c. Server — fixed engine→RAVENNA link map + Source auto-provision
+### 2b. Server — receive: Sink → capture-channel auto-mapping (`server/src/index.ts`)
 
-Fixed playback-channel layout (0-indexed):
+Extends the Phase 1 `daemon_create_sink` handler:
+
+- Allocate a contiguous free block of `AES67_Source` capture channels (0..31)
+  sized to the new Sink's channel count; use that as the Sink's `map`.
+- Persist the assignment in `rx_sinks.json`:
+  `{ sinkId, streamName, address, captureBase, channels }`.
+- `reconcileRxSinks()` — on each `pollDaemonState()` where the daemon is
+  reachable, re-`PUT` any Sink whose live `map` drifted from the persisted plan
+  (covers a daemon restart).
+- In the `daemon_state` broadcast, add per-Sink `capturePorts: string[]`
+  (`AES67_Source:capture_AUX{n}` for each mapped channel).
+
+UI side (`usePatchbayStore.ts`): fold each Sink's `capturePorts` straight into
+the stream registry as an `Aes67Stream` with `ports[]` pre-filled, so a
+subscribed stream is immediately selectable in the existing SOURCES patchbay —
+the manual "type in the PipeWire port names" step disappears. Registry entries
+derived from Sinks are read-only and excluded from `persist` (live server state).
+
+### 2c. Server — transmit: fixed 20-ch link map + Source auto-provision
+
+Fixed playout-channel layout (0-indexed `AES67_Sink` channels):
 
 | RAVENNA ch | Engine port | Daemon Source (`map`) |
 |---|---|---|
-| 0–63 | `direct_{1..32}_L/R` | `Deck CH 1-4` [0–7], `CH 5-8` [8–15], … `CH 29-32` [56–63] — 8 Sources |
-| 64–79 | `bus_{101..108}_L/R` | `Deck AUX 1-4` [64–71], `AUX 5-8` [72–79] — 2 Sources |
-| 80–81 | `out_L/out_R` | `Deck Master` [80,81] |
-| 82–83 | `monitor_L/monitor_R` | `Deck Monitor` [82,83] |
+| 0–1 | `out_L` / `out_R` | `Deck Master` [0,1] |
+| 2–3 | `monitor_L` / `monitor_R` | `Deck Monitor` [2,3] |
+| 4–11 | `bus_101..104_L/R` | `Deck AUX 1-4` [4–11] |
+| 12–19 | `bus_105..108_L/R` | `Deck AUX 5-8` [12–19] |
 
 - New `applyBroadcastRouting()` in `server/src/index.ts`, called from the
-  `ipcServer` "C++ Engine connected via IPC" block (`:392`) alongside
-  `applyOutputRouting` etc. `pw-link`s each engine port to its fixed
-  `AES67_Sink:playback_AUX{n}` (reuses the existing `pwLink()` /
-  `disconnectAllOutputsOf()` helpers). Idempotent, same self-heal contract as
-  the rest of that block.
-- New `tx_sources.json` persistence + `reconcileTxSources()`: desired state is
-  the 12-entry plan above, each `{ enabled, name }` operator-overridable.
-  Whenever `pollDaemonState()` sees the daemon reachable, diff desired vs actual
-  and `PUT`/`DELETE` `/api/source/{id}` to converge. Let the daemon auto-assign
-  multicast addresses from `rtp_mcast_base`; read them back for display.
+  `ipcServer` "C++ Engine connected via IPC" block (`~:392`) alongside
+  `applyOutputRouting` etc. `pw-link`s each engine output port to its fixed
+  `AES67_Sink:playback_AUX{n}` (reuses `pwLink()` / `disconnectAllOutputsOf()`).
+  Idempotent, same self-heal contract as the rest of that block.
+- New `tx_sources.json` + `reconcileTxSources()`: desired state is the 4 entries
+  above, each `{ enabled, name }` operator-overridable. Whenever
+  `pollDaemonState()` sees the daemon reachable, diff desired vs actual and
+  `PUT`/`DELETE` `/api/source/{id}` to converge. Daemon auto-assigns multicast
+  from `rtp_mcast_base`; read the addresses back for display.
 - WS: `set_tx_source` `{key, enabled?, name?}` → update `tx_sources.json` +
   reconcile. Broadcast a `tx_sources` message with desired+resolved state.
 
-### 2d. UI — TX toggle grid in `NetworkPanel.tsx`
+### 2d. UI — `NetworkPanel.tsx`
 
-Replace the Phase-1 manual TX list with a grid of the 12 groups: checkbox
-(enabled), editable name, resolved multicast address + channel count, live
-"running / no-clock" indicator derived from `ptpStatus`. Sends `set_tx_source`.
+- **RECEIVE (SINKS)**: each row shows its resolved capture-port range and a
+  "mapped to CH n" hint (cross-referenced with `usePatchbayStore` mappings).
+  "Add" unchanged from Phase 1 (pick a discovered remote / paste SDP).
+- **TRANSMIT (SOURCES)**: replace the Phase 1 manual list with a 4-group grid
+  (Master, Monitor, AUX 1-4, AUX 5-8): enabled checkbox, editable name, resolved
+  multicast + channel count, live "running / no-clock" indicator from
+  `ptpStatus`. Sends `set_tx_source`.
 
-### 2e. Consolidation note
+### 2e. Deferred — opt-in, not built now
 
-The existing per-bus **Output Endpoints** feature (`output_routing.json`,
-`applyOutputRouting`, DESTINATIONS panel) overlaps Phase 2 for Master/Aux. Leave
-it in place (it can still route to non-AES67 hardware endpoints), but the
-NetworkPanel doc/tooltip should note that Master/Aux now always have a dedicated
-AES67 stream regardless of Output-Endpoint assignment.
+- **Per-channel post-FX direct outs.** If a virtual-soundcheck / outboard-matrix
+  workflow ever needs the console-processed channel signal, add it then as an
+  opt-in Source group. This is the *only* piece that needs the engine change
+  (64 `direct_n_L/R` ports + an RT tap in the channel loop, post-fader/pre-pan)
+  and a wider playout config. Kept out of the baseline because every input is
+  already independently on the network for a downstream device to subscribe to.
+- **System-audio / talkback as clean network sources.** One stereo Source each,
+  opt-in, if a downstream device ever needs them un-mixed (talkback already
+  reaches the network via the bus streams when PTT is active).
+
+### 2f. Consolidation note
+
+The per-bus **Output Endpoints** feature (`output_routing.json`,
+`applyOutputRouting`, DESTINATIONS panel) overlaps 2c for Master/Aux. Leave it in
+place (it still routes to non-AES67 hardware endpoints), but the NetworkPanel
+doc/tooltip should note Master/Aux/Monitor now always have a dedicated AES67
+stream regardless of Output-Endpoint assignment.
 
 ### Phase 2 caveats (operational, call out in the UI + `deploy/README.md`)
 
-- **PTP lock required to transmit** — same dependency as receiving; needs the
-  external Dante grandmaster (`192.168.1.8`) present. No GM ⇒ Sources exist but
-  don't run.
-- **Bandwidth / CPU**: 84 ch L24 @ 48 k @ 1 ms ≈ 100 Mbit/s multicast + ~12 000
-  pkt/s TX across 12 streams, with software PTP timestamping on the i5-4570.
-  Enable groups incrementally; watch `/var/log/aes67-watch.log`, PTP offset, and
-  engine xruns. Reducing to mono or fewer active groups is the pressure valve.
+- **PTP lock required to transmit *and* receive** — needs the external Dante
+  grandmaster (`192.168.1.8`) present. No GM ⇒ Sources/Sinks exist but don't run.
+- **No engine rebuild** — Phase 2 is PipeWire config + server + UI only, same
+  change class as Phase 1.
+- **Bandwidth / CPU**: 20 ch TX L24 @ 48 k @ 1 ms ≈ 24 Mbit/s + ~4 000 pkt/s
+  across 4 streams, plus the subscribed RX flows, with software PTP on the
+  i5-4570 — comfortable, but still enable TX groups incrementally and watch
+  `/var/log/aes67-watch.log`, PTP offset, and engine xruns.
 
 ### Phase 2 verification
 
-- Rebuild engine (`deploy/build-deck.sh` or `cmake --build engine/build`),
-  reinstall the pipewire drop-in, restart PipeWire, restart the engine.
-- `pw-link -o | grep AES67_Deck:direct_` shows 64 ports; `pw-link -l` shows them
-  linked to `AES67_Sink:playback_AUX*`.
-- `curl $DAEMON/api/sources` shows the 12 Sources with assigned addresses.
-- From another AES67 device (or a second daemon / `gst`+SDP), subscribe to
-  `Deck Master` and confirm audio; move a channel fader and confirm its
-  `Deck CH n` stream follows (post-fader tap).
-- Toggle a group off in the UI → `curl` shows it `enabled:false` / removed and
-  its multicast traffic stops (`tcpdump`).
-- Regression: local monitoring, patchbay matrix, Output Endpoints, LUFS metering
-  all still work.
+- Reinstall the pipewire drop-in, restart PipeWire (no engine restart needed).
+- `pw-cli ls Node` shows `AES67_Sink` 20-ch / `AES67_Source` 32-ch;
+  `hw_params` for `pcm0p` and `pcm0c` confirm the driver accepted both.
+- `pw-link -l` shows `out_L/R`, `bus_101..108_L/R`, `monitor_L/R` linked to
+  `AES67_Sink:playback_AUX0..19`.
+- `curl $DAEMON/api/sources` shows the 4 Deck Sources with assigned addresses.
+  From another AES67 device subscribe to `Deck Master`, move the Master fader,
+  confirm audio follows (post-fader).
+- Create a Sink from a discovered multichannel remote → its channels appear as
+  `AES67_Source:capture_AUX*`, auto-populate the stream registry, and map to a
+  mixer channel with audio (`pw-record --target=AES67_Source`).
+- Toggle a TX group off → `curl` shows it removed, `tcpdump` shows its multicast
+  stop.
+- Regression: local monitoring, patchbay matrix, Output Endpoints, LUFS
+  metering, talkback all still work.
 
 ---
 
@@ -227,6 +276,8 @@ AES67 stream regardless of Output-Endpoint assignment.
 `ui/src/stores/useMixerStore.ts` (one dispatch branch), `ui/src/components/patchbay/NetworkPanel.tsx` (new),
 `ui/src/components/patchbay/PatchbayView.tsx` (mount the section).
 
-**Phase 2**: `engine/src/main.cpp`, `server/src/index.ts` (broadcast routing + TX reconcile),
-`deploy/pipewire/20-aes67-ravenna-bridge.conf`, `ui/src/components/patchbay/NetworkPanel.tsx`,
-`server/src/index.ts` NUM/topology constants mirror, `deploy/README.md` (caveats).
+**Phase 2** (no engine change): `deploy/pipewire/20-aes67-ravenna-bridge.conf` (widen both nodes),
+`server/src/index.ts` (RX sink→capture mapping + `reconcileRxSinks`, broadcast link map + `reconcileTxSources`),
+`ui/src/stores/usePatchbayStore.ts` (Sink-derived registry entries),
+`ui/src/components/patchbay/NetworkPanel.tsx` (RX port hints + 4-group TX grid),
+`deploy/README.md` (caveats).
