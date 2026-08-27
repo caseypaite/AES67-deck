@@ -5,6 +5,7 @@ import * as dgram from 'dgram';
 import * as http from 'http';
 import { execFile } from 'child_process';
 import * as path from 'path';
+import { ensurePeaks } from './wavPeaks';
 
 const SCENES_DIR = path.join(process.cwd(), '..', 'scenes');
 if (!fs.existsSync(SCENES_DIR)) {
@@ -633,6 +634,20 @@ wss.on('connection', (ws) => {
         }
       } else if (data.type === 'stop_multitrack_record') {
         if (engineSocket) engineSocket.write(JSON.stringify({ type: 'stop_multitrack_record' }) + '\n');
+      } else if (data.type === 'get_clip_peaks') {
+        // Lazy waveform data: compute (and cache) min/max peaks for one take
+        // file on first request, then serve from disk.
+        const takeDir = String(data.takeDir || '').replace(/[^0-9A-Za-z:_-]/g, '');
+        const file = String(data.file || '').replace(/[^0-9A-Za-z._-]/g, '');
+        if (takeDir && /^ch\d+\.wav$/.test(file)) {
+          const wavPath = path.join(projectDir(activeProjectName), 'takes', takeDir, file);
+          setImmediate(() => {
+            const peaks = fs.existsSync(wavPath) ? ensurePeaks(wavPath) : null;
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'clip_peaks', clipId: data.clipId, takeDir, file, peaks }));
+            }
+          });
+        }
       } else if (data.type && allowedTypes.includes(data.type)) {
         // Intercept mixer state changes: update in-memory snapshot, persist
         // to disk (debounced), and fan-out to all other connected clients.
