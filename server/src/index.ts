@@ -394,66 +394,6 @@ wss.on('connection', (ws) => {
           if (lastDaemonState.reachable) await reconcileTxSources(lastDaemonState.sources);
           await refreshDaemonState();
         });
-      } else if (data.type === 'daemon_create_source') {
-        // Transmit: create a daemon Source that reads `map` ALSA playback
-        // channels (fed by the engine via pw-link in Phase 2) and sends RTP.
-        runDaemonOp(async () => {
-          const id = lowestFreeDaemonId(lastDaemonState.sources);
-          if (id < 0) { console.error('daemon_create_source: no free source id'); return; }
-          const map = Array.isArray(data.map) && data.map.length > 0
-            ? data.map.map((n: any) => Number(n)) : [0, 1];
-          const body = {
-            enabled: true,
-            name: String(data.name || `Deck Source ${id}`),
-            io: 'Audio Device',
-            map,
-            max_samples_per_packet: 48,
-            codec: 'L24',
-            address: typeof data.address === 'string' ? data.address : '',
-            ttl: 15,
-            payload_type: 98,
-            dscp: 34,
-            refclk_ptp_traceable: false
-          };
-          const res = await daemonRequest('PUT', `/api/source/${id}`, body);
-          if (!res.ok) console.error(`daemon_create_source failed (${res.status})`, res.json);
-          await refreshDaemonState();
-        });
-      } else if (data.type === 'daemon_update_source') {
-        // Re-PUT an existing Source with the live config merged over the patch
-        // (the daemon has no PATCH — every field must be present).
-        runDaemonOp(async () => {
-          const id = Number(data.id);
-          if (!Number.isInteger(id)) return;
-          const current = lastDaemonState.sources.find((s: any) => Number(s.id) === id);
-          if (!current) { console.error(`daemon_update_source: unknown source ${id}`); return; }
-          const { type: _t, id: _i, ...patch } = data;
-          const body = {
-            enabled: current.enabled,
-            name: current.name,
-            io: current.io || 'Audio Device',
-            map: current.map,
-            max_samples_per_packet: current.max_samples_per_packet ?? 48,
-            codec: current.codec || 'L24',
-            address: current.address || '',
-            ttl: current.ttl ?? 15,
-            payload_type: current.payload_type ?? 98,
-            dscp: current.dscp ?? 34,
-            refclk_ptp_traceable: current.refclk_ptp_traceable ?? false,
-            ...patch
-          };
-          const res = await daemonRequest('PUT', `/api/source/${id}`, body);
-          if (!res.ok) console.error(`daemon_update_source failed (${res.status})`, res.json);
-          await refreshDaemonState();
-        });
-      } else if (data.type === 'daemon_delete_source') {
-        runDaemonOp(async () => {
-          const id = Number(data.id);
-          if (!Number.isInteger(id)) return;
-          const res = await daemonRequest('DELETE', `/api/source/${id}`);
-          if (!res.ok) console.error(`daemon_delete_source failed (${res.status})`, res.json);
-          await refreshDaemonState();
-        });
       } else if (data.type === 'daemon_set_ptp') {
         runDaemonOp(async () => {
           const domain = Number(data.domain);
