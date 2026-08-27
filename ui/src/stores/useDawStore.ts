@@ -19,6 +19,8 @@ export interface DawClip {
   sampleRate?: number;
   sourceOffset?: number; // seconds into the source file the clip starts (left-trim)
   gain?: number;         // linear playback gain, default 1
+  fadeIn?: number;       // seconds — fade-in ramp at the clip head
+  fadeOut?: number;      // seconds — fade-out ramp at the clip tail
 }
 
 export interface DawMarker {
@@ -32,7 +34,8 @@ export interface PeaksData {
   version: number;
   sampleRate: number;
   frames: number;
-  tiers: Record<string, number[]>; // tier(spf) -> [min,max,min,max,...] mono
+  tiers: Record<string, number[]>;      // tier(spf) -> [min,max,min,max,...] mono
+  rmsTiers?: Record<string, number[]>;  // tier(spf) -> [rms,...] mono (v2+); absent on legacy files
 }
 
 export function clipPeakKey(clip: Pick<DawClip, 'takeDir' | 'file'>): string | null {
@@ -65,8 +68,15 @@ interface DawState {
   selectedClipIds: string[];
   clipboard: DawClip[];
 
+  // Transient interaction state (not persisted, not serialised to the project).
+  dragOverTrackId: number | null;         // lane highlighted as a vertical-move target
+  marquee: { x0: number; y0: number; x1: number; y1: number } | null;
+
   snapToGrid: boolean;
   gridSize: number;               // seconds
+
+  fps: number;                    // timecode frame rate (25 | 30)
+  timecode: string;               // hh:mm:ss:ff derived from the playhead — toolbar readout
 
   lastOverrun: boolean;           // last committed take reported a disk overrun
   playbackUnderrun: boolean;      // the timeline reader couldn't keep playback fed
@@ -174,8 +184,13 @@ export const useDawStore = create<DawState>()(
       selectedClipIds: [],
       clipboard: [],
 
+      dragOverTrackId: null,
+      marquee: null,
+
       snapToGrid: true,
       gridSize: 1.0,
+      fps: 30,
+      timecode: '00:00:00:00',
 
       lastOverrun: false,
       playbackUnderrun: false,
