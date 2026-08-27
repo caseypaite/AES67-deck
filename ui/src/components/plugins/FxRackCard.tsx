@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   useMixerStore,
   PluginNode,
@@ -45,58 +46,106 @@ const CATEGORIES: PluginCategory[] = [
   'Saturation', 'Dynamics', 'De-Esser', 'Equalizer', 'Delay', 'Reverb', 'Limiter',
 ];
 
+const POPOVER_WIDTH = 260;
+
+// Rendered in a body portal with fixed positioning anchored to the INSERT
+// EFFECT button, so no `overflow-hidden` ancestor in the rack/panel can clip
+// it and nothing in the rack layout shifts when it opens — it just appears.
 const AddEffectPopover = ({
+  anchor,
   onAdd,
   onClose,
 }: {
+  anchor: HTMLElement;
   onAdd: (uri: string, name: string) => void;
   onClose: () => void;
 }) => {
   const [activeCategory, setActiveCategory] = useState<PluginCategory>('Dynamics');
   const options = PLUGIN_REGISTRY.filter(e => e.category === activeCategory);
 
-  return (
-    <div className="metal-face metal-grain absolute bottom-full left-0 mb-1 z-50 w-[260px] border border-black/70 rounded shadow-2xl overflow-hidden">
-      {/* Category tabs */}
-      <div className="flex flex-wrap gap-0.5 p-1.5 border-b-2 border-black/50 metal-face-rack">
-        {CATEGORIES.map(cat => (
-          <button
-            key={cat}
-            onClick={() => setActiveCategory(cat)}
-            className={`px-2 py-0.5 text-[9px] font-bold tracking-wide rounded border transition-colors ${
-              activeCategory === cat
-                ? CATEGORY_COLORS[cat]
-                : 'bg-transparent text-gray-500 border-transparent hover:text-gray-300'
-            }`}
-          >
-            {cat.toUpperCase()}
-          </button>
-        ))}
-      </div>
+  const [pos, setPos] = useState<{ left: number; bottom: number; maxHeight: number }>(() => {
+    const r = anchor.getBoundingClientRect();
+    return {
+      left: Math.max(8, Math.min(r.left, window.innerWidth - POPOVER_WIDTH - 8)),
+      bottom: window.innerHeight - r.top + 6,
+      maxHeight: r.top - 16,
+    };
+  });
 
-      {/* Plugin list */}
-      <div className="flex flex-col max-h-[200px] overflow-y-auto custom-scrollbar metal-well">
-        {options.map(opt => (
-          <button
-            key={opt.uri}
-            onClick={() => { onAdd(opt.uri, opt.name); onClose(); }}
-            className="text-left px-3 py-2 text-xs text-gray-300 hover:bg-white/5 hover:text-white border-b border-black/40 transition-colors last:border-0"
-          >
-            {opt.name}
-          </button>
-        ))}
-      </div>
+  // Re-anchor once mounted and on viewport changes.
+  useLayoutEffect(() => {
+    const place = () => {
+      const r = anchor.getBoundingClientRect();
+      setPos({
+        left: Math.max(8, Math.min(r.left, window.innerWidth - POPOVER_WIDTH - 8)),
+        bottom: window.innerHeight - r.top + 6,
+        maxHeight: r.top - 16,
+      });
+    };
+    place();
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [anchor]);
 
-      {/* Dismiss */}
-      <div className="p-1.5 border-t-2 border-black/50 metal-face-rack flex justify-end">
-        <button
-          onClick={onClose}
-          className="text-[9px] text-gray-500 hover:text-gray-300 font-bold tracking-widest px-2 py-0.5"
-        >
-          CANCEL
-        </button>
+  return createPortal(
+    <div className="fixed inset-0 z-[100]" onClick={onClose}>
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          position: 'fixed',
+          left: pos.left,
+          bottom: pos.bottom,
+          width: POPOVER_WIDTH,
+          maxHeight: Math.max(160, pos.maxHeight),
+        }}
+        className="metal-face metal-grain border border-black/70 rounded shadow-2xl overflow-hidden flex flex-col"
+      >
+        {/* Category tabs */}
+        <div className="flex flex-wrap gap-0.5 p-1.5 border-b-2 border-black/50 metal-face-rack shrink-0">
+          {CATEGORIES.map(cat => (
+            <button
+              key={cat}
+              onClick={() => setActiveCategory(cat)}
+              className={`px-2 py-0.5 text-[9px] font-bold tracking-wide rounded border transition-colors ${
+                activeCategory === cat
+                  ? CATEGORY_COLORS[cat]
+                  : 'bg-transparent text-gray-500 border-transparent hover:text-gray-300'
+              }`}
+            >
+              {cat.toUpperCase()}
+            </button>
+          ))}
+        </div>
+
+        {/* Plugin list */}
+        <div className="flex flex-col flex-1 min-h-0 overflow-y-auto custom-scrollbar metal-well">
+          {options.map(opt => (
+            <button
+              key={opt.uri}
+              onClick={() => { onAdd(opt.uri, opt.name); onClose(); }}
+              className="text-left px-3 py-2 text-xs text-gray-300 hover:bg-white/5 hover:text-white border-b border-black/40 transition-colors last:border-0"
+            >
+              {opt.name}
+            </button>
+          ))}
+        </div>
+
+        {/* Dismiss */}
+        <div className="p-1.5 border-t-2 border-black/50 metal-face-rack flex justify-end shrink-0">
+          <button
+            onClick={onClose}
+            className="text-[9px] text-gray-500 hover:text-gray-300 font-bold tracking-widest px-2 py-0.5"
+          >
+            CANCEL
+          </button>
+        </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };
 
@@ -219,6 +268,7 @@ export const FxRackCard = () => {
   const [showPresets,  setShowPresets]  = useState(false);
   const [draggedIdx,   setDraggedIdx]   = useState<number | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null); // plugin.id
+  const addBtnRef = useRef<HTMLButtonElement>(null);
 
   // Request preset list whenever the popover opens
   const handleOpenPresets = () => {
@@ -346,14 +396,16 @@ export const FxRackCard = () => {
         {/* Add effect button */}
         <div className="metal-face relative px-2 py-2 border-t-2 border-black/60 shrink-0">
           <button
+            ref={addBtnRef}
             onClick={() => setShowAdd(v => !v)}
             className="metal-btn w-full text-[9px] font-black tracking-widest text-sky-300 rounded-[3px] py-1.5 flex items-center justify-center gap-1"
           >
             <span className="text-sm leading-none">+</span>
             INSERT EFFECT
           </button>
-          {showAdd && (
+          {showAdd && addBtnRef.current && (
             <AddEffectPopover
+              anchor={addBtnRef.current}
               onAdd={(uri, name) => addPlugin(selectedChannelId, { name, uri, enabled: true })}
               onClose={() => setShowAdd(false)}
             />
