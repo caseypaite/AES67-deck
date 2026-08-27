@@ -40,13 +40,16 @@ public:
 
     // RT thread. No-op for channels not armed in the current take.
     void write(int ch_id, const float* l, const float* r, int nframes) {
-        if (!recording_.load(std::memory_order_relaxed)) return;
+        if (!recording_.load(std::memory_order_acquire)) return;
         if (ch_id < 1 || ch_id > MAX_CH) return;
         DiskWriter* w = writers_[ch_id].get();
         if (!w) return;
         const float* chans[2] = { l, r };
         w->write_audio(chans, 2, nframes);
+        frames_tapped_.fetch_add(nframes, std::memory_order_relaxed);
     }
+
+    uint64_t frames_tapped() const { return frames_tapped_.load(std::memory_order_relaxed); }
 
     // True if any armed channel's disk writer reported a ringbuffer overrun.
     bool had_overrun() const {
@@ -60,6 +63,7 @@ public:
 private:
     std::array<std::unique_ptr<DiskWriter>, MAX_CH + 1> writers_{}; // index by ch id
     std::atomic<bool> recording_{false};
+    std::atomic<uint64_t> frames_tapped_{0};
     std::string dir_;
     std::vector<int> armed_;
     uint64_t origin_frame_ = 0;

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -31,6 +32,7 @@ public:
 
 private:
     void disk_thread_func();
+    void drain_ringbuffer();
 
     std::atomic<bool> is_recording_;
     std::atomic<bool> thread_running_;

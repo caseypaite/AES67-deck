@@ -47,6 +47,7 @@ bool MultitrackRecorder::start(const std::string& dir, const std::vector<int>& a
         return false;
     }
 
+    frames_tapped_.store(0, std::memory_order_relaxed);
     recording_.store(true, std::memory_order_release);
     std::cout << "MultitrackRecorder: recording " << opened << " channel(s) to "
               << base << " from frame " << origin_frame_ << std::endl;
@@ -62,7 +63,9 @@ void MultitrackRecorder::stop() {
     for (auto& w : writers_) {
         if (w) w->stop_recording();
     }
-    std::cout << "MultitrackRecorder: take closed (" << dir_ << ")" << std::endl;
+    std::cout << "MultitrackRecorder: take closed (" << dir_ << "), "
+              << (armed_.empty() ? 0 : frames_tapped_.load(std::memory_order_relaxed) / armed_.size())
+              << " frames/ch across " << armed_.size() << " channel(s)" << std::endl;
 }
 
 } // namespace recorder
