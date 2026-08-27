@@ -533,6 +533,13 @@ const ipcServer = net.createServer((socket) => {
   // to disk on every (re)connect so the signal chain self-heals whether
   // this is the first boot or a recovery, with no manual step required.
   (async () => {
+    // The engine opens this IPC socket before it finishes registering its
+    // JACK ports — on a cold PipeWire+engine restart the ports can lag the
+    // connection by several seconds. Applying pw-link routing before the
+    // ports exist silently no-ops (pw-link errors are ignored) and nothing
+    // retries, leaving the whole graph disconnected. Wait for the engine's
+    // ports to actually appear first.
+    await waitForEnginePorts();
     await handlePatchbaySync(getPatchbayMappings());
     await applyOutputRouting(getOutputRouting());
     await applyMonitorRouting();
@@ -1049,6 +1056,20 @@ function runCmd(cmd: string, args: string[]): Promise<string> {
 async function listAllOutputPorts(): Promise<string[]> {
   const stdout = await runCmd('pw-link', ['-o']);
   return stdout.split('\n').map(l => l.trim()).filter(Boolean);
+}
+
+// Polls the PipeWire graph until the engine's JACK ports are present (or a
+// timeout), so the routing reapply on engine (re)connect doesn't race the
+// engine's port registration. `monitor_R` is the very last output port the
+// engine registers (main.cpp: inputs, then out/bus, then monitor_L/R), so
+// seeing it means every port this block links is up.
+async function waitForEnginePorts(timeoutMs = 20000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await listAllOutputPorts()).includes('AES67_Deck:monitor_R')) return;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  console.warn('waitForEnginePorts: AES67_Deck ports not seen within timeout — applying routing anyway');
 }
 
 interface PactlSource {
