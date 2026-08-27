@@ -146,7 +146,10 @@ interface DawState {
 // --- project persistence (debounced push to the server) ---
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let applyingRemote = false;
-const requestedPeaks = new Set<string>(); // clipPeakKeys with a get_clip_peaks in flight
+// clipPeakKey -> last get_clip_peaks request time. Cleared when the peaks land;
+// a stale entry (lost response, socket race) is retried after RETRY_MS.
+const requestedPeaks = new Map<string, number>();
+const PEAK_RETRY_MS = 4000;
 
 export function formatTimecode(sec: number, fps: number): string {
   const s = Math.max(0, sec);
@@ -231,11 +234,16 @@ export const useDawStore = create<DawState>()(
       setScroll: (x, y) => set({ scrollX: Math.max(0, x), scrollY: Math.max(0, y) }),
       flagPlaybackUnderrun: () => { if (!get().playbackUnderrun) set({ playbackUnderrun: true }); },
 
-      setPeaks: (key, data) => set((s) => ({ peaks: { ...s.peaks, [key]: data } })),
+      setPeaks: (key, data) => {
+        requestedPeaks.delete(key);
+        set((s) => ({ peaks: { ...s.peaks, [key]: data } }));
+      },
       ensureClipPeaks: (clip) => {
         const key = clipPeakKey(clip);
-        if (!key || get().peaks[key] || requestedPeaks.has(key)) return;
-        requestedPeaks.add(key);
+        if (!key || get().peaks[key]) return;
+        const last = requestedPeaks.get(key);
+        if (last && Date.now() - last < PEAK_RETRY_MS) return; // in flight / just tried
+        requestedPeaks.set(key, Date.now());
         wsSend({ type: 'get_clip_peaks', clipId: clip.id, takeDir: clip.takeDir, file: clip.file });
       },
 
