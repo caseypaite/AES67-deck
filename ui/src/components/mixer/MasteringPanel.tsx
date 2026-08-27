@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useMixerStore } from '../../stores/useMixerStore';
 import { MASTERING_PRESETS } from '../../data/masteringPresets';
+import { SaveDialog } from '../common/SaveDialog';
 
 // Mastering tools + analysers shown in the sends-sidebar space when the
 // Master or Monitor bus is selected. Left: master-output spectrum + stereo
@@ -97,6 +98,7 @@ export const MasteringPanel = ({ channelId }: { channelId: number }) => {
   const channelName = useMixerStore(s => s.channels[channelId]?.name ?? '');
 
   const [sel, setSel] = useState<string>(MASTERING_PRESETS[0].id);
+  const [showSave, setShowSave] = useState(false);
 
   useEffect(() => { listRackPresets(); }, [listRackPresets]);
 
@@ -110,13 +112,21 @@ export const MasteringPanel = ({ channelId }: { channelId: number }) => {
     if (builtin) applyRack(channelId, builtin.plugins);
     else loadRackPreset(sel); // user preset → server applies to selected channel
   };
-  const save = () => {
-    const name = window.prompt('Save current master chain as preset:');
-    if (name?.trim()) { saveRackPreset(channelId, name.trim()); setTimeout(listRackPresets, 300); }
-  };
+  const save = () => setShowSave(true);
+  const doSave = (name: string) => { saveRackPreset(channelId, name); setTimeout(listRackPresets, 300); };
 
   return (
     <div className="w-full h-full flex flex-col bg-[#0d0f13] z-10 overflow-hidden">
+      {showSave && (
+        <SaveDialog
+          title="Save master chain preset"
+          label="Preset name"
+          existing={rackPresets}
+          existingLabel="presets"
+          onSave={doSave}
+          onClose={() => setShowSave(false)}
+        />
+      )}
       <div className="shrink-0 text-[9px] font-black tracking-[0.2em] text-[#a0a5aa] uppercase text-center border-b-2 border-black py-1 bg-[#111]">
         Mastering · {channelName || 'Master'}
       </div>

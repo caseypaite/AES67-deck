@@ -9,6 +9,7 @@ import { PatchbayView } from '../components/patchbay/PatchbayView';
 import { Screw } from '../components/analog/Screw';
 import { LufsPanel } from '../components/mixer/LufsPanel';
 import { MasteringPanel } from '../components/mixer/MasteringPanel';
+import { SaveDialog, ConfirmDialog } from '../components/common/SaveDialog';
 
 // One vertical send fader — shared by AuxSendsPanel (columns = destination
 // buses, for a selected input channel) and SourceSendsPanel (columns =
@@ -326,14 +327,13 @@ export const LiveConsoleView = () => {
     return () => clearTimeout(t);
   }, [recordingProjectError, setRecordingProjectError]);
 
-  const handleSaveScene = () => {
-    const name = prompt("Enter scene name to save:");
-    if (!name) return;
+  // null = closed; 'scene' | 'project' selects which save dialog is open.
+  const [saveDialog, setSaveDialog] = useState<null | 'scene' | 'project'>(null);
+  const [pendingOpenProject, setPendingOpenProject] = useState<string | null>(null);
+
+  const doSaveScene = (name: string) => {
     const patchbayMappings = usePatchbayStore.getState().mappings;
-    const state = {
-      mixer: { channels },
-      patchbay: { mappings: patchbayMappings }
-    };
+    const state = { mixer: { channels }, patchbay: { mappings: patchbayMappings } };
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'save_scene', name, state }));
     }
@@ -346,18 +346,9 @@ export const LiveConsoleView = () => {
     }
   };
 
-  const handleSaveProject = () => {
-    const suggested = activeRecordingProject || '';
-    const name = prompt('Save multitrack recording project as:', suggested);
-    if (!name || !name.trim()) return;
-    saveRecordingProject(name.trim());
-  };
-
   const handleOpenProject = (name: string) => {
-    if (!name) return;
-    if (name !== activeRecordingProject &&
-        !confirm(`Open recording project "${name}"? The current timeline will be replaced.`)) return;
-    openRecordingProject(name);
+    if (!name || name === activeRecordingProject) return;
+    setPendingOpenProject(name);
   };
 
   return (
@@ -366,6 +357,37 @@ export const LiveConsoleView = () => {
         <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-red-700 text-white text-xs font-bold rounded shadow-xl border border-red-400">
           Recording project: {recordingProjectError}
         </div>
+      )}
+
+      {saveDialog === 'scene' && (
+        <SaveDialog
+          title="Save scene"
+          label="Scene name"
+          existing={scenes}
+          existingLabel="scenes"
+          onSave={doSaveScene}
+          onClose={() => setSaveDialog(null)}
+        />
+      )}
+      {saveDialog === 'project' && (
+        <SaveDialog
+          title="Save recording project"
+          label="Project name"
+          existing={recordingProjects}
+          initialName={activeRecordingProject ?? ''}
+          existingLabel="projects"
+          onSave={saveRecordingProject}
+          onClose={() => setSaveDialog(null)}
+        />
+      )}
+      {pendingOpenProject && (
+        <ConfirmDialog
+          title="Open recording project"
+          message={`Open "${pendingOpenProject}"? The current timeline will be replaced${activeRecordingProject ? '' : ' and any unsaved takes left in the scratch session'}.`}
+          confirmLabel="Open"
+          onConfirm={() => openRecordingProject(pendingOpenProject)}
+          onClose={() => setPendingOpenProject(null)}
+        />
       )}
       {/* Top Toolbar */}
       <div className="h-14 bg-[#111318] border-b border-gray-800 flex items-center justify-between px-6 shrink-0 z-20 shadow-md">
@@ -394,7 +416,7 @@ export const LiveConsoleView = () => {
           {activeView === 'daw' && (
             <>
               <button
-                onClick={handleSaveProject}
+                onClick={() => setSaveDialog('project')}
                 title={activeRecordingProject ? `Saving to records/${activeRecordingProject}/` : 'Consolidate takes into a REAPER project'}
                 className="px-3 py-1.5 bg-[#1a1c22] hover:bg-blue-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]"
               >
@@ -412,7 +434,7 @@ export const LiveConsoleView = () => {
               <div className="w-px h-5 bg-gray-700" />
             </>
           )}
-          <button onClick={handleSaveScene} className="px-3 py-1.5 bg-[#1a1c22] hover:bg-green-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]">SAVE SCENE</button>
+          <button onClick={() => setSaveDialog('scene')} className="px-3 py-1.5 bg-[#1a1c22] hover:bg-green-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]">SAVE SCENE</button>
           <select onChange={e => { handleLoadScene(e.target.value); e.target.value = ''; }} className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-32 cursor-pointer shadow-sm">
              <option value="">LOAD SCENE...</option>
              {scenes.map((s: string) => <option key={s} value={s}>{s}</option>)}

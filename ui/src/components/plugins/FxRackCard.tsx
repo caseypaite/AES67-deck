@@ -8,6 +8,7 @@ import {
 } from '../../stores/useMixerStore';
 import { PluginDetail } from './PluginDetail';
 import { Screw } from '../analog/Screw';
+import { SaveDialog } from '../common/SaveDialog';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -266,6 +267,7 @@ export const FxRackCard = () => {
 
   const [showAdd,      setShowAdd]      = useState(false);
   const [showPresets,  setShowPresets]  = useState(false);
+  const [showSave,     setShowSave]     = useState(false);
   const [draggedIdx,   setDraggedIdx]   = useState<number | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null); // plugin.id
   const addBtnRef = useRef<HTMLButtonElement>(null);
@@ -284,16 +286,24 @@ export const FxRackCard = () => {
   const plugins = channel.plugins;
   const selectedPlugin = selectedSlot ? plugins.find(p => p.id === selectedSlot) ?? null : null;
 
-  const handleSave = () => {
-    const name = prompt('Save FX preset as:');
-    if (!name?.trim()) return;
-    saveRackPreset(selectedChannelId, name.trim());
+  const handleSave = (name: string) => {
+    saveRackPreset(selectedChannelId, name);
     // Re-list after save so the popover stays fresh
     setTimeout(() => listRackPresets(), 300);
   };
 
   return (
     <div className="flex h-full w-full">
+      {showSave && (
+        <SaveDialog
+          title={`Save FX rack — ${channel.name}`}
+          label="Preset name"
+          existing={rackPresets}
+          existingLabel="presets"
+          onSave={handleSave}
+          onClose={() => setShowSave(false)}
+        />
+      )}
       {/* ── Rack Card (square / fixed width = full panel height) ── */}
       <div className="metal-face-rack metal-grain relative flex flex-col border-r-2 border-black/70 shrink-0 h-full min-h-0"
            style={{ width: 'var(--rack-width, 200px)' }}>
@@ -310,7 +320,7 @@ export const FxRackCard = () => {
         {/* Preset toolbar */}
         <div className="flex items-center gap-1.5 px-2 py-1.5 border-b-2 border-black/50 shrink-0">
           <button
-            onClick={handleSave}
+            onClick={() => { listRackPresets(); setShowSave(true); }}
             className="metal-btn flex-1 text-[8px] font-black tracking-widest text-emerald-300 rounded-[3px] px-1 py-1"
           >
             SAVE
