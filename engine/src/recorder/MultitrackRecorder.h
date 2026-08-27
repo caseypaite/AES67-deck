@@ -51,6 +51,13 @@ public:
 
     uint64_t frames_tapped() const { return frames_tapped_.load(std::memory_order_relaxed); }
 
+    // Frames actually written per channel this take — the reliable clip length,
+    // independent of where the transport was when record armed.
+    uint64_t recorded_frames() const {
+        const size_t n = armed_.size();
+        return n ? frames_tapped_.load(std::memory_order_relaxed) / n : 0;
+    }
+
     // True if any armed channel's disk writer reported a ringbuffer overrun.
     bool had_overrun() const {
         for (int c = 1; c <= MAX_CH; ++c) {
