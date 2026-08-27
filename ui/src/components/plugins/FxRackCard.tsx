@@ -9,6 +9,7 @@ import {
 import { PluginDetail } from './PluginDetail';
 import { Screw } from '../analog/Screw';
 import { SaveDialog } from '../common/SaveDialog';
+import { FX_CHAINS, FxChainGroup } from '../../data/fxChains';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -264,6 +265,7 @@ export const FxRackCard = () => {
   const loadRackPreset    = useMixerStore(s => s.loadRackPreset);
   const deleteRackPreset  = useMixerStore(s => s.deleteRackPreset);
   const listRackPresets   = useMixerStore(s => s.listRackPresets);
+  const applyRack         = useMixerStore(s => s.applyRack);
 
   const [showAdd,      setShowAdd]      = useState(false);
   const [showPresets,  setShowPresets]  = useState(false);
@@ -333,11 +335,33 @@ export const FxRackCard = () => {
               LOAD
             </button>
             {showPresets && (
-              <div className="metal-face metal-grain absolute top-full left-0 mt-1 z-50 w-[200px] border border-black/70 rounded shadow-2xl overflow-hidden">
-                <div className="text-[8px] font-black tracking-widest text-engrave px-2 py-1.5 border-b-2 border-black/50">
-                  RACK PRESETS
-                </div>
-                <div className="flex flex-col max-h-[180px] overflow-y-auto custom-scrollbar metal-well">
+              <div className="metal-face metal-grain absolute top-full left-0 mt-1 z-50 w-[240px] border border-black/70 rounded shadow-2xl overflow-hidden">
+                <div className="flex flex-col max-h-[320px] overflow-y-auto custom-scrollbar metal-well">
+                  {(['Vocals', 'Instruments'] as FxChainGroup[]).map(group => (
+                    <React.Fragment key={group}>
+                      <div className="text-[8px] font-black tracking-widest text-engrave px-2 py-1.5 border-b-2 border-black/50 sticky top-0 metal-face-rack z-10">
+                        {group.toUpperCase()}
+                      </div>
+                      {FX_CHAINS.filter(c => c.group === group).map(chain => (
+                        <button
+                          key={chain.id}
+                          onClick={() => {
+                            applyRack(selectedChannelId, chain.plugins);
+                            setSelectedSlot(null);
+                            setShowPresets(false);
+                          }}
+                          title={chain.desc}
+                          className="text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 border-b border-black/40 transition-colors"
+                        >
+                          <div className="font-bold truncate">{chain.name}</div>
+                          <div className="text-[8px] text-gray-500 leading-tight line-clamp-2">{chain.desc}</div>
+                        </button>
+                      ))}
+                    </React.Fragment>
+                  ))}
+                  <div className="text-[8px] font-black tracking-widest text-engrave px-2 py-1.5 border-y-2 border-black/50 sticky top-0 metal-face-rack z-10">
+                    SAVED PRESETS
+                  </div>
                   {rackPresets.length === 0 ? (
                     <div className="text-[9px] text-gray-600 px-3 py-3 text-center">No saved presets.</div>
                   ) : (
