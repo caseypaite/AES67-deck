@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore } from '../stores/useMixerStore';
 import { SurfaceModel, RULER_H } from './SurfaceModel';
@@ -6,11 +6,19 @@ import { SurfaceModel, RULER_H } from './SurfaceModel';
 // Canvas arrange surface. React mounts it once; all drawing and interaction
 // happen outside React — a single rAF loop paints the SurfaceModel, pointer
 // handlers mutate the store, and a store subscription just flips a dirty flag.
+// The only React state here is the two transient DOM overlays (context menu,
+// inline rename) that genuinely need the DOM.
+
+interface MenuState { x: number; y: number; clipId: string; time: number }
+interface RenameState { x: number; y: number; w: number; clipId: string; value: string }
+
 export function ArrangeSurface() {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const modelRef = useRef<SurfaceModel | null>(null);
   const dirtyRef = useRef(true);
+  const [menu, setMenu] = useState<MenuState | null>(null);
+  const [rename, setRename] = useState<RenameState | null>(null);
 
   if (!modelRef.current) modelRef.current = new SurfaceModel();
   const model = modelRef.current;
@@ -36,14 +44,15 @@ export function ArrangeSurface() {
     return () => ro.disconnect();
   }, [model]);
 
-  // --- render loop ---
+  // --- render loop (the only rAF loop in the timeline) ---
   useEffect(() => {
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext('2d')!;
     let raf = 0;
     const frame = () => {
-      const playing = useMixerStore.getState().transportState !== 'stopped';
-      if (dirtyRef.current || playing) {
+      const rolling = useMixerStore.getState().transportState !== 'stopped';
+      if (rolling) useDawStore.getState().tickPlayhead(); // interpolate engine clock
+      if (dirtyRef.current || rolling) {
         const dpr = window.devicePixelRatio || 1;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         model.draw(ctx);
@@ -52,9 +61,8 @@ export function ArrangeSurface() {
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
-    // The DAW store carries everything the surface draws (clips, selection,
-    // scroll, zoom, playhead, peaks); a change there flags a repaint. Transport
-    // state is polled in the loop above to keep repainting while it rolls.
+    // Any DAW-store change (clips, selection, scroll, zoom, playhead, peaks,
+    // marquee, drag target) flags a repaint.
     const unsub = useDawStore.subscribe(() => { dirtyRef.current = true; });
     return () => { cancelAnimationFrame(raf); unsub(); };
   }, [model]);
@@ -68,29 +76,52 @@ export function ArrangeSurface() {
       const s = daw.getState();
       return s.snapToGrid ? Math.round(t / s.gridSize) * s.gridSize : t;
     };
+    const pt = (e: PointerEvent | MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      return { px: e.clientX - rect.left, py: e.clientY - rect.top, rect };
+    };
+    const drag = (move: (e: PointerEvent) => void, end?: () => void) => {
+      const up = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        end?.();
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    };
+
+    // hover cursor feedback
+    const onPointerMove = (e: PointerEvent) => {
+      if (e.buttons) return;
+      const { px, py } = pt(e);
+      canvas.style.cursor = model.hitTest(px, py).cursor;
+    };
 
     const onPointerDown = (e: PointerEvent) => {
-      const rect = canvas.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const py = e.clientY - rect.top;
+      if (e.button === 2) return; // context menu handled separately
+      setMenu(null);
+      const { px, py, rect } = pt(e);
       const hit = model.hitTest(px, py);
       const s = daw.getState();
 
       if (hit.kind === 'ruler') {
-        const scrub = (cx: number) => {
-          const t = Math.max(0, model.xToTime(cx - rect.left));
-          daw.getState().locate(snap(t));
-        };
+        const scrub = (cx: number) => s.locate(snap(Math.max(0, model.xToTime(cx - rect.left))));
         scrub(e.clientX);
-        const move = (ev: PointerEvent) => scrub(ev.clientX);
-        const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-        window.addEventListener('pointermove', move);
-        window.addEventListener('pointerup', up);
+        drag((ev) => scrub(ev.clientX));
         return;
       }
 
       if (hit.kind === 'lane' || hit.kind === 'empty') {
         if (!e.shiftKey) s.clearSelection();
+        // marquee select
+        const startPx = px, startPy = py;
+        const baseSel = e.shiftKey ? [...s.selectedClipIds] : [];
+        const move = (ev: PointerEvent) => {
+          const p = pt(ev);
+          daw.getState().setMarquee({ x0: startPx, y0: startPy, x1: p.px, y1: p.py });
+          daw.getState().setSelectedClips(uniq([...baseSel, ...model.clipsInRect(startPx, startPy, p.px, p.py)]));
+        };
+        drag(move, () => daw.getState().setMarquee(null));
         return;
       }
 
@@ -108,11 +139,34 @@ export function ArrangeSurface() {
       }
 
       const startX = e.clientX;
+      const startY = e.clientY;
+      const zoomAt = () => daw.getState().zoom;
+
+      if (hit.kind === 'clip-fade-in' || hit.kind === 'clip-fade-out') {
+        const edge = hit.kind === 'clip-fade-in' ? 'in' : 'out';
+        const base = edge === 'in' ? (clip.fadeIn || 0) : (clip.fadeOut || 0);
+        drag((ev) => {
+          const dt = (ev.clientX - startX) / zoomAt();
+          daw.getState().setClipFade(clip.id, edge, edge === 'in' ? base + dt : base - dt);
+        });
+        return;
+      }
+
+      if (hit.kind === 'clip-gain') {
+        const laneH = Math.max(20, (model.trackAtY(py)?.height ?? 96) - 20);
+        const baseDb = 20 * Math.log10(Math.max(1e-4, clip.gain ?? 1));
+        drag((ev) => {
+          const dy = ev.clientY - startY;
+          const db = baseDb - (dy / laneH) * 72; // dragging the full lane ≈ 72 dB
+          daw.getState().setClipGain(clip.id, Math.pow(10, Math.max(-60, Math.min(12, db)) / 20));
+        });
+        return;
+      }
 
       if (hit.kind === 'clip-left') {
         const c0 = { ...clip };
-        const move = (ev: PointerEvent) => {
-          const dt = (ev.clientX - startX) / daw.getState().zoom;
+        drag((ev) => {
+          const dt = (ev.clientX - startX) / zoomAt();
           let newStart = snap(c0.start + dt);
           newStart = Math.max(0, Math.min(c0.start + c0.length - 0.05, newStart));
           const shift = newStart - c0.start;
@@ -120,38 +174,73 @@ export function ArrangeSurface() {
             start: newStart, length: c0.length - shift,
             sourceOffset: Math.max(0, (c0.sourceOffset || 0) + shift),
           });
-        };
-        drag(move);
+        });
         return;
       }
       if (hit.kind === 'clip-right') {
         const c0 = { ...clip };
-        const move = (ev: PointerEvent) => {
-          const dt = (ev.clientX - startX) / daw.getState().zoom;
+        drag((ev) => {
+          const dt = (ev.clientX - startX) / zoomAt();
           const newLen = Math.max(0.05, snap(c0.start + c0.length + dt) - c0.start);
           daw.getState().updateClip(c0.id, { length: newLen });
-        };
-        drag(move);
+        });
         return;
       }
 
-      // move (whole selection)
+      // move (whole selection), with vertical retarget for a lone clip
       const starts: Record<string, number> = {};
       sel.forEach((id) => { const c = s.clips[id]; if (c) starts[id] = c.start; });
+      const originTrack = clip.trackId;
+      let moved = false;
       const move = (ev: PointerEvent) => {
-        const dt = (ev.clientX - startX) / daw.getState().zoom;
+        moved = true;
+        const dt = (ev.clientX - startX) / zoomAt();
         const snapped = snap(starts[clip.id] + dt) - starts[clip.id];
         let delta = snapped;
-        sel.forEach((id) => { if (starts[id] + delta < 0) delta = -starts[id]; });
+        Object.keys(starts).forEach((id) => { if (starts[id] + delta < 0) delta = -starts[id]; });
         sel.forEach((id) => daw.getState().updateClip(id, { start: starts[id] + delta }));
+
+        if (sel.length === 1) {
+          const p = pt(ev);
+          const tgt = model.trackAtY(p.py);
+          daw.getState().setDragOverTrack(tgt && tgt.id !== originTrack ? tgt.id : null);
+        }
       };
-      drag(move);
+      drag(move, () => {
+        const over = daw.getState().dragOverTrackId;
+        if (moved && sel.length === 1 && over != null && over !== originTrack) {
+          daw.getState().updateClip(clip.id, { trackId: over });
+        }
+        daw.getState().setDragOverTrack(null);
+      });
     };
 
-    const drag = (move: (e: PointerEvent) => void) => {
-      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-      window.addEventListener('pointermove', move);
-      window.addEventListener('pointerup', up);
+    const onDblClick = (e: MouseEvent) => {
+      const { px, py } = pt(e);
+      const hit = model.hitTest(px, py);
+      if ((hit.kind === 'clip' || hit.kind === 'clip-gain') && hit.clipId) {
+        const c = daw.getState().clips[hit.clipId];
+        if (!c) return;
+        setRename({
+          x: Math.max(model.timeToX(c.start), 2),
+          y: model.trackAtY(py)?.y ?? py,
+          w: 160,
+          clipId: c.id,
+          value: c.name,
+        });
+      }
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+      const { px, py } = pt(e);
+      const hit = model.hitTest(px, py);
+      if (hit.clipId) {
+        if (!daw.getState().selectedClipIds.includes(hit.clipId)) daw.getState().setSelectedClips([hit.clipId]);
+        setMenu({ x: e.clientX, y: e.clientY, clipId: hit.clipId, time: hit.time });
+      } else {
+        setMenu(null);
+      }
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -172,24 +261,82 @@ export function ArrangeSurface() {
     };
 
     canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('dblclick', onDblClick);
+    canvas.addEventListener('contextmenu', onContextMenu);
     canvas.addEventListener('wheel', onWheel, { passive: false });
     return () => {
       canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('dblclick', onDblClick);
+      canvas.removeEventListener('contextmenu', onContextMenu);
       canvas.removeEventListener('wheel', onWheel);
     };
   }, [model]);
 
-  // fetch peaks for any clip that lacks them whenever the clip set changes
+  // fetch peaks only when the set of source files changes
   useEffect(() => {
-    const run = () => Object.values(useDawStore.getState().clips).forEach((c) => useDawStore.getState().ensureClipPeaks(c));
+    let lastKeys = '';
+    const run = () => {
+      const clips = Object.values(useDawStore.getState().clips);
+      const keys = clips.map((c) => `${c.takeDir}/${c.file}`).sort().join('|');
+      if (keys === lastKeys) return;
+      lastKeys = keys;
+      clips.forEach((c) => useDawStore.getState().ensureClipPeaks(c));
+    };
     run();
     return useDawStore.subscribe(run);
   }, []);
 
+  const menuClip = menu ? useDawStore.getState().clips[menu.clipId] : undefined;
+
   return (
     <div ref={wrapRef} className="flex-1 relative overflow-hidden bg-[#16181d]">
-      <canvas ref={canvasRef} className="absolute inset-0 block" style={{ cursor: 'default' }} />
+      <canvas ref={canvasRef} className="absolute inset-0 block" />
       <div className="pointer-events-none absolute left-0 right-0 top-0" style={{ height: RULER_H }} />
+
+      {menu && menuClip && (
+        <>
+          <div className="fixed inset-0 z-40" onPointerDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
+          <div
+            className="fixed z-50 min-w-[168px] bg-[#1c1e24] border border-[#3a3d45] rounded-md shadow-2xl py-1 text-xs text-gray-200"
+            style={{ left: menu.x, top: menu.y }}
+          >
+            {[
+              { label: 'Split at cursor', fn: () => useDawStore.getState().splitClipAt(menu.clipId, menu.time) },
+              { label: 'Rename…', fn: () => setRename({ x: Math.max(model.timeToX(menuClip.start), 2), y: (model.tracks().find((t) => t.id === menuClip.trackId)?.y ?? 40), w: 160, clipId: menu.clipId, value: menuClip.name }) },
+              { label: 'Reset gain', fn: () => useDawStore.getState().setClipGain(menu.clipId, 1) },
+              { label: 'Clear fades', fn: () => { useDawStore.getState().setClipFade(menu.clipId, 'in', 0); useDawStore.getState().setClipFade(menu.clipId, 'out', 0); } },
+              { label: 'Delete', fn: () => { useDawStore.getState().setSelectedClips([menu.clipId]); useDawStore.getState().deleteSelected(); }, danger: true },
+            ].map((item) => (
+              <button
+                key={item.label}
+                className={`block w-full text-left px-3 py-1.5 hover:bg-[#2a2d35] ${item.danger ? 'text-red-400' : ''}`}
+                onClick={() => { item.fn(); setMenu(null); }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {rename && (
+        <input
+          autoFocus
+          className="absolute z-50 h-[15px] px-1 text-[10px] bg-[#111] text-white border border-blue-500 rounded-sm outline-none"
+          style={{ left: rename.x, top: rename.y + 3, width: rename.w }}
+          value={rename.value}
+          onChange={(e) => setRename({ ...rename, value: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { useDawStore.getState().renameClip(rename.clipId, rename.value.trim() || 'Clip'); setRename(null); }
+            else if (e.key === 'Escape') setRename(null);
+          }}
+          onBlur={() => { useDawStore.getState().renameClip(rename.clipId, rename.value.trim() || 'Clip'); setRename(null); }}
+        />
+      )}
     </div>
   );
 }
+
+function uniq(a: string[]): string[] { return [...new Set(a)]; }

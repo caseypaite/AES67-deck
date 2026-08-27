@@ -111,6 +111,12 @@ interface DawState {
   clearSelection: () => void;
   deleteSelected: () => void;
   sliceSelectedAtPlayhead: () => void;
+  splitClipAt: (clipId: string, time: number) => void;
+  renameClip: (id: string, name: string) => void;
+  setClipFade: (id: string, edge: 'in' | 'out', seconds: number) => void;
+  setClipGain: (id: string, gain: number) => void;
+  setDragOverTrack: (trackId: number | null) => void;
+  setMarquee: (m: { x0: number; y0: number; x1: number; y1: number } | null) => void;
   copySelected: () => void;
   pasteClipboard: () => void;
 
@@ -339,6 +345,59 @@ export const useDawStore = create<DawState>()(
         });
         scheduleSave();
       },
+
+      splitClipAt: (clipId, time) => {
+        set((state) => {
+          const clip = state.clips[clipId];
+          if (!clip || time <= clip.start + 0.01 || time >= clip.start + clip.length - 0.01) return state;
+          const len1 = time - clip.start;
+          const len2 = clip.start + clip.length - time;
+          const newId = uuid();
+          // A fade that spanned the cut goes to the piece that keeps that edge.
+          const nextClips = {
+            ...state.clips,
+            [clipId]: { ...clip, length: len1, fadeOut: Math.min(clip.fadeOut || 0, len1) },
+            [newId]: {
+              ...clip, id: newId, start: time, length: len2,
+              sourceOffset: (clip.sourceOffset || 0) + len1,
+              fadeIn: Math.min(clip.fadeIn || 0, len2),
+            },
+          };
+          return { clips: nextClips, selectedClipIds: [newId] };
+        });
+        scheduleSave();
+      },
+
+      renameClip: (id, name) => {
+        set((state) => {
+          const c = state.clips[id];
+          if (!c) return state;
+          return { clips: { ...state.clips, [id]: { ...c, name } } };
+        });
+        scheduleSave();
+      },
+
+      setClipFade: (id, edge, seconds) => {
+        set((state) => {
+          const c = state.clips[id];
+          if (!c) return state;
+          const v = Math.max(0, Math.min(c.length, seconds));
+          return { clips: { ...state.clips, [id]: { ...c, [edge === 'in' ? 'fadeIn' : 'fadeOut']: v } } };
+        });
+        scheduleSave();
+      },
+
+      setClipGain: (id, gain) => {
+        set((state) => {
+          const c = state.clips[id];
+          if (!c) return state;
+          return { clips: { ...state.clips, [id]: { ...c, gain: Math.max(0.001, Math.min(4, gain)) } } };
+        });
+        scheduleSave();
+      },
+
+      setDragOverTrack: (trackId) => set((s) => (s.dragOverTrackId === trackId ? s : { dragOverTrackId: trackId })),
+      setMarquee: (m) => set({ marquee: m }),
 
       copySelected: () =>
         set((state) => ({
