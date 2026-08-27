@@ -413,7 +413,7 @@ export const LiveConsoleView = () => {
         </div>
         
         <div className="flex gap-2 items-center">
-          {activeView === 'daw' && (
+          {activeView === 'daw' ? (
             <>
               <button
                 onClick={() => setSaveDialog('project')}
@@ -428,17 +428,19 @@ export const LiveConsoleView = () => {
                 onChange={e => { handleOpenProject(e.target.value); }}
                 className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-40 cursor-pointer shadow-sm"
               >
-                <option value="">{activeRecordingProject ? 'OPEN PROJECT…' : 'OPEN PROJECT…'}</option>
+                <option value="">OPEN PROJECT…</option>
                 {recordingProjects.map((p: string) => <option key={p} value={p}>{p}</option>)}
               </select>
-              <div className="w-px h-5 bg-gray-700" />
+            </>
+          ) : (
+            <>
+              <button onClick={() => setSaveDialog('scene')} className="px-3 py-1.5 bg-[#1a1c22] hover:bg-green-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]">SAVE SCENE</button>
+              <select onChange={e => { handleLoadScene(e.target.value); e.target.value = ''; }} className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-32 cursor-pointer shadow-sm">
+                 <option value="">LOAD SCENE...</option>
+                 {scenes.map((s: string) => <option key={s} value={s}>{s}</option>)}
+              </select>
             </>
           )}
-          <button onClick={() => setSaveDialog('scene')} className="px-3 py-1.5 bg-[#1a1c22] hover:bg-green-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]">SAVE SCENE</button>
-          <select onChange={e => { handleLoadScene(e.target.value); e.target.value = ''; }} className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-32 cursor-pointer shadow-sm">
-             <option value="">LOAD SCENE...</option>
-             {scenes.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
         </div>
 
         <div className="flex items-center gap-6 bg-[#050608] px-6 py-1.5 rounded border border-gray-800 shadow-inner">
