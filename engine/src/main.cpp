@@ -1244,12 +1244,14 @@ int main(int argc, char** argv) {
                 offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
             }
 
-            // ── Transport position (engine-owned clock; UI/server follow) ──
+            // ── Transport position (engine-owned clock; UI/server follow).
+            //    `buf` = the process block size, for the toolbar latency readout.
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
-                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"pbUnderrun\":%d}",
+                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d}",
                 static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
                 g_transport.state.load(std::memory_order_relaxed),
                 static_cast<int>(jack.get_sample_rate()),
+                static_cast<unsigned>(nframes),
                 player.take_underrun() ? 1 : 0);
 
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
