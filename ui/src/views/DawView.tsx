@@ -1,20 +1,22 @@
 import React, { useRef, useEffect } from 'react';
 import { useMixerStore } from '../stores/useMixerStore';
 import { useDawStore } from '../stores/useDawStore';
-import { uuid } from '../lib/uuid';
 
 export const DawView = () => {
   const allChannels = useMixerStore(state => state.channels);
   const setChannelValue = useMixerStore(state => state.setChannelValue);
   const transportState = useMixerStore(state => state.transportState);
-  
+
   const clips = useDawStore(state => Object.values(state.clips));
   const updateClip = useDawStore(state => state.updateClip);
   const playheadPosition = useDawStore(state => state.playheadPosition);
-  const setPlayheadPosition = useDawStore(state => state.setPlayheadPosition);
+  const locate = useDawStore(state => state.locate);
+  const tickPlayhead = useDawStore(state => state.tickPlayhead);
   const zoom = useDawStore(state => state.zoom);
   const setZoom = useDawStore(state => state.setZoom);
-  
+  const recordOriginSec = useDawStore(state => state.recordOriginSec);
+  const lastOverrun = useDawStore(state => state.lastOverrun);
+
   // Selection & Clipboard
   const selectedClipIds = useDawStore(state => state.selectedClipIds);
   const setSelectedClips = useDawStore(state => state.setSelectedClips);
@@ -35,54 +37,21 @@ export const DawView = () => {
   const tracks = Object.values(allChannels).filter(c => c.type === 'input').sort((a, b) => a.id - b.id);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // --- Transport / Playhead Animation ---
-  const lastTimeRef = useRef<number>(performance.now());
-  const recordStartTime = useDawStore(state => state.recordStartTime);
-  const setRecordStartTime = useDawStore(state => state.setRecordStartTime);
-  const addClip = useDawStore(state => state.addClip);
-
+  // --- Playhead: follow the engine transport clock ---
+  // The engine owns the clock and reports position on every metering frame
+  // (useDawStore.applyTransport). Here we just interpolate between frames for
+  // smooth 60 fps while it's rolling; when stopped the store snaps the
+  // playhead to the exact engine frame.
   useEffect(() => {
-    if (transportState === 'recording') {
-       if (recordStartTime === null) {
-          setRecordStartTime(useDawStore.getState().playheadPosition);
-       }
-    } else if (transportState === 'stopped') {
-       if (recordStartTime !== null) {
-          const endTime = useDawStore.getState().playheadPosition;
-          if (endTime > recordStartTime) {
-             const length = endTime - recordStartTime;
-             const armedTracks = Object.values(useMixerStore.getState().channels).filter(c => c.type === 'input' && c.arm);
-             armedTracks.forEach(t => {
-                addClip({
-                  id: uuid(),
-                  trackId: t.id,
-                  start: recordStartTime,
-                  length: length,
-                  color: 'bg-red-600',
-                  name: `Take ${Math.floor(Math.random() * 100)}`
-                });
-             });
-          }
-          setRecordStartTime(null);
-       }
-    }
-  }, [transportState, recordStartTime, setRecordStartTime, addClip]);
-  
-  useEffect(() => {
+    if (transportState === 'stopped') return;
     let rafId: number;
-    if (transportState === 'playing' || transportState === 'recording') {
-      lastTimeRef.current = performance.now();
-      const loop = () => {
-        const now = performance.now();
-        const delta = (now - lastTimeRef.current) / 1000.0;
-        lastTimeRef.current = now;
-        setPlayheadPosition(useDawStore.getState().playheadPosition + delta);
-        rafId = requestAnimationFrame(loop);
-      };
+    const loop = () => {
+      tickPlayhead();
       rafId = requestAnimationFrame(loop);
-    }
+    };
+    rafId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafId);
-  }, [transportState, setPlayheadPosition]);
+  }, [transportState, tickPlayhead]);
 
   const formatTime = (secs: number) => {
     const hh = Math.floor(secs / 3600).toString().padStart(2, '0');
@@ -143,12 +112,8 @@ export const DawView = () => {
     const updateScrub = (ev: { clientX: number }) => {
       const clickX = ev.clientX - rect.left + scrollLeft;
       const newSec = Math.max(0, clickX / zoom);
-
-      // If snapping is on, maybe we want to snap playhead too? Optional.
-      // Let's snap playhead if shift is NOT held, to match standard DAW behavior?
-      // Actually, playhead scrubbing usually doesn't snap unless explicitly moving it on grid.
-      // We'll snap playhead during scrub.
-      setPlayheadPosition(snap(newSec));
+      // locate() moves the local playhead and tells the engine where to park.
+      locate(snap(newSec));
     };
 
     const up = () => {
@@ -246,10 +211,10 @@ export const DawView = () => {
         >
           <div className="w-[100000px] flex flex-col pt-1 pb-20 relative">
             
-            {/* Playhead Line */}
-            <div 
-              className="absolute top-0 bottom-0 w-px bg-white z-30 shadow-[0_0_4px_rgba(255,255,255,0.8)] pointer-events-none"
-              style={{ left: playheadPosition * zoom }}
+            {/* Playhead Line — transform (compositor only), not layout */}
+            <div
+              className="absolute top-0 bottom-0 left-0 w-px bg-white z-30 shadow-[0_0_4px_rgba(255,255,255,0.8)] pointer-events-none will-change-transform"
+              style={{ transform: `translateX(${playheadPosition * zoom}px)` }}
             >
                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[8px] border-t-white" />
             </div>
@@ -258,18 +223,19 @@ export const DawView = () => {
             {tracks.map(track => {
               const trackClips = clips.filter(c => c.trackId === track.id);
               const isRecording = transportState === 'recording' && track.arm;
+              const recFrom = recordOriginSec ?? playheadPosition;
               const h = trackHeights[track.id] || 96;
               
               return (
                 <div key={track.id} className="border-b border-[#222]/50 relative group bg-[#1c1e24]/40 hover:bg-[#1c1e24]/80 transition-colors" style={{ height: h }}>
                   <div className="absolute inset-0 pointer-events-none opacity-20" style={{ backgroundImage: `repeating-linear-gradient(to right, transparent, transparent ${zoom * gridSize * 10 - 1}px, #fff ${zoom * gridSize * 10 - 1}px, #fff ${zoom * gridSize * 10}px)` }} />
                   
-                  {isRecording && recordStartTime !== null && playheadPosition > recordStartTime && (
-                    <div 
+                  {isRecording && playheadPosition > recFrom && (
+                    <div
                       className="absolute top-2 bottom-2 rounded border border-red-400 bg-red-600/40 z-20 pointer-events-none overflow-hidden"
-                      style={{ 
-                        left: recordStartTime * zoom,
-                        width: (playheadPosition - recordStartTime) * zoom
+                      style={{
+                        left: recFrom * zoom,
+                        width: (playheadPosition - recFrom) * zoom
                       }}
                     >
                       <div className="absolute inset-0 bg-[linear-gradient(45deg,transparent_25%,rgba(255,255,255,0.1)_50%,transparent_75%)] bg-[length:20px_20px] animate-[slide_1s_linear_infinite]" />
@@ -402,6 +368,12 @@ export const DawView = () => {
           </div>
         </div>
       </div>
+
+      {lastOverrun && (
+        <div className="absolute bottom-6 left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400">
+          ⚠ Last take dropped audio — disk could not keep up
+        </div>
+      )}
 
       {/* Utilities / Zoom Controls */}
       <div className="absolute bottom-6 right-8 flex items-center bg-[#111] rounded-lg shadow-xl border border-[#333] p-1 z-40 gap-1">

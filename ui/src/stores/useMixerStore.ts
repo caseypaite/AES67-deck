@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 import { usePatchbayStore } from './usePatchbayStore';
+import { useDawStore } from './useDawStore';
 import { calfDefaultParams } from '../data/calfPlugins';
 import { uuid } from '../lib/uuid';
+import { setWs } from '../lib/wsBus';
 
 export interface PluginNode {
   id: string;
@@ -447,19 +449,37 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   },
 
   toggleTransport: (action) => {
-    const currentState = get().transportState;
-    let nextState = currentState;
-    const ws = get().ws;
+    const s = get();
+    const ws = s.ws;
+    const send = (m: unknown) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); };
+    const cur = s.transportState;
 
-    if (action === 'play') nextState = currentState === 'playing' ? 'stopped' : 'playing';
-    if (action === 'stop') nextState = 'stopped';
-    if (action === 'record') {
-        nextState = currentState === 'recording' ? 'stopped' : 'recording';
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: nextState === 'recording' ? 'start_record' : 'stop_record' }));
+    // The engine owns the transport clock and reports the authoritative state
+    // back on every metering frame (see the `metering` handler). We set an
+    // optimistic transportState here so the buttons feel instant; the engine
+    // frame corrects it within ~10 ms.
+    if (action === 'play') {
+      if (cur === 'playing') { send({ type: 'transport_stop' }); set({ transportState: 'stopped' }); }
+      else { send({ type: 'transport_play' }); set({ transportState: 'playing' }); }
+    } else if (action === 'stop') {
+      send({ type: 'transport_stop' });
+      set({ transportState: 'stopped' });
+    } else if (action === 'record') {
+      if (cur === 'recording') {
+        send({ type: 'stop_multitrack_record' });
+        set({ transportState: 'playing' }); // engine keeps rolling after a take
+      } else {
+        const armed = Object.values(s.channels)
+          .filter((c) => c.type === 'input' && c.arm)
+          .map((c) => c.id);
+        if (armed.length === 0) {
+          console.warn('record: no armed tracks — arm a track in the Timeline first');
+          return;
         }
+        send({ type: 'start_multitrack_record', armed });
+        set({ transportState: 'recording' });
+      }
     }
-    set({ transportState: nextState });
   },
 
   connectWebSocket: () => {
@@ -473,6 +493,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       `ws://${typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : 'localhost'}:8081`;
     const ws = new WebSocket(wsUrl);
     set({ ws });
+    setWs(ws);
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -680,9 +701,25 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           set({ fxMeter: data.fx ?? null });
           if (data.lufs) set({ lufs: data.lufs });
           if (data.master) set({ masterAnalysis: data.master });
+          if (data.transport) {
+            const t = data.transport;
+            // Engine transport is authoritative for both position and state.
+            useDawStore.getState().applyTransport(t.frame, t.state, t.sr);
+            const st = t.state === 2 ? 'recording' : t.state === 1 ? 'playing' : 'stopped';
+            if (get().transportState !== st) set({ transportState: st });
+          }
         } else if (data.type === 'aes67_discovery') {
           const { upsertStream } = usePatchbayStore.getState();
           upsertStream(data.name, data.address);
+        } else if (data.type === 'project_data') {
+          useDawStore.getState().loadProjectData(data.name, data.project);
+        } else if (data.type === 'projects_list') {
+          useDawStore.getState().setProjectList(data.projects || [], data.active);
+        } else if (data.type === 'take_committed') {
+          useDawStore.getState().addCommittedClips(data.clips || [], !!data.overrun);
+        } else if (data.type === 'take_failed') {
+          console.warn('multitrack take failed:', data.reason || 'unknown');
+          set({ transportState: 'stopped' });
         }
       } catch (e) {
         // Malformed or partial WebSocket frame — drop it, matching the
@@ -691,6 +728,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     };
     ws.onclose = () => {
       set({ ws: null });
+      setWs(null);
       setTimeout(() => get().connectWebSocket(), 1000);
     };
   }

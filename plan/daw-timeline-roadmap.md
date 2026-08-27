@@ -50,15 +50,15 @@ mixing over AES67.
 
 ---
 
-## Decisions needed before Phase 1
+## Decisions
 
-| # | Question | Recommendation |
+| # | Question | Decision |
 |---|---|---|
-| D1 | Record **tap point** per channel: pre-insert (raw input), post-insert/pre-fader (channel-processed, clean level), or post-fader | **Post-insert, pre-fader.** Matches virtual-soundcheck expectation (channel EQ/dynamics captured, mix moves not baked in). Make it a global switch, default pre-insert for a pure archive. |
-| D2 | File layout: one interleaved N-ch WAV, or N mono WAVs in a take folder | **N mono WAVs** in `takes/<timestamp>/ch<NN>.wav`. Simpler partial-arm handling, standard for stem interchange, lets the playback voice mmap one file per track. |
-| D3 | Timeline time base | Keep **seconds/timecode primary**; add an optional bars+beats grid (Phase 5) but do not block on it. |
-| D4 | Project model: extend `scenes/` or a separate project file | **Separate `projects/<name>.json`** (clips, markers, track layout, take index). A scene is a mixer snapshot you recall live; a project is the arrangement. Scene recall inside a project should not wipe the timeline. |
-| D5 | Sample rate / format on disk | Follow JACK SR (`jack.get_sample_rate()`), 32-bit float WAV (matches current `DiskWriter` `SF_FORMAT_FLOAT`). Offer 24-bit on export only. |
+| D1 | Record **tap point** per channel | **Pre-insert (raw input)** — tap the JACK input buffers before the insert chain (`main.cpp:656-664`). Pure archive; playback re-processes through the live channel. A global post-insert switch can be added later if a soundcheck workflow needs the captured channel tone. |
+| D2 | File layout | **N mono float WAVs** per take: `projects/<name>/takes/<timestamp>/ch<NN>.wav` + `take.json` (project-frame origin, SR, armed mask). Simpler partial-arm handling, standard stem interchange, one file per playback voice. |
+| D3 | Timeline time base | **Seconds/timecode primary**; optional bars+beats grid deferred to Phase 5. |
+| D4 | Project model | **Separate `projects/<name>/` dir** (`project.json` = clips, markers, track layout, take index; `takes/` alongside). A scene is a live mixer snapshot; a project is the arrangement. Scene recall must not wipe the timeline. |
+| D5 | Disk format | Follow JACK SR (`jack.get_sample_rate()`), 32-bit float WAV (matches current `DiskWriter` `SF_FORMAT_FLOAT`). 24-bit on export only. |
 
 ---
 
