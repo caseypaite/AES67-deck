@@ -62,10 +62,11 @@ function readWav(path: string): WavData | null {
 }
 
 export interface PeaksFile {
-  version: 1;
+  version: 2;
   sampleRate: number;
   frames: number;
-  tiers: Record<string, number[]>; // tier -> [min,max,min,max,...] mono
+  tiers: Record<string, number[]>;     // tier -> [min,max,min,max,...] mono
+  rmsTiers: Record<string, number[]>;  // tier -> [rms,rms,...] mono, one per bucket
 }
 
 export function computePeaks(wavPath: string): PeaksFile | null {
@@ -74,11 +75,13 @@ export function computePeaks(wavPath: string): PeaksFile | null {
   const { channels, frames, samples } = w;
 
   const tiers: Record<string, number[]> = {};
+  const rmsTiers: Record<string, number[]> = {};
   for (const tier of PEAK_TIERS) {
     const buckets = Math.ceil(frames / tier);
     const out = new Array(buckets * 2);
+    const rms = new Array(buckets);
     for (let bkt = 0; bkt < buckets; bkt++) {
-      let mn = Infinity, mx = -Infinity;
+      let mn = Infinity, mx = -Infinity, sumSq = 0;
       const f0 = bkt * tier;
       const f1 = Math.min(frames, f0 + tier);
       for (let f = f0; f < f1; f++) {
@@ -88,14 +91,18 @@ export function computePeaks(wavPath: string): PeaksFile | null {
         v /= channels;
         if (v < mn) mn = v;
         if (v > mx) mx = v;
+        sumSq += v * v;
       }
       if (!isFinite(mn)) { mn = 0; mx = 0; }
+      const n = Math.max(1, f1 - f0);
       out[bkt * 2] = Math.round(mn * 1000) / 1000;
       out[bkt * 2 + 1] = Math.round(mx * 1000) / 1000;
+      rms[bkt] = Math.round(Math.sqrt(sumSq / n) * 1000) / 1000;
     }
     tiers[String(tier)] = out;
+    rmsTiers[String(tier)] = rms;
   }
-  return { version: 1, sampleRate: w.sampleRate, frames, tiers };
+  return { version: 2, sampleRate: w.sampleRate, frames, tiers, rmsTiers };
 }
 
 // Compute peaks for wavPath and cache next to it as <name>.peaks.json.
@@ -104,7 +111,9 @@ export function ensurePeaks(wavPath: string): PeaksFile | null {
   const cachePath = wavPath.replace(/\.wav$/i, '') + '.peaks.json';
   try {
     if (fs.existsSync(cachePath) && fs.statSync(cachePath).mtimeMs >= fs.statSync(wavPath).mtimeMs) {
-      return JSON.parse(fs.readFileSync(cachePath, 'utf8')) as PeaksFile;
+      const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8')) as PeaksFile;
+      if (cached.version === 2) return cached;
+      // fall through to recompute stale (v1) caches
     }
   } catch { /* recompute */ }
   const peaks = computePeaks(wavPath);

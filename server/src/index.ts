@@ -773,12 +773,16 @@ function pushTimelineToEngine(name: string, project?: DawProject, extraClips: an
     const length = Number(c.length) || 0;
     const sourceOffset = Number(c.sourceOffset) || 0;
     if (length <= 0) continue;
+    const fadeIn = Math.max(0, Math.min(length, Number(c.fadeIn) || 0));
+    const fadeOut = Math.max(0, Math.min(length, Number(c.fadeOut) || 0));
     specs.push({
       trackId: Number(c.trackId),
       timelineStart: Math.round(start * sr),
       length: Math.round(length * sr),
       fileStart: Math.round(sourceOffset * sr),
       gain: typeof c.gain === 'number' ? c.gain : 1.0,
+      fadeIn: Math.round(fadeIn * sr),
+      fadeOut: Math.round(fadeOut * sr),
       path: path.resolve(dir, 'takes', String(c.takeDir), String(c.file)),
     });
   }
