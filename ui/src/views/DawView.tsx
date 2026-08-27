@@ -1,5 +1,4 @@
 import { useEffect } from 'react';
-import { useMixerStore } from '../stores/useMixerStore';
 import { useDawStore } from '../stores/useDawStore';
 import { ArrangeSurface } from '../daw/ArrangeSurface';
 import { TrackPanel } from '../daw/TrackPanel';
@@ -7,13 +6,12 @@ import { TrackPanel } from '../daw/TrackPanel';
 const PANEL_W = 208;
 
 export const DawView = () => {
-  const transportState = useMixerStore((s) => s.transportState);
-  const playheadPosition = useDawStore((s) => s.playheadPosition);
-  const tickPlayhead = useDawStore((s) => s.tickPlayhead);
   const zoom = useDawStore((s) => s.zoom);
   const setZoom = useDawStore((s) => s.setZoom);
   const snapToGrid = useDawStore((s) => s.snapToGrid);
   const setSnapToGrid = useDawStore((s) => s.setSnapToGrid);
+  const fps = useDawStore((s) => s.fps);
+  const setFps = useDawStore((s) => s.setFps);
   const lastOverrun = useDawStore((s) => s.lastOverrun);
   const playbackUnderrun = useDawStore((s) => s.playbackUnderrun);
 
@@ -22,24 +20,9 @@ export const DawView = () => {
   const pasteClipboard = useDawStore((s) => s.pasteClipboard);
   const sliceSelectedAtPlayhead = useDawStore((s) => s.sliceSelectedAtPlayhead);
 
-  // Playhead: interpolate the engine clock between metering frames.
-  useEffect(() => {
-    if (transportState === 'stopped') return;
-    let raf: number;
-    const loop = () => { tickPlayhead(); raf = requestAnimationFrame(loop); };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, [transportState, tickPlayhead]);
-
-  // Toolbar timecode (SMPTE-ish 30 fps).
-  useEffect(() => {
-    const s = Math.max(0, playheadPosition);
-    const hh = Math.floor(s / 3600).toString().padStart(2, '0');
-    const mm = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
-    const ss = Math.floor(s % 60).toString().padStart(2, '0');
-    const ff = Math.floor((s % 1) * 30).toString().padStart(2, '0');
-    useMixerStore.setState({ timecode: `${hh}:${mm}:${ss}:${ff}` });
-  }, [playheadPosition]);
+  // The playhead clock and toolbar timecode are driven by the engine transport
+  // (useDawStore.applyTransport / tickPlayhead) and painted by the ArrangeSurface
+  // rAF loop — no React render loop here.
 
   // Keyboard shortcuts (the surface owns pointer input).
   useEffect(() => {
@@ -73,6 +56,13 @@ export const DawView = () => {
           className={`px-3 py-1 text-xs font-bold rounded transition-colors ${snapToGrid ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
         >
           SNAP
+        </button>
+        <button
+          onClick={() => setFps(fps === 30 ? 25 : 30)}
+          className="px-2 py-1 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white"
+          title="Timecode frame rate"
+        >
+          {fps} fps
         </button>
         <div className="w-px h-6 bg-[#333] mx-1" />
         <button className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom / 1.3)}>−</button>

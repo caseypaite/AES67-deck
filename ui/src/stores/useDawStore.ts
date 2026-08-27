@@ -91,6 +91,7 @@ interface DawState {
   setRecordStartTime: (time: number | null) => void;
   setSnapToGrid: (snap: boolean) => void;
   setGridSize: (size: number) => void;
+  setFps: (fps: number) => void;
 
   applyTransport: (frame: number, state: number, sr: number) => void;
   flagPlaybackUnderrun: () => void;
@@ -134,6 +135,15 @@ interface DawState {
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let applyingRemote = false;
 const requestedPeaks = new Set<string>(); // clipPeakKeys with a get_clip_peaks in flight
+
+export function formatTimecode(sec: number, fps: number): string {
+  const s = Math.max(0, sec);
+  const hh = Math.floor(s / 3600).toString().padStart(2, '0');
+  const mm = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+  const ss = Math.floor(s % 60).toString().padStart(2, '0');
+  const ff = Math.floor((s % 1) * fps).toString().padStart(2, '0');
+  return `${hh}:${mm}:${ss}:${ff}`;
+}
 
 function serializeProject(s: DawState) {
   return {
@@ -218,7 +228,10 @@ export const useDawStore = create<DawState>()(
 
       locate: (sec) => {
         const s = Math.max(0, sec);
-        set({ playheadPosition: s, _engineSec: s, _engineWall: performance.now(), playbackUnderrun: false });
+        set({
+          playheadPosition: s, _engineSec: s, _engineWall: performance.now(),
+          playbackUnderrun: false, timecode: formatTimecode(s, get().fps),
+        });
         wsSend({ type: 'transport_locate', frame: Math.round(s * get().sampleRate) });
       },
 
@@ -226,12 +239,15 @@ export const useDawStore = create<DawState>()(
         const s = get();
         if (s.engineState === 0) return;
         const next = s._engineSec + (performance.now() - s._engineWall) / 1000;
-        if (Math.abs(next - s.playheadPosition) > 0.0005) set({ playheadPosition: next });
+        if (Math.abs(next - s.playheadPosition) > 0.0005) {
+          set({ playheadPosition: next, timecode: formatTimecode(next, s.fps) });
+        }
       },
 
       setRecordStartTime: (time) => set({ recordStartTime: time }),
       setSnapToGrid: (snap) => set({ snapToGrid: snap }),
       setGridSize: (size) => set({ gridSize: size }),
+      setFps: (fps) => set({ fps, timecode: formatTimecode(get().playheadPosition, fps) }),
 
       applyTransport: (frame, state, sr) => {
         const s = get();
@@ -249,7 +265,7 @@ export const useDawStore = create<DawState>()(
           _engineSec: sec,
           _engineWall: performance.now(),
           // When stopped, snap exactly; while rolling, tickPlayhead interpolates.
-          ...(st === 0 ? { playheadPosition: sec } : {}),
+          ...(st === 0 ? { playheadPosition: sec, timecode: formatTimecode(sec, s.fps) } : {}),
         });
       },
 
@@ -472,6 +488,7 @@ export const useDawStore = create<DawState>()(
         zoom: s.zoom,
         snapToGrid: s.snapToGrid,
         gridSize: s.gridSize,
+        fps: s.fps,
       }),
     }
   )

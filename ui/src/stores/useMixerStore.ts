@@ -48,7 +48,6 @@ interface MixerState {
   channels: Record<number, Channel>;
   activeView: 'mixer' | 'daw' | 'patchbay';
   transportState: 'playing' | 'recording' | 'stopped';
-  timecode: string;
   ws: WebSocket | null;
   selectedChannelId: number | null;
 
@@ -241,7 +240,6 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   channels: buildChannels(),
   activeView: 'mixer',
   transportState: 'stopped',
-  timecode: '00:00:00:00',
   ws: null,
   selectedChannelId: null,
   

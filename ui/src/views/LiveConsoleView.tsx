@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { ChannelStrip } from '../components/mixer/ChannelStrip';
 import { FxRackCard } from '../components/plugins/FxRackCard';
 import { useMixerStore, positionToDb } from '../stores/useMixerStore';
+import { useDawStore } from '../stores/useDawStore';
 import { DawView } from './DawView';
 import { PatchbayView } from '../components/patchbay/PatchbayView';
 import { Screw } from '../components/analog/Screw';
@@ -284,7 +285,7 @@ const FxPanelRow = ({
 export const LiveConsoleView = () => {
   const connectWebSocket = useMixerStore(state => state.connectWebSocket);
   const transportState = useMixerStore(state => state.transportState);
-  const timecode = useMixerStore(state => state.timecode);
+  const timecode = useDawStore(state => state.timecode);
   const toggleTransport = useMixerStore(state => state.toggleTransport);
   const activeView = useMixerStore(state => state.activeView);
   const setActiveView = useMixerStore(state => state.setActiveView);
