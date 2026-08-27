@@ -17,6 +17,7 @@
 #include "ipc/json.hpp"
 #include "recorder/DiskWriter.h"
 #include "recorder/MultitrackRecorder.h"
+#include "playback/TimelinePlayer.h"
 
 using namespace aes67_deck;
 
@@ -329,6 +330,10 @@ int main(int argc, char** argv) {
     lufs_init(sr);
     master_analyser_init(sr);
 
+    // Disk-streaming timeline playback (plan Phase 2a). Reader thread + a
+    // per-track ring; the audio thread pulls via player.render().
+    playback::TimelinePlayer player(static_cast<int>(sr));
+
     // Full system LV2 plugin catalog for the Rack Manager's plugin browser
     // — the UI groups these into "Live" (reportsLatency false) and
     // "Studio" (true) sections. Static port-metadata scan only, no
@@ -445,8 +450,29 @@ int main(int argc, char** argv) {
     // take files here (never on the audio thread) and flips the transport
     // atomics the audio callback reads. take_started / take_finished replies
     // ride the same IPC tx path as metering.
-    ipc.set_transport_callback([&mtr, &jack, &ipc](const nlohmann::json& j) {
+    ipc.set_transport_callback([&mtr, &jack, &ipc, &player](const nlohmann::json& j) {
         const std::string type = j.value("type", "");
+
+        if (type == "set_timeline") {
+            std::vector<playback::ClipSpec> clips;
+            if (j.contains("clips") && j["clips"].is_array()) {
+                for (const auto& cj : j["clips"]) {
+                    playback::ClipSpec c;
+                    c.trackId = cj.value("trackId", 0);
+                    c.timelineStart = cj.value("timelineStart", (uint64_t)0);
+                    c.length = cj.value("length", (uint64_t)0);
+                    c.fileStart = cj.value("fileStart", (uint64_t)0);
+                    c.gain = cj.value("gain", 1.0f);
+                    c.path = cj.value("path", "");
+                    if (c.trackId >= 1 && c.trackId <= playback::TimelinePlayer::MAX_CH &&
+                        c.length > 0 && !c.path.empty()) {
+                        clips.push_back(std::move(c));
+                    }
+                }
+            }
+            player.set_schedule(std::move(clips));
+            return;
+        }
 
         if (type == "transport_play") {
             // Don't clobber an in-progress recording (state 2).
@@ -638,6 +664,7 @@ int main(int argc, char** argv) {
         }
         const uint64_t block_start_frame = g_transport.frame.load(std::memory_order_relaxed);
         const int transport_state = g_transport.state.load(std::memory_order_relaxed);
+        player.set_transport(block_start_frame, transport_state);
 
         // Apply any queued plugin-chain mutations before processing any
         // channel this cycle — insert_chain is only ever touched here, on
@@ -775,6 +802,15 @@ int main(int argc, char** argv) {
             // 1. Copy Stereo input to temporary buffers
             std::memcpy(tmp_L.data(), in_buf_L, sizeof(float) * nframes);
             std::memcpy(tmp_R.data(), in_buf_R, sizeof(float) * nframes);
+
+            // Timeline playback (plan Phase 2a): while the transport is
+            // *playing* (not recording), the timeline is the channel source —
+            // render() overwrites tmp_L/tmp_R with this track's clip audio
+            // (silence in gaps). Everything downstream — inserts, fader, pan,
+            // sends, metering, routing — then applies unchanged.
+            if (transport_state == 1) {
+                player.render(i, tmp_L.data(), tmp_R.data(), nframes);
+            }
 
             // 2. Process LV2 Insert Chain
             int p_i = 0;
@@ -1184,10 +1220,11 @@ int main(int argc, char** argv) {
 
             // ── Transport position (engine-owned clock; UI/server follow) ──
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
-                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d}",
+                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"pbUnderrun\":%d}",
                 static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
                 g_transport.state.load(std::memory_order_relaxed),
-                static_cast<int>(jack.get_sample_rate()));
+                static_cast<int>(jack.get_sample_rate()),
+                player.take_underrun() ? 1 : 0);
 
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 

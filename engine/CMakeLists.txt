@@ -31,6 +31,7 @@ add_executable(aes67_deck_engine
     src/ipc/IpcClient.cpp
     src/recorder/DiskWriter.cpp
     src/recorder/MultitrackRecorder.cpp
+    src/playback/TimelinePlayer.cpp
 )
 
 target_link_libraries(aes67_deck_engine
