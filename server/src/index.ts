@@ -1586,14 +1586,54 @@ function mergePatchbayMappings(incoming: any): Record<string, any> {
   return merged;
 }
 
-// The Monitor bus's fixed destination — "the system's audio out device" for
-// the operator to hear locally. Not user-editable (Monitor never appears in
+// The Monitor bus's destination — "the system's audio out device" so the
+// operator hears the mix locally. Not user-editable (Monitor never appears in
 // output_routing.json); Master and the Aux buses have no forced default of
 // their own and are freely mapped to any destination via Output Endpoints.
-// ck-aes67: the on-board Intel PCH analog stereo out (00:1b.0). There is no
-// pro-audio / HDMI sink on this box.
-const HARDWARE_OUT_L = 'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FL';
-const HARDWARE_OUT_R = 'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FR';
+//
+// Resolved from the live graph at routing time rather than hardcoded, so
+// `run-dev` on a dev workstation lands on that machine's real output and the
+// appliance lands on its on-board card — without a per-host build.
+// `DECK_MONITOR_PORTS="node:portL,node:portR"` pins it explicitly.
+const MONITOR_FALLBACK_PORTS: [string, string] = [
+  'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FL', // ck-aes67 on-board PCH
+  'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FR',
+];
+
+// A usable local monitor sink is a real ALSA output — not an AES67 network /
+// virtual bridge node, where Monitor audio would be transmitted on the wire or
+// looped straight back into the deck's own input.
+function isLocalHardwareSink(node: string): boolean {
+  return node.startsWith('alsa_output.') && !/aes67|ravenna/i.test(node);
+}
+
+async function resolveMonitorOutputPorts(): Promise<[string, string]> {
+  const pins = (process.env.DECK_MONITOR_PORTS || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  if (pins.length >= 2) return [pins[0], pins[1]];
+  if (pins.length === 1) return [pins[0], pins[0]];
+
+  const inPorts = (await runCmd('pw-link', ['-i']))
+    .split('\n').map((l) => l.trim()).filter(Boolean);
+  const portsOf = (node: string) => inPorts.filter((p) => p.startsWith(node + ':')).sort();
+
+  const candidates: string[] = [];
+  const def = (await runCmd('pactl', ['get-default-sink'])).trim();
+  if (def && isLocalHardwareSink(def)) candidates.push(def);
+  for (const p of inPorts) {
+    const node = p.slice(0, p.lastIndexOf(':'));
+    if (isLocalHardwareSink(node) && !candidates.includes(node)) candidates.push(node);
+  }
+
+  for (const node of candidates) {
+    const ps = portsOf(node);
+    if (ps.length >= 2) return [ps[0], ps[1]];
+    if (ps.length === 1) return [ps[0], ps[0]];
+  }
+
+  console.warn('resolveMonitorOutputPorts: no local hardware sink in the graph — using fallback');
+  return MONITOR_FALLBACK_PORTS;
+}
 
 // A bus's output-endpoint assignment: the destination ports plus whether
 // they carry an identical mono downmix rather than a distinct L/R pair.
@@ -1825,11 +1865,12 @@ async function applyOutputRouting(routing: Record<string, OutputEndpoint>) {
 // Monitor's destination is fixed, not user-editable: it always goes to the
 // system's local audio out device so the operator can hear the mix.
 async function applyMonitorRouting() {
+  const [L, R] = await resolveMonitorOutputPorts();
   await disconnectAllOutputsOf('AES67_Deck:monitor_L');
   await disconnectAllOutputsOf('AES67_Deck:monitor_R');
-  await pwLink(['AES67_Deck:monitor_L', HARDWARE_OUT_L]);
-  await pwLink(['AES67_Deck:monitor_R', HARDWARE_OUT_R]);
-  console.log('Monitor routing applied successfully');
+  await pwLink(['AES67_Deck:monitor_L', L]);
+  await pwLink(['AES67_Deck:monitor_R', R]);
+  console.log(`Monitor routing applied → ${L} / ${R}`);
 }
 
 // Phase 2: pin each engine mix-product output port to its fixed AES67_Sink
