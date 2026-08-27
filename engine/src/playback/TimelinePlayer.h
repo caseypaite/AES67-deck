@@ -21,6 +21,8 @@ struct ClipSpec {
     uint64_t length = 0;        // clip length
     uint64_t fileStart = 0;     // offset into the source file the clip begins at
     float gain = 1.0f;          // linear
+    uint64_t fadeIn = 0;        // linear fade-in ramp length, frames
+    uint64_t fadeOut = 0;       // linear fade-out ramp length, frames
     std::string path;
 };
 

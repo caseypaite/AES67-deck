@@ -127,8 +127,22 @@ void TimelinePlayer::produce_track(int track_id, uint64_t pos, uint32_t n, float
         if (got < take) {
             std::memset(dst + (produced + got) * 2, 0, sizeof(float) * 2 * (take - got));
         }
-        if (cur->gain != 1.0f) {
-            for (uint32_t i = 0; i < take * 2; ++i) dst[produced * 2 + i] *= cur->gain;
+
+        // Per-frame envelope: constant clip gain × linear fade-in/out ramps.
+        const uint64_t clip_off = here - cur->timelineStart;   // frames into the clip
+        const bool has_fade = cur->fadeIn > 0 || cur->fadeOut > 0;
+        if (cur->gain != 1.0f || has_fade) {
+            for (uint32_t f = 0; f < take; ++f) {
+                float e = cur->gain;
+                const uint64_t p = clip_off + f;
+                if (cur->fadeIn > 0 && p < cur->fadeIn)
+                    e *= static_cast<float>(p) / static_cast<float>(cur->fadeIn);
+                if (cur->fadeOut > 0 && cur->length > p &&
+                    cur->length - p <= cur->fadeOut)
+                    e *= static_cast<float>(cur->length - p) / static_cast<float>(cur->fadeOut);
+                dst[(produced + f) * 2] *= e;
+                dst[(produced + f) * 2 + 1] *= e;
+            }
         }
         produced += take;
     }

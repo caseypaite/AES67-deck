@@ -463,6 +463,8 @@ int main(int argc, char** argv) {
                     c.length = cj.value("length", (uint64_t)0);
                     c.fileStart = cj.value("fileStart", (uint64_t)0);
                     c.gain = cj.value("gain", 1.0f);
+                    c.fadeIn = cj.value("fadeIn", (uint64_t)0);
+                    c.fadeOut = cj.value("fadeOut", (uint64_t)0);
                     c.path = cj.value("path", "");
                     if (c.trackId >= 1 && c.trackId <= playback::TimelinePlayer::MAX_CH &&
                         c.length > 0 && !c.path.empty()) {
