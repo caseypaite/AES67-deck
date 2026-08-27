@@ -612,6 +612,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             state.setDiscoveredDestinations(data.destinations || []);
             state.setDaemonReachable(!!data.daemonReachable);
           });
+        } else if (data.type === 'daemon_state') {
+          import('./usePatchbayStore').then(({ usePatchbayStore }) => {
+            usePatchbayStore.getState().setDaemonState(data);
+          });
         } else if (data.type === 'talkback_config_loaded') {
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
              usePatchbayStore.setState({

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { usePatchbayStore, Aes67Stream, ChannelMapping, MicDevice } from '../../stores/usePatchbayStore';
 import { useMixerStore, MONITOR_ID } from '../../stores/useMixerStore';
+import { NetworkPanel } from './NetworkPanel';
 
 const MIC_KIND_LABEL: Record<MicDevice['kind'], string> = {
   builtin: 'Built-in',
@@ -453,6 +454,10 @@ export const PatchbayView = () => {
           APPLY ROUTING
         </button>
       </div>
+
+      {/* Unified aes67-linux-daemon control (PTP, receive Sinks, transmit
+          Sources) — no engine involvement, WSS/store wiring only. */}
+      <NetworkPanel />
 
       {/* REGISTRIES: destinations and streams share one panel/row — streams
           on the left, destinations on the right. */}

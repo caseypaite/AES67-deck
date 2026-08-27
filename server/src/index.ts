@@ -195,6 +195,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'output_routing_loaded', outputs: getOutputRouting() }));
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
+  ws.send(JSON.stringify({ type: 'daemon_state', ...lastDaemonState }));
   ws.send(JSON.stringify({ type: 'mic_devices_loaded', devices: lastMicDevices }));
   if (lastPluginCatalog.length > 0) {
     ws.send(JSON.stringify({ type: 'plugin_list_loaded', plugins: lastPluginCatalog }));
@@ -320,6 +321,112 @@ wss.on('connection', (ws) => {
         connectedWsClients.forEach(c => {
           if (c.readyState === WebSocket.OPEN) c.send(loadedMsg);
         });
+      } else if (data.type === 'daemon_create_sink') {
+        // Receive an AES67 stream: create a daemon Sink from a discovered
+        // remote's SDP (or a pasted one). map is the AES67_Source ALSA capture
+        // channels it lands on — [0,1] in Phase 1 (the bridge is 2ch); Phase 2
+        // widens it and allocates a block per sink.
+        (async () => {
+          const sinkId = lowestFreeDaemonId(lastDaemonState.sinks);
+          if (sinkId < 0) { console.error('daemon_create_sink: no free sink id'); return; }
+          const map = Array.isArray(data.map) && data.map.length > 0
+            ? data.map.map((n: any) => Number(n)) : [0, 1];
+          // ignore_refclk_gmid defaults true: the daemon's SDP parser rejects
+          // (400 "cannot parse SDP") any stream whose a=ts-refclk gmid doesn't
+          // match the daemon's current PTP grandmaster — which is every stream
+          // whenever we're not yet locked to the same GM. The existing
+          // appliance sink is configured the same way.
+          const body = {
+            name: String(data.name || `Deck Sink ${sinkId}`),
+            io: 'Audio Device',
+            use_sdp: true,
+            source: typeof data.source === 'string' ? data.source : '',
+            sdp: typeof data.sdp === 'string' ? data.sdp : '',
+            delay: typeof data.delay === 'number' ? data.delay : 384,
+            ignore_refclk_gmid: data.ignore_refclk_gmid !== false,
+            map
+          };
+          const res = await daemonRequest('PUT', `/api/sink/${sinkId}`, body);
+          if (!res.ok) console.error(`daemon_create_sink failed (${res.status})`, res.json);
+          await pollDaemonState();
+        })();
+      } else if (data.type === 'daemon_delete_sink') {
+        (async () => {
+          const id = Number(data.id);
+          if (!Number.isInteger(id)) return;
+          const res = await daemonRequest('DELETE', `/api/sink/${id}`);
+          if (!res.ok) console.error(`daemon_delete_sink failed (${res.status})`, res.json);
+          await pollDaemonState();
+        })();
+      } else if (data.type === 'daemon_create_source') {
+        // Transmit: create a daemon Source that reads `map` ALSA playback
+        // channels (fed by the engine via pw-link in Phase 2) and sends RTP.
+        (async () => {
+          const id = lowestFreeDaemonId(lastDaemonState.sources);
+          if (id < 0) { console.error('daemon_create_source: no free source id'); return; }
+          const map = Array.isArray(data.map) && data.map.length > 0
+            ? data.map.map((n: any) => Number(n)) : [0, 1];
+          const body = {
+            enabled: true,
+            name: String(data.name || `Deck Source ${id}`),
+            io: 'Audio Device',
+            map,
+            max_samples_per_packet: 48,
+            codec: 'L24',
+            address: typeof data.address === 'string' ? data.address : '',
+            ttl: 15,
+            payload_type: 98,
+            dscp: 34,
+            refclk_ptp_traceable: false
+          };
+          const res = await daemonRequest('PUT', `/api/source/${id}`, body);
+          if (!res.ok) console.error(`daemon_create_source failed (${res.status})`, res.json);
+          await pollDaemonState();
+        })();
+      } else if (data.type === 'daemon_update_source') {
+        // Re-PUT an existing Source with the live config merged over the patch
+        // (the daemon has no PATCH — every field must be present).
+        (async () => {
+          const id = Number(data.id);
+          if (!Number.isInteger(id)) return;
+          const current = lastDaemonState.sources.find((s: any) => Number(s.id) === id);
+          if (!current) { console.error(`daemon_update_source: unknown source ${id}`); return; }
+          const { type: _t, id: _i, ...patch } = data;
+          const body = {
+            enabled: current.enabled,
+            name: current.name,
+            io: current.io || 'Audio Device',
+            map: current.map,
+            max_samples_per_packet: current.max_samples_per_packet ?? 48,
+            codec: current.codec || 'L24',
+            address: current.address || '',
+            ttl: current.ttl ?? 15,
+            payload_type: current.payload_type ?? 98,
+            dscp: current.dscp ?? 34,
+            refclk_ptp_traceable: current.refclk_ptp_traceable ?? false,
+            ...patch
+          };
+          const res = await daemonRequest('PUT', `/api/source/${id}`, body);
+          if (!res.ok) console.error(`daemon_update_source failed (${res.status})`, res.json);
+          await pollDaemonState();
+        })();
+      } else if (data.type === 'daemon_delete_source') {
+        (async () => {
+          const id = Number(data.id);
+          if (!Number.isInteger(id)) return;
+          const res = await daemonRequest('DELETE', `/api/source/${id}`);
+          if (!res.ok) console.error(`daemon_delete_source failed (${res.status})`, res.json);
+          await pollDaemonState();
+        })();
+      } else if (data.type === 'daemon_set_ptp') {
+        (async () => {
+          const domain = Number(data.domain);
+          const dscp = Number(data.dscp);
+          if (!Number.isInteger(domain) || !Number.isInteger(dscp)) return;
+          const res = await daemonRequest('POST', '/api/ptp/config', { domain, dscp });
+          if (!res.ok) console.error(`daemon_set_ptp failed (${res.status})`, res.json);
+          await pollDaemonState();
+        })();
       } else if (data.type && allowedTypes.includes(data.type)) {
         // Intercept mixer state changes: update in-memory snapshot, persist
         // to disk (debounced), and fan-out to all other connected clients.
@@ -462,13 +569,18 @@ ipcServer.listen(SOCKET_PATH, () => {
 // engine (re)connect, which covers both first boot and recovery after the
 // engine restarts — see the comment there.
 
-// --- aes67-linux-daemon polling: "AES67 destinations" ---
-// This app's Master/Aux buses only ever produce local PipeWire audio;
-// getting that onto the AES67 network means feeding it into a *Source*
-// configured on the aes67-linux-daemon (a Source reads from a local ALSA
-// playback device and transmits RTP out — see daemon/README.md). So the
-// daemon's already-configured Sources are exactly the set of real,
-// addressable "AES67 destinations" available to route Master/Aux into.
+// --- aes67-linux-daemon control proxy ---
+// The daemon is control-plane only: it configures the RAVENNA kernel module
+// over netlink and does SAP/mDNS discovery, and is never in the audio path.
+// Everything it does is reachable through its REST API, so the deck drives it
+// directly (PTP, Sinks to receive streams, transmit Sources) instead of the
+// operator opening the separate daemon WebUI on :8080. We poll a full snapshot
+// of daemon state every 5s and broadcast it as `daemon_state`; a handful of
+// write commands come back over the same WS the UI already uses.
+//
+// The pre-existing Output-Endpoints feature ("AES67 destinations" — feed a bus
+// into a configured Source to transmit it) still consumes a derived
+// `daemon_destinations_loaded` message, kept emitted below unchanged.
 const DAEMON_BASE_URL = process.env.AES67_DAEMON_URL || 'http://localhost:8080';
 const DAEMON_POLL_INTERVAL_MS = 5000;
 
@@ -477,51 +589,123 @@ interface DaemonDestination {
   address: string;
 }
 
-function fetchDaemonSources(): Promise<{ ok: boolean; sources: DaemonDestination[] }> {
+interface DaemonRequestResult {
+  ok: boolean;
+  status: number;
+  json: any;
+}
+
+// Generic daemon REST call. Never throws — a dead daemon, a timeout, or a
+// non-JSON body all resolve to { ok:false, status:0, json:null } so callers
+// stay branch-free.
+function daemonRequest(method: string, apiPath: string, body?: unknown): Promise<DaemonRequestResult> {
   return new Promise((resolve) => {
-    const req = http.get(`${DAEMON_BASE_URL}/api/sources`, { timeout: 2000 }, (res) => {
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    let url: URL;
+    try {
+      url = new URL(apiPath, DAEMON_BASE_URL);
+    } catch {
+      resolve({ ok: false, status: 0, json: null });
+      return;
+    }
+    const req = http.request(url, {
+      method,
+      timeout: 2000,
+      headers: payload === undefined ? undefined : {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', (chunk) => { raw += chunk; });
       res.on('end', () => {
-        try {
-          const parsed = JSON.parse(body);
-          const raw = Array.isArray(parsed.sources) ? parsed.sources : [];
-          const sources: DaemonDestination[] = raw.map((s: any) => ({
-            name: typeof s.name === 'string' && s.name ? s.name : `Source ${s.id}`,
-            address: typeof s.address === 'string' ? s.address : ''
-          }));
-          resolve({ ok: true, sources });
-        } catch (e) {
-          resolve({ ok: false, sources: [] });
+        const status = res.statusCode || 0;
+        const ok = status >= 200 && status < 300;
+        let json: any = null;
+        if (raw.trim().length > 0) {
+          try { json = JSON.parse(raw); } catch { json = null; }
         }
+        resolve({ ok, status, json });
       });
     });
-    req.on('timeout', () => { req.destroy(); resolve({ ok: false, sources: [] }); });
-    req.on('error', () => resolve({ ok: false, sources: [] }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, json: null }); });
+    req.on('error', () => resolve({ ok: false, status: 0, json: null }));
+    if (payload !== undefined) req.write(payload);
+    req.end();
   });
 }
 
+interface DaemonState {
+  reachable: boolean;
+  config: any;
+  ptp: any;
+  sources: any[];
+  sinks: any[];
+  remote: any[];
+}
+
+let lastDaemonState: DaemonState = {
+  reachable: false, config: null, ptp: null, sources: [], sinks: [], remote: []
+};
 let lastDaemonDestinations: DaemonDestination[] = [];
 let daemonReachable = false;
 
-async function pollDaemonDestinations() {
-  const { ok, sources } = await fetchDaemonSources();
-  if (ok !== daemonReachable) {
-    console.log(ok
-      ? `Connected to aes67-linux-daemon at ${DAEMON_BASE_URL}`
-      : `aes67-linux-daemon unreachable at ${DAEMON_BASE_URL} (destination discovery paused)`);
-    daemonReachable = ok;
+// Lowest integer id in 0..63 not already taken by an existing source/sink,
+// matching how the daemon WebUI allocates them. -1 if all 64 are in use.
+function lowestFreeDaemonId(items: any[]): number {
+  const used = new Set((items || []).map((i) => Number(i.id)));
+  for (let i = 0; i <= 63; i++) {
+    if (!used.has(i)) return i;
   }
-  if (ok) lastDaemonDestinations = sources;
+  return -1;
+}
 
-  const msg = JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable: ok });
-  connectedWsClients.forEach(ws => {
+function broadcastToClients(msg: string) {
+  connectedWsClients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(msg);
   });
 }
 
-setInterval(pollDaemonDestinations, DAEMON_POLL_INTERVAL_MS);
-pollDaemonDestinations();
+async function pollDaemonState() {
+  const [configRes, ptpRes, sourcesRes, sinksRes, remoteRes] = await Promise.all([
+    daemonRequest('GET', '/api/config'),
+    daemonRequest('GET', '/api/ptp/status'),
+    daemonRequest('GET', '/api/sources'),
+    daemonRequest('GET', '/api/sinks'),
+    daemonRequest('GET', '/api/browse/sources/all')
+  ]);
+
+  const reachable = configRes.ok || sourcesRes.ok;
+  if (reachable !== daemonReachable) {
+    console.log(reachable
+      ? `Connected to aes67-linux-daemon at ${DAEMON_BASE_URL}`
+      : `aes67-linux-daemon unreachable at ${DAEMON_BASE_URL} (daemon control paused)`);
+    daemonReachable = reachable;
+  }
+
+  if (reachable) {
+    lastDaemonState = {
+      reachable: true,
+      config: configRes.json ?? lastDaemonState.config,
+      ptp: ptpRes.json ?? null,
+      sources: Array.isArray(sourcesRes.json?.sources) ? sourcesRes.json.sources : [],
+      sinks: Array.isArray(sinksRes.json?.sinks) ? sinksRes.json.sinks : [],
+      remote: Array.isArray(remoteRes.json?.remote_sources) ? remoteRes.json.remote_sources : []
+    };
+    lastDaemonDestinations = lastDaemonState.sources.map((s: any) => ({
+      name: typeof s.name === 'string' && s.name ? s.name : `Source ${s.id}`,
+      address: typeof s.address === 'string' ? s.address : ''
+    }));
+  } else {
+    lastDaemonState = { ...lastDaemonState, reachable: false };
+  }
+
+  broadcastToClients(JSON.stringify({ type: 'daemon_state', ...lastDaemonState }));
+  broadcastToClients(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable: reachable }));
+}
+
+setInterval(pollDaemonState, DAEMON_POLL_INTERVAL_MS);
+pollDaemonState();
 
 // --- Local microphone discovery (Talkback source dropdown) ---
 // Polls `pactl list sources` for real capture devices (not sink monitors),

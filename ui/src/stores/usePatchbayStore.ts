@@ -19,6 +19,69 @@ export interface Aes67Stream {
   lastSeen: number;
 }
 
+// --- aes67-linux-daemon state, mirrored from the server's `daemon_state`
+// broadcast (a full snapshot every ~5s). All live server state — never
+// persisted (see `partialize` below) so stale daemon data can't survive a
+// reload.
+
+// A configured receive stream on the daemon. `map` is the list of 0-indexed
+// AES67_Source ALSA capture channels this sink lands on.
+export interface DaemonSink {
+  id: number;
+  name: string;
+  use_sdp: boolean;
+  source: string;
+  sdp: string;
+  delay: number;
+  ignore_refclk_gmid: boolean;
+  map: number[];
+}
+
+// A configured transmit stream on the daemon. `map` is the list of 0-indexed
+// AES67_Sink ALSA playback channels it reads and sends as RTP.
+export interface DaemonSource {
+  id: number;
+  enabled: boolean;
+  name: string;
+  io: string;
+  codec: string;
+  address: string;
+  max_samples_per_packet: number;
+  ttl: number;
+  payload_type: number;
+  dscp: number;
+  refclk_ptp_traceable: boolean;
+  map: number[];
+}
+
+// A stream announced on the network via SAP/mDNS that the daemon has seen but
+// isn't receiving — the "Add" dropdown in NetworkPanel picks from these.
+export interface DaemonRemoteSource {
+  source: string;   // "SAP" | "mDNS"
+  id: string;
+  name: string;
+  domain: string;
+  address: string;
+  sdp: string;
+  last_seen: number;
+  announce_period: number;
+}
+
+export interface DaemonPtpStatus {
+  status: string;   // "locked" | "unlocked" | ...
+  gmid: string;
+  jitter: number;
+}
+
+export interface DaemonStatePayload {
+  reachable: boolean;
+  config: Record<string, unknown> | null;
+  ptp: DaemonPtpStatus | null;
+  sources: DaemonSource[];
+  sinks: DaemonSink[];
+  remote: DaemonRemoteSource[];
+}
+
 // Input channels are source-only: they can be mapped to an AES67/PipeWire
 // source, never to a destination.
 export interface ChannelMapping {
@@ -68,6 +131,16 @@ interface PatchbayState {
   // Whether the server's last poll of aes67-linux-daemon's REST API
   // succeeded — lets the UI explain an empty discovered-destinations list.
   daemonReachable: boolean;
+
+  // Full aes67-linux-daemon snapshot from the server's `daemon_state`
+  // broadcast — drives the NetworkPanel (PTP, receive Sinks, transmit
+  // Sources). Not persisted.
+  daemonConfig: Record<string, unknown> | null;
+  ptpStatus: DaemonPtpStatus | null;
+  daemonSinks: DaemonSink[];
+  daemonSources: DaemonSource[];
+  daemonRemoteSources: DaemonRemoteSource[];
+  setDaemonState: (payload: DaemonStatePayload) => void;
 
   // Live-detected local capture devices, for the Talkback mic dropdown.
   micDevices: MicDevice[];
@@ -162,6 +235,12 @@ export const usePatchbayStore = create<PatchbayState>()(
   manualDestinations: [],
   outputMappings: buildOutputMappings(),
   daemonReachable: true,
+
+  daemonConfig: null,
+  ptpStatus: null,
+  daemonSinks: [],
+  daemonSources: [],
+  daemonRemoteSources: [],
 
   micDevices: [],
 
@@ -316,6 +395,17 @@ export const usePatchbayStore = create<PatchbayState>()(
     set({ daemonReachable: reachable });
   },
 
+  setDaemonState: (payload) => {
+    set({
+      daemonReachable: !!payload.reachable,
+      daemonConfig: payload.config ?? null,
+      ptpStatus: payload.ptp ?? null,
+      daemonSinks: Array.isArray(payload.sinks) ? payload.sinks : [],
+      daemonSources: Array.isArray(payload.sources) ? payload.sources : [],
+      daemonRemoteSources: Array.isArray(payload.remote) ? payload.remote : []
+    });
+  },
+
   setMicDevices: (devices) => set({ micDevices: devices }),
   setTalkbackSourcePorts: (ports) => set({ talkbackSourcePorts: ports, talkbackMicSourceName: null, talkbackMicAlsaPortName: null }),
   toggleTalkbackDestBusId: (busId) => set(state => ({
@@ -331,6 +421,18 @@ export const usePatchbayStore = create<PatchbayState>()(
     }),
     {
       name: 'aes67-patchbay-storage',
+      // Live server state pushed by `daemon_state` — never persist it, or a
+      // reload would briefly show a stale daemon snapshot (wrong PTP lock,
+      // ghost sinks) until the next poll overwrites it.
+      partialize: (state) => {
+        const copy: Record<string, unknown> = { ...state };
+        delete copy.daemonConfig;
+        delete copy.ptpStatus;
+        delete copy.daemonSinks;
+        delete copy.daemonSources;
+        delete copy.daemonRemoteSources;
+        return copy as unknown as PatchbayState;
+      },
       // Fields added after this store was first persisted won't exist in
       // older saved state; without backfilling here, code that assumes
       // they're present (e.g. `s.ports.join(...)`) throws on load and the

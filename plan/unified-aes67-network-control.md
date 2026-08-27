@@ -77,7 +77,7 @@ forwarded to the engine). Each performs the daemon call then calls
 
 | WS type | Daemon call |
 |---|---|
-| `daemon_create_sink` `{name, sdp \| source, delay?, map}` | `PUT /api/sink/{nextFreeId}` (`use_sdp:true`, `ignore_refclk_gmid:false`, `delay: 384` default) |
+| `daemon_create_sink` `{name, sdp \| source, delay?, map}` | `PUT /api/sink/{nextFreeId}` (`use_sdp:true`, `ignore_refclk_gmid:true`, `delay: 384` default) |
 | `daemon_delete_sink` `{id}` | `DELETE /api/sink/{id}` |
 | `daemon_create_source` `{name, map, address?}` | `PUT /api/source/{id}` (`enabled:true`, `io:"Audio Device"`, `codec:"L24"`, `max_samples_per_packet:48`, `ttl:15`, `payload_type:98`, `dscp:34`, `refclk_ptp_traceable:false`) |
 | `daemon_update_source` `{id, ...patch}` | `PUT /api/source/{id}` with merged current + patch |
@@ -88,7 +88,14 @@ Sink/source id allocation: pick the lowest integer 0..63 not present in the
 current `sources`/`sinks` list.
 
 Source/sink JSON shapes verified against `daemon/json.cpp:445` (`json_to_source`)
-and `:497` (`json_to_sink`) — `map` is a list of 0-indexed ALSA channels.
+and `:497` (`json_to_sink`) — `map` is a list of 0-indexed ALSA channels. The
+daemon has no PATCH: every field must be present on each `PUT`, so
+`daemon_update_source` re-sends the cached live config merged under the patch.
+`ignore_refclk_gmid` must be `true` — the SDP parser
+(`daemon/session_manager.cpp:216`) returns 400 "cannot parse SDP" for any
+stream whose `a=ts-refclk` gmid differs from the daemon's current PTP
+grandmaster, which is every stream while we're unlocked or on a different GM
+(the existing appliance sink is configured the same way).
 
 ### 1b. UI store (`ui/src/stores/usePatchbayStore.ts`)
 
