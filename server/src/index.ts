@@ -6,6 +6,7 @@ import * as http from 'http';
 import { execFile } from 'child_process';
 import * as path from 'path';
 import { ensurePeaks } from './wavPeaks';
+import { buildRpp, parseRpp, type RppProject } from './rpp';
 
 const SCENES_DIR = path.join(process.cwd(), '..', 'scenes');
 if (!fs.existsSync(SCENES_DIR)) {
@@ -49,6 +50,138 @@ function sanitizeProjectName(name: unknown): string {
 
 function projectDir(name: string): string {
   return path.join(PROJECTS_DIR, sanitizeProjectName(name));
+}
+
+// --- REAPER-compatible multitrack recording projects ---------------------
+// A recording project is a portable bundle: records/<Name>/<Name>.rpp plus
+// its consolidated WavPack media, openable directly in REAPER. It is the
+// primary saved format; projects/default/project.json is just the scratch
+// autosave for the not-yet-saved session.
+const RECORDS_DIR = process.env.AES67_RECORDS_DIR
+  ? path.resolve(process.env.AES67_RECORDS_DIR)
+  : path.join(process.cwd(), '..', 'records');
+try { fs.mkdirSync(RECORDS_DIR, { recursive: true }); } catch { /* ignore */ }
+
+// Name of the recording project currently open, or null for the scratch
+// session. When set, its media lives in records/<name>/ (flat) and autosave
+// rewrites records/<name>/<name>.rpp.
+let activeRecordingProject: string | null = null;
+
+function recProjectDir(name: string): string {
+  return path.join(RECORDS_DIR, sanitizeProjectName(name));
+}
+function rppPath(name: string): string {
+  return path.join(recProjectDir(name), `${sanitizeProjectName(name)}.rpp`);
+}
+
+function listRecordingProjects(): string[] {
+  try {
+    return fs.readdirSync(RECORDS_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && fs.existsSync(rppPath(d.name)))
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+// Flat, collision-free media name for a consolidated take file.
+function consolidatedName(takeDir: string, file: string): string {
+  const td = String(takeDir || '').replace(/[^0-9A-Za-z_-]/g, '');
+  const base = path.basename(String(file || ''));
+  return td && !base.startsWith(td) ? `${td}_${base}` : base;
+}
+
+// The current timeline (DawProject-shaped) -> RppProject. `fileFor` maps each
+// clip to the media filename to write into the .rpp (relative to it).
+function timelineToRpp(
+  clips: any[], markers: any[], trackHeights: Record<string, number>,
+  sampleRate: number, fileFor: (c: any) => string,
+): RppProject {
+  const byTrack = new Map<number, any[]>();
+  for (const c of clips) {
+    if (!c || !c.file) continue;
+    const t = Number(c.trackId) || 1;
+    if (!byTrack.has(t)) byTrack.set(t, []);
+    byTrack.get(t)!.push(c);
+  }
+  const tracks = [...byTrack.keys()].sort((a, b) => a - b).map((tid) => ({
+    name: `IN ${tid}`,
+    trackId: tid,
+    height: Number(trackHeights[String(tid)]) || undefined,
+    items: byTrack.get(tid)!.map((c) => ({
+      id: typeof c.id === 'string' ? c.id : undefined,
+      name: String(c.name || `CH${tid}`),
+      position: Number(c.start) || 0,
+      length: Number(c.length) || 0,
+      soffs: Number(c.sourceOffset) || 0,
+      gain: typeof c.gain === 'number' ? c.gain : 1,
+      fadeIn: Number(c.fadeIn) || 0,
+      fadeOut: Number(c.fadeOut) || 0,
+      file: fileFor(c),
+    })),
+  }));
+  return {
+    sampleRate: sampleRate || 48000,
+    tempo: 120,
+    tracks,
+    markers: (markers || []).map((m: any) => ({ position: Number(m.time) || 0, name: String(m.name || 'Marker') })),
+  };
+}
+
+const REC_CLIP_COLORS = ['bg-red-600', 'bg-blue-600', 'bg-green-600', 'bg-orange-600', 'bg-purple-600', 'bg-teal-600'];
+
+// A parsed .rpp -> DawProject the UI store understands. `projName` is stamped
+// onto each clip's takeDir so peak lookups route to records/<projName>/.
+function rppToProject(rpp: RppProject, projName: string): DawProject {
+  const clips: any[] = [];
+  rpp.tracks.forEach((tr, ti) => {
+    const trackId = tr.trackId && tr.trackId >= 1 && tr.trackId <= NUM_CHANNELS ? tr.trackId : ti + 1;
+    for (const it of tr.items) {
+      clips.push({
+        id: it.id || (globalThis.crypto as Crypto).randomUUID(),
+        trackId,
+        start: it.position,
+        length: it.length,
+        color: REC_CLIP_COLORS[(trackId - 1) % REC_CLIP_COLORS.length],
+        name: it.name,
+        takeDir: projName,
+        file: path.basename(it.file),
+        originFrame: Math.round(it.position * rpp.sampleRate),
+        endFrame: Math.round((it.position + it.length) * rpp.sampleRate),
+        sampleRate: rpp.sampleRate,
+        ...(it.soffs ? { sourceOffset: it.soffs } : {}),
+        ...(it.gain !== 1 ? { gain: it.gain } : {}),
+        ...(it.fadeIn ? { fadeIn: it.fadeIn } : {}),
+        ...(it.fadeOut ? { fadeOut: it.fadeOut } : {}),
+      });
+    }
+  });
+  const trackHeights: Record<string, number> = {};
+  rpp.tracks.forEach((tr) => {
+    const tid = tr.trackId && tr.trackId >= 1 && tr.trackId <= NUM_CHANNELS ? tr.trackId : null;
+    if (tid && tr.height) trackHeights[String(tid)] = tr.height;
+  });
+  const markers = rpp.markers.map((m, i) => ({ id: `m${i}_${Math.round(m.position * 1000)}`, time: m.position, name: m.name }));
+  return { clips, markers, trackHeights };
+}
+
+let rppSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function writeRppDebounced(name: string, rpp: RppProject): void {
+  if (rppSaveTimer) clearTimeout(rppSaveTimer);
+  rppSaveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(recProjectDir(name), { recursive: true });
+      fs.writeFileSync(rppPath(name), buildRpp(rpp));
+    } catch (e) {
+      console.error(`Error writing ${name}.rpp`, e);
+    }
+  }, 500);
+}
+
+function broadcastRecordingProjects(): void {
+  const msg = JSON.stringify({ type: 'recording_projects_list', projects: listRecordingProjects(), active: activeRecordingProject });
+  connectedWsClients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
 }
 
 function ensureProject(name: string): void {
@@ -133,7 +266,10 @@ function saveProjectDebounced(name: string, project: DawProject): void {
 function takeManifestToClips(takeName: string, m: any): any[] {
   const sr = Number(m.sampleRate) > 0 ? Number(m.sampleRate) : 48000;
   const origin = Number(m.originFrame) || 0;
-  const end = Number(m.endFrame) || origin;
+  // Prefer the frames actually written (engine `frames`) — reliable even if the
+  // transport moved between arming and rolling; fall back to the frame span.
+  const recorded = Number(m.frames) || 0;
+  const end = recorded > 0 ? origin + recorded : (Number(m.endFrame) || origin);
   const lengthSec = Math.max(0, (end - origin) / sr);
   const armed: number[] = Array.isArray(m.armed) ? m.armed : [];
   const ext = typeof m.ext === 'string' && /^[a-z0-9]{2,4}$/.test(m.ext) ? m.ext : 'wv';
@@ -159,7 +295,13 @@ try {
     activeProjectName = sanitizeProjectName(fs.readFileSync(ACTIVE_PROJECT_PATH, 'utf8').trim());
   }
 } catch { /* keep default */ }
-ensureProject(activeProjectName);
+// If the persisted active project is a REAPER recording project, reopen it as
+// one (media in records/<name>/, autosave to the .rpp).
+if (activeProjectName !== 'default' && fs.existsSync(rppPath(activeProjectName))) {
+  activeRecordingProject = activeProjectName;
+} else {
+  ensureProject(activeProjectName);
+}
 
 function setActiveProject(name: string): void {
   activeProjectName = sanitizeProjectName(name);
@@ -367,9 +509,22 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ type: 'mixer_state_loaded', state: mixerState }));
   }
 
-  // DAW: the active project (arrangement) and the project list.
+  // DAW: the active project (arrangement) and the available projects. A
+  // REAPER recording project takes precedence over the scratch session.
   ws.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
-  ws.send(JSON.stringify({ type: 'project_data', name: activeProjectName, project: loadProject(activeProjectName) }));
+  ws.send(JSON.stringify({ type: 'recording_projects_list', projects: listRecordingProjects(), active: activeRecordingProject }));
+  if (activeRecordingProject && fs.existsSync(rppPath(activeRecordingProject))) {
+    try {
+      ws.send(JSON.stringify({
+        type: 'project_data', name: activeRecordingProject,
+        project: rppToProject(parseRpp(fs.readFileSync(rppPath(activeRecordingProject), 'utf8')), activeRecordingProject),
+      }));
+    } catch {
+      ws.send(JSON.stringify({ type: 'project_data', name: activeProjectName, project: loadProject(activeProjectName) }));
+    }
+  } else {
+    ws.send(JSON.stringify({ type: 'project_data', name: activeProjectName, project: loadProject(activeProjectName) }));
+  }
 
   ws.on('close', () => {
     connectedWsClients = connectedWsClients.filter(client => client !== ws);
@@ -597,6 +752,95 @@ wss.on('connection', (ws) => {
           }
         });
         pushTimelineToEngine(name, project);
+      } else if (data.type === 'list_recording_projects') {
+        ws.send(JSON.stringify({ type: 'recording_projects_list', projects: listRecordingProjects(), active: activeRecordingProject }));
+      } else if (data.type === 'save_recording_project') {
+        const name = sanitizeProjectName(data.name);
+        const p = data.project || {};
+        const project: DawProject = {
+          clips: Array.isArray(p.clips) ? p.clips : [],
+          markers: Array.isArray(p.markers) ? p.markers : [],
+          trackHeights: p.trackHeights && typeof p.trackHeights === 'object' ? p.trackHeights : {},
+        };
+        if (!name || name === 'default') {
+          ws.send(JSON.stringify({ type: 'recording_project_error', reason: 'pick a project name' }));
+        } else {
+          try {
+            const dir = recProjectDir(name);
+            fs.mkdirSync(dir, { recursive: true });
+            const sr = Number(project.clips.find((c: any) => c?.sampleRate)?.sampleRate) || 48000;
+            // Consolidate: MOVE every referenced media file (and its .peaks.json)
+            // into records/<name>/ with a flat, collision-free name.
+            const remap = new Map<string, string>();
+            const sourceTakeDirs = new Set<string>();
+            for (const c of project.clips) {
+              if (!c || !c.file) continue;
+              const key = `${c.takeDir || ''}/${c.file}`;
+              if (remap.has(key)) { c.file = remap.get(key)!; c.takeDir = name; continue; }
+              const inRec = activeRecordingProject && (!c.takeDir || c.takeDir === activeRecordingProject);
+              if (!inRec && c.takeDir) sourceTakeDirs.add(String(c.takeDir));
+              const cur = inRec
+                ? path.join(recProjectDir(activeRecordingProject as string), path.basename(c.file))
+                : path.join(projectDir(activeProjectName), 'takes', String(c.takeDir || ''), path.basename(c.file));
+              const destBase = inRec ? path.basename(c.file) : consolidatedName(String(c.takeDir || ''), c.file);
+              const dest = path.join(dir, destBase);
+              try {
+                if (fs.existsSync(cur) && path.resolve(cur) !== path.resolve(dest)) {
+                  fs.renameSync(cur, dest);
+                  const pk = cur.replace(/\.(wav|wv)$/i, '') + '.peaks.json';
+                  if (fs.existsSync(pk)) { try { fs.renameSync(pk, dest.replace(/\.(wav|wv)$/i, '') + '.peaks.json'); } catch { /* ignore */ } }
+                }
+              } catch (e) {
+                console.error('save_recording_project: could not move', cur, e);
+              }
+              remap.set(key, destBase);
+              c.file = destBase;
+              c.takeDir = name;
+            }
+            // Drop the now-consolidated staging take dirs.
+            for (const td of sourceTakeDirs) {
+              try { fs.rmSync(path.join(projectDir(activeProjectName), 'takes', td), { recursive: true, force: true }); } catch { /* ignore */ }
+            }
+            fs.writeFileSync(rppPath(name), buildRpp(
+              timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => c.file),
+            ));
+            activeRecordingProject = name;
+            activeProjectName = name;
+            try { fs.writeFileSync(ACTIVE_PROJECT_PATH, name); } catch { /* ignore */ }
+
+            const loaded = rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name);
+            connectedWsClients.forEach((c) => {
+              if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'project_data', name, project: loaded }));
+            });
+            broadcastRecordingProjects();
+            pushTimelineToEngine(name, loaded);
+            console.log(`Recording project saved: ${rppPath(name)} (${loaded.clips.length} clip(s))`);
+          } catch (e) {
+            console.error('save_recording_project failed', e);
+            ws.send(JSON.stringify({ type: 'recording_project_error', reason: 'save failed' }));
+          }
+        }
+      } else if (data.type === 'open_recording_project') {
+        const name = sanitizeProjectName(data.name);
+        if (!fs.existsSync(rppPath(name))) {
+          ws.send(JSON.stringify({ type: 'recording_project_error', reason: 'not found' }));
+        } else {
+          try {
+            const proj = rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name);
+            activeRecordingProject = name;
+            activeProjectName = name;
+            try { fs.writeFileSync(ACTIVE_PROJECT_PATH, name); } catch { /* ignore */ }
+            connectedWsClients.forEach((c) => {
+              if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'project_data', name, project: proj }));
+            });
+            broadcastRecordingProjects();
+            pushTimelineToEngine(name, proj);
+            console.log(`Opened recording project: ${name} (${proj.clips.length} clip(s))`);
+          } catch (e) {
+            console.error('open_recording_project failed', e);
+            ws.send(JSON.stringify({ type: 'recording_project_error', reason: 'open failed' }));
+          }
+        }
       } else if (data.type === 'save_project') {
         const name = sanitizeProjectName(data.name);
         const p = data.project || {};
@@ -606,12 +850,21 @@ wss.on('connection', (ws) => {
           trackHeights: p.trackHeights && typeof p.trackHeights === 'object' ? p.trackHeights : {},
           loop: p.loop && typeof p.loop === 'object' ? p.loop : undefined,
         };
-        saveProjectDebounced(name, project);
-        if (name === activeProjectName) pushTimelineToEngine(name, project);
+        if (activeRecordingProject) {
+          // A REAPER project is open: autosave rewrites its .rpp in place
+          // (media already consolidated in records/<name>/).
+          const sr = Number(project.clips.find((c: any) => c?.sampleRate)?.sampleRate) || 48000;
+          writeRppDebounced(activeRecordingProject,
+            timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => path.basename(String(c.file || ''))));
+          pushTimelineToEngine(activeRecordingProject, project);
+        } else {
+          saveProjectDebounced(name, project);
+          if (name === activeProjectName) pushTimelineToEngine(name, project);
+        }
         // Fan out so other connected clients converge on the same arrangement.
         connectedWsClients.forEach(c => {
           if (c !== ws && c.readyState === WebSocket.OPEN) {
-            c.send(JSON.stringify({ type: 'project_data', name, project }));
+            c.send(JSON.stringify({ type: 'project_data', name: activeRecordingProject || name, project }));
           }
         });
       } else if (data.type === 'start_multitrack_record') {
@@ -640,8 +893,10 @@ wss.on('connection', (ws) => {
         // file on first request, then serve from disk.
         const takeDir = String(data.takeDir || '').replace(/[^0-9A-Za-z:_-]/g, '');
         const file = String(data.file || '').replace(/[^0-9A-Za-z._-]/g, '');
-        if (takeDir && /^ch\d+\.(wav|wv)$/.test(file)) {
-          const srcPath = path.join(projectDir(activeProjectName), 'takes', takeDir, file);
+        if (takeDir && /^[0-9A-Za-z_-]+\.(wav|wv)$/.test(file)) {
+          const srcPath = activeRecordingProject
+            ? path.join(recProjectDir(activeRecordingProject), file)
+            : path.join(projectDir(activeProjectName), 'takes', takeDir, file);
           setImmediate(() => {
             const peaks = fs.existsSync(srcPath) ? ensurePeaks(srcPath) : null;
             if (ws.readyState === WebSocket.OPEN) {
@@ -733,6 +988,7 @@ function handleTakeFinished(msg: any): boolean {
   const manifest = {
     originFrame: Number(msg.originFrame) || 0,
     endFrame: Number(msg.endFrame) || 0,
+    frames: Number(msg.frames) || 0,
     sampleRate: Number(msg.sampleRate) || 48000,
     armed: Array.isArray(msg.armed) ? msg.armed : [],
     ext: typeof msg.ext === 'string' ? msg.ext : 'wv',
@@ -747,6 +1003,50 @@ function handleTakeFinished(msg: any): boolean {
   }
 
   const clips = takeManifestToClips(takeName, manifest);
+
+  // If a REAPER recording project is open, consolidate this take straight into
+  // records/<name>/ (flat, collision-free) and fold it into the .rpp so the
+  // project stays self-contained.
+  if (activeRecordingProject) {
+    const recName = activeRecordingProject;
+    const recDir = recProjectDir(recName);
+    try { fs.mkdirSync(recDir, { recursive: true }); } catch { /* ignore */ }
+    for (const c of clips) {
+      const from = path.join(takeDir, path.basename(c.file));
+      const base = consolidatedName(takeName, c.file);
+      const to = path.join(recDir, base);
+      try {
+        if (fs.existsSync(from)) {
+          fs.renameSync(from, to);
+          const pk = from.replace(/\.(wav|wv)$/i, '') + '.peaks.json';
+          if (fs.existsSync(pk)) { try { fs.renameSync(pk, to.replace(/\.(wav|wv)$/i, '') + '.peaks.json'); } catch { /* ignore */ } }
+        }
+      } catch (e) {
+        console.error('handleTakeFinished: consolidate move failed', from, e);
+      }
+      c.file = base;
+      c.takeDir = recName;
+    }
+    try { fs.rmSync(takeDir, { recursive: true, force: true }); } catch { /* ignore */ }
+
+    let merged: DawProject = { clips: [], markers: [], trackHeights: {} };
+    try {
+      const base = rppToProject(parseRpp(fs.readFileSync(rppPath(recName), 'utf8')), recName);
+      merged = { clips: [...base.clips, ...clips], markers: base.markers, trackHeights: base.trackHeights };
+      fs.writeFileSync(rppPath(recName), buildRpp(
+        timelineToRpp(merged.clips, merged.markers, merged.trackHeights, manifest.sampleRate, (x) => path.basename(String(x.file || ''))),
+      ));
+    } catch (e) {
+      console.error('handleTakeFinished: rpp rewrite failed', e);
+    }
+
+    broadcastToClients(JSON.stringify({
+      type: 'take_committed', project: recName, takeDir: recName, overrun: !!msg.overrun, clips,
+    }));
+    pushTimelineToEngine(recName, merged);
+    return true;
+  }
+
   broadcastToClients(JSON.stringify({
     type: 'take_committed',
     project: activeProjectName,
@@ -755,7 +1055,7 @@ function handleTakeFinished(msg: any): boolean {
     clips,
   }));
   // The committed clips aren't in project.json yet (the UI persists them via
-  // save_project), so fold them in here for the engine schedule.
+  // save_project), so fold them into the engine schedule now.
   pushTimelineToEngine(activeProjectName, undefined, clips);
   return true;
 }
@@ -764,12 +1064,14 @@ function handleTakeFinished(msg: any): boolean {
 // positions and push them to the engine as the playback schedule.
 function pushTimelineToEngine(name: string, project?: DawProject, extraClips: any[] = []): void {
   if (!engineSocket) return;
-  const proj = project || loadProject(name);
+  const isRec = activeRecordingProject === sanitizeProjectName(name);
+  const proj = project || (isRec ? rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name) : loadProject(name));
   const allClips = [...(proj.clips || []), ...extraClips];
-  const dir = projectDir(name);
+  const dir = isRec ? recProjectDir(name) : projectDir(name);
   const specs: any[] = [];
   for (const c of allClips) {
-    if (!c || !c.takeDir || !c.file) continue;
+    if (!c || !c.file) continue;
+    if (!isRec && !c.takeDir) continue;
     const sr = Number(c.sampleRate) > 0 ? Number(c.sampleRate) : 48000;
     const start = Number(c.start) || 0;
     const length = Number(c.length) || 0;
@@ -785,7 +1087,9 @@ function pushTimelineToEngine(name: string, project?: DawProject, extraClips: an
       gain: typeof c.gain === 'number' ? c.gain : 1.0,
       fadeIn: Math.round(fadeIn * sr),
       fadeOut: Math.round(fadeOut * sr),
-      path: path.resolve(dir, 'takes', String(c.takeDir), String(c.file)),
+      path: isRec
+        ? path.resolve(dir, path.basename(String(c.file)))
+        : path.resolve(dir, 'takes', String(c.takeDir), String(c.file)),
     });
   }
   engineSocket.write(JSON.stringify({ type: 'set_timeline', clips: specs }) + '\n');

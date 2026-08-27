@@ -17,6 +17,9 @@ scenes/*.json
 # DAW projects — arrangement JSON + recorded take audio (user session data)
 projects/
 
+# REAPER-compatible multitrack recording projects (.rpp + consolidated media)
+records/
+
 # Editor / OS
 .DS_Store
 *.swp
