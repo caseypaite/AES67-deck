@@ -1645,6 +1645,50 @@ function pollDaemonState() {
 setInterval(pollDaemonState, DAEMON_POLL_INTERVAL_MS);
 pollDaemonState();
 
+// --- Box telemetry for the toolbar (CPU / RAM) ---------------------------
+let prevCpu: { total: number; idle: number } | null = null;
+function readCpuSample(): { total: number; idle: number } | null {
+  try {
+    const line = fs.readFileSync('/proc/stat', 'utf8').split('\n')[0]; // "cpu  u n s i io irq sirq steal ..."
+    const v = line.trim().split(/\s+/).slice(1).map(Number);
+    if (v.length < 5 || v.some((n) => !Number.isFinite(n))) return null;
+    const idle = v[3] + (v[4] || 0);
+    const total = v.reduce((a, b) => a + b, 0);
+    return { total, idle };
+  } catch { return null; }
+}
+function readMem(): { usedMB: number; totalMB: number } | null {
+  try {
+    const t = fs.readFileSync('/proc/meminfo', 'utf8');
+    const kb = (k: string) => {
+      const m = new RegExp(`^${k}:\\s+(\\d+)`, 'm').exec(t);
+      return m ? Number(m[1]) : NaN;
+    };
+    const total = kb('MemTotal');
+    const avail = kb('MemAvailable');
+    if (!Number.isFinite(total) || !Number.isFinite(avail)) return null;
+    return { usedMB: Math.round((total - avail) / 1024), totalMB: Math.round(total / 1024) };
+  } catch { return null; }
+}
+function broadcastServerStats() {
+  const cur = readCpuSample();
+  let cpu: number | null = null;
+  if (cur && prevCpu && cur.total > prevCpu.total) {
+    cpu = Math.round((1 - (cur.idle - prevCpu.idle) / (cur.total - prevCpu.total)) * 1000) / 10;
+  }
+  if (cur) prevCpu = cur;
+  const mem = readMem();
+  if (cpu == null && !mem) return;
+  broadcastToClients(JSON.stringify({
+    type: 'server_stats',
+    cpu,
+    memUsedMB: mem?.usedMB ?? null,
+    memTotalMB: mem?.totalMB ?? null,
+  }));
+}
+readCpuSample() && (prevCpu = readCpuSample());
+setInterval(broadcastServerStats, 2000);
+
 // --- Local microphone discovery (Talkback source dropdown) ---
 // Polls `pactl list sources` for real capture devices (not sink monitors),
 // classified as builtin/USB/jack by device.bus / device.form_factor and,
