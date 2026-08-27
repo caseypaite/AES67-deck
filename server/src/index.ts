@@ -19,6 +19,160 @@ if (!fs.existsSync(RACK_PRESETS_DIR)) {
   fs.mkdirSync(RACK_PRESETS_DIR);
 }
 
+// DAW projects (plan/daw-timeline-roadmap.md Phase 1c). A project is the
+// timeline arrangement — clips, markers, track layout — kept separate from
+// scenes (a live mixer snapshot). Each project is a directory:
+//   projects/<name>/project.json          the arrangement (UI is source of truth)
+//   projects/<name>/takes/<timestamp>/     ch<NN>.wav + take.json per recording
+const PROJECTS_DIR = path.join(process.cwd(), '..', 'projects');
+if (!fs.existsSync(PROJECTS_DIR)) {
+  fs.mkdirSync(PROJECTS_DIR);
+}
+const ACTIVE_PROJECT_PATH = path.join(PROJECTS_DIR, '.active');
+
+interface DawProject {
+  clips: any[];
+  markers: any[];
+  trackHeights: Record<string, number>;
+  loop?: { start: number; end: number; enabled: boolean };
+}
+
+function emptyProject(): DawProject {
+  return { clips: [], markers: [], trackHeights: {} };
+}
+
+function sanitizeProjectName(name: unknown): string {
+  const s = String(name || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+  return s.length > 0 ? s : 'default';
+}
+
+function projectDir(name: string): string {
+  return path.join(PROJECTS_DIR, sanitizeProjectName(name));
+}
+
+function ensureProject(name: string): void {
+  const dir = projectDir(name);
+  fs.mkdirSync(path.join(dir, 'takes'), { recursive: true });
+  const pj = path.join(dir, 'project.json');
+  if (!fs.existsSync(pj)) {
+    fs.writeFileSync(pj, JSON.stringify(emptyProject(), null, 2));
+  }
+}
+
+function listProjects(): string[] {
+  try {
+    return fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory() && !d.name.startsWith('.'))
+      .map(d => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+// Merge any recorded takes on disk that aren't yet represented as clips in
+// project.json (covers a take finishing while no UI was connected, or a UI
+// that never persisted). Dedupe by (takeDir, trackId).
+function projectWithOrphanTakes(name: string, project: DawProject): DawProject {
+  const takesRoot = path.join(projectDir(name), 'takes');
+  if (!fs.existsSync(takesRoot)) return project;
+  const known = new Set(
+    (project.clips || []).map((c: any) => `${c.takeDir || ''}::${c.trackId}`)
+  );
+  const clips = [...(project.clips || [])];
+  for (const takeName of fs.readdirSync(takesRoot).sort()) {
+    const manifestPath = path.join(takesRoot, takeName, 'take.json');
+    if (!fs.existsSync(manifestPath)) continue;
+    let m: any;
+    try { m = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { continue; }
+    for (const clip of takeManifestToClips(takeName, m)) {
+      if (known.has(`${clip.takeDir}::${clip.trackId}`)) continue;
+      clips.push(clip);
+    }
+  }
+  return { ...project, clips };
+}
+
+function loadProject(name: string): DawProject {
+  const pj = path.join(projectDir(name), 'project.json');
+  let project = emptyProject();
+  try {
+    if (fs.existsSync(pj)) {
+      const raw = JSON.parse(fs.readFileSync(pj, 'utf8'));
+      project = {
+        clips: Array.isArray(raw.clips) ? raw.clips : [],
+        markers: Array.isArray(raw.markers) ? raw.markers : [],
+        trackHeights: raw.trackHeights && typeof raw.trackHeights === 'object' ? raw.trackHeights : {},
+        loop: raw.loop && typeof raw.loop === 'object' ? raw.loop : undefined,
+      };
+    }
+  } catch (e) {
+    console.error(`Error loading project ${name}, starting fresh`, e);
+  }
+  return projectWithOrphanTakes(name, project);
+}
+
+let projectSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function saveProjectDebounced(name: string, project: DawProject): void {
+  ensureProject(name);
+  const pj = path.join(projectDir(name), 'project.json');
+  if (projectSaveTimer) clearTimeout(projectSaveTimer);
+  projectSaveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(pj, JSON.stringify(project, null, 2));
+    } catch (e) {
+      console.error(`Error saving project ${name}`, e);
+    }
+  }, 500);
+}
+
+// One take manifest -> one clip per recorded channel, in the DawClip shape the
+// UI store expects (start/length in seconds), plus source fields Phase 2
+// playback needs.
+function takeManifestToClips(takeName: string, m: any): any[] {
+  const sr = Number(m.sampleRate) > 0 ? Number(m.sampleRate) : 48000;
+  const origin = Number(m.originFrame) || 0;
+  const end = Number(m.endFrame) || origin;
+  const lengthSec = Math.max(0, (end - origin) / sr);
+  const armed: number[] = Array.isArray(m.armed) ? m.armed : [];
+  const label = takeName.replace(/T(\d\d)-(\d\d)-(\d\d).*/, ' $1:$2');
+  return armed.map((ch) => ({
+    id: (globalThis.crypto as Crypto).randomUUID(),
+    trackId: ch,
+    start: origin / sr,
+    length: lengthSec,
+    color: 'bg-red-600',
+    name: `Take${label} · CH${ch}`,
+    takeDir: takeName,
+    file: `ch${String(ch).padStart(2, '0')}.wav`,
+    originFrame: origin,
+    endFrame: end,
+    sampleRate: sr,
+  }));
+}
+
+let activeProjectName = 'default';
+try {
+  if (fs.existsSync(ACTIVE_PROJECT_PATH)) {
+    activeProjectName = sanitizeProjectName(fs.readFileSync(ACTIVE_PROJECT_PATH, 'utf8').trim());
+  }
+} catch { /* keep default */ }
+ensureProject(activeProjectName);
+
+function setActiveProject(name: string): void {
+  activeProjectName = sanitizeProjectName(name);
+  ensureProject(activeProjectName);
+  try {
+    fs.writeFileSync(ACTIVE_PROJECT_PATH, activeProjectName);
+  } catch (e) {
+    console.error('Could not persist active project name', e);
+  }
+}
+
+// The take directory the engine is currently recording into (set when we
+// issue start_multitrack_record, read when take_started/finished comes back).
+let activeTakeDir: string | null = null;
+
 const SOCKET_PATH = '/tmp/aes67_deck.sock';
 const WSS_PORT = parseInt(process.env.PORT || '8081', 10);
 
@@ -211,6 +365,10 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ type: 'mixer_state_loaded', state: mixerState }));
   }
 
+  // DAW: the active project (arrangement) and the project list.
+  ws.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
+  ws.send(JSON.stringify({ type: 'project_data', name: activeProjectName, project: loadProject(activeProjectName) }));
+
   ws.on('close', () => {
     connectedWsClients = connectedWsClients.filter(client => client !== ws);
     console.log('UI Client disconnected');
@@ -233,7 +391,11 @@ wss.on('connection', (ws) => {
         // Plugin-chain structure — engine applies these to the live
         // insert_chain (see engine/src/main.cpp's PluginCmd); the server
         // just forwards, same trust model as the params/bypass types above.
-        'add_plugin', 'remove_plugin', 'reorder_plugin', 'replace_plugin', 'load_rack'
+        'add_plugin', 'remove_plugin', 'reorder_plugin', 'replace_plugin', 'load_rack',
+        // Transport control — engine owns the clock; plain forward + fan-out
+        // to other clients (start/stop_multitrack_record are handled
+        // explicitly below because the server injects the take directory).
+        'transport_play', 'transport_stop', 'transport_locate', 'transport_set_loop'
       ];
       if (data.type === 'save_scene') {
         const safeName = data.name.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -403,6 +565,71 @@ wss.on('connection', (ws) => {
           if (!res.ok) console.error(`daemon_set_ptp failed (${res.status})`, res.json);
           await refreshDaemonState();
         });
+      } else if (data.type === 'list_projects') {
+        ws.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
+      } else if (data.type === 'load_project') {
+        const name = sanitizeProjectName(data.name);
+        setActiveProject(name);
+        const project = loadProject(name);
+        // Persist back so any orphan takes that were merged in stick.
+        saveProjectDebounced(name, project);
+        connectedWsClients.forEach(c => {
+          if (c.readyState === WebSocket.OPEN) {
+            c.send(JSON.stringify({ type: 'project_data', name, project }));
+          }
+        });
+        connectedWsClients.forEach(c => {
+          if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
+        });
+      } else if (data.type === 'new_project') {
+        const name = sanitizeProjectName(data.name);
+        ensureProject(name);
+        setActiveProject(name);
+        const project = emptyProject();
+        fs.writeFileSync(path.join(projectDir(name), 'project.json'), JSON.stringify(project, null, 2));
+        connectedWsClients.forEach(c => {
+          if (c.readyState === WebSocket.OPEN) {
+            c.send(JSON.stringify({ type: 'project_data', name, project }));
+            c.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
+          }
+        });
+      } else if (data.type === 'save_project') {
+        const name = sanitizeProjectName(data.name);
+        const p = data.project || {};
+        const project: DawProject = {
+          clips: Array.isArray(p.clips) ? p.clips : [],
+          markers: Array.isArray(p.markers) ? p.markers : [],
+          trackHeights: p.trackHeights && typeof p.trackHeights === 'object' ? p.trackHeights : {},
+          loop: p.loop && typeof p.loop === 'object' ? p.loop : undefined,
+        };
+        saveProjectDebounced(name, project);
+        // Fan out so other connected clients converge on the same arrangement.
+        connectedWsClients.forEach(c => {
+          if (c !== ws && c.readyState === WebSocket.OPEN) {
+            c.send(JSON.stringify({ type: 'project_data', name, project }));
+          }
+        });
+      } else if (data.type === 'start_multitrack_record') {
+        const armed: number[] = Array.isArray(data.armed)
+          ? data.armed.filter((n: any) => Number.isInteger(n) && n >= 1 && n <= NUM_CHANNELS)
+          : [];
+        if (armed.length === 0) {
+          ws.send(JSON.stringify({ type: 'take_failed', reason: 'no armed tracks' }));
+        } else if (!engineSocket) {
+          ws.send(JSON.stringify({ type: 'take_failed', reason: 'engine not connected' }));
+        } else {
+          ensureProject(activeProjectName);
+          const ts = new Date().toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
+          activeTakeDir = path.join(projectDir(activeProjectName), 'takes', ts);
+          fs.mkdirSync(activeTakeDir, { recursive: true });
+          engineSocket.write(JSON.stringify({
+            type: 'start_multitrack_record',
+            dir: path.resolve(activeTakeDir),
+            armed,
+          }) + '\n');
+        }
+      } else if (data.type === 'stop_multitrack_record') {
+        if (engineSocket) engineSocket.write(JSON.stringify({ type: 'stop_multitrack_record' }) + '\n');
       } else if (data.type && allowedTypes.includes(data.type)) {
         // Intercept mixer state changes: update in-memory snapshot, persist
         // to disk (debounced), and fan-out to all other connected clients.
@@ -455,6 +682,60 @@ if (fs.existsSync(SOCKET_PATH)) {
 }
 
 let engineSocket: net.Socket | null = null;
+
+// Engine reports a multitrack take has begun: write the take manifest so the
+// recording is self-describing on disk regardless of what the UI does. Still
+// forwarded to the UI (return false) as a recording-confirmed signal.
+function handleTakeStarted(msg: any): boolean {
+  if (!activeTakeDir) return false;
+  try {
+    fs.writeFileSync(path.join(activeTakeDir, 'take.json'), JSON.stringify({
+      originFrame: Number(msg.originFrame) || 0,
+      sampleRate: Number(msg.sampleRate) || 48000,
+      armed: Array.isArray(msg.armed) ? msg.armed : [],
+      channels: 2,
+      project: activeProjectName,
+      startedAt: new Date().toISOString(),
+    }, null, 2));
+  } catch (e) {
+    console.error('Could not write take.json', e);
+  }
+  return false;
+}
+
+// Engine reports a take has closed: turn it into clips, hand them to every UI
+// as `take_committed` (the raw take_finished line is not forwarded).
+function handleTakeFinished(msg: any): boolean {
+  const takeDir = activeTakeDir;
+  activeTakeDir = null;
+  if (!takeDir) return false;
+  const takeName = path.basename(takeDir);
+
+  const manifest = {
+    originFrame: Number(msg.originFrame) || 0,
+    endFrame: Number(msg.endFrame) || 0,
+    sampleRate: Number(msg.sampleRate) || 48000,
+    armed: Array.isArray(msg.armed) ? msg.armed : [],
+  };
+  try {
+    // Merge end frame into the manifest written at take_started.
+    const p = path.join(takeDir, 'take.json');
+    const existing = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
+    fs.writeFileSync(p, JSON.stringify({ ...existing, ...manifest, overrun: !!msg.overrun }, null, 2));
+  } catch (e) {
+    console.error('Could not finalise take.json', e);
+  }
+
+  const clips = takeManifestToClips(takeName, manifest);
+  broadcastToClients(JSON.stringify({
+    type: 'take_committed',
+    project: activeProjectName,
+    takeDir: takeName,
+    overrun: !!msg.overrun,
+    clips,
+  }));
+  return true;
+}
 
 const ipcServer = net.createServer((socket) => {
   if (engineSocket) {
@@ -514,19 +795,32 @@ const ipcServer = net.createServer((socket) => {
 
     for (const line of lines) {
       if (line.trim().length > 0) {
+        let handled = false;
         try {
           const parsed = JSON.parse(line);
           if (parsed.type === 'plugin_list' && Array.isArray(parsed.plugins)) {
             lastPluginCatalog = parsed.plugins;
+          } else if (parsed.type === 'take_started') {
+            handled = handleTakeStarted(parsed);
+          } else if (parsed.type === 'take_finished') {
+            handled = handleTakeFinished(parsed);
+          } else if (parsed.type === 'take_failed') {
+            // Engine couldn't open the files — bin the empty take dir.
+            if (activeTakeDir && fs.existsSync(activeTakeDir)) {
+              try { fs.rmSync(activeTakeDir, { recursive: true, force: true }); } catch { /* ignore */ }
+            }
+            activeTakeDir = null;
           }
         } catch {
           // Not JSON or not a message we care about caching; still forward below.
         }
-        connectedWsClients.forEach(ws => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(line);
-          }
-        });
+        if (!handled) {
+          connectedWsClients.forEach(ws => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(line);
+            }
+          });
+        }
       }
     }
   });
