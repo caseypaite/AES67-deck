@@ -80,6 +80,11 @@ interface MixerState {
   // log-spaced spectrum (dBFS), L/R correlation [-1,1], goniometer scatter.
   masterAnalysis: { rta: number[]; corr: number; gonio: number[] } | null;
 
+  // Toolbar telemetry: box CPU/RAM (server `server_stats`), audio round-trip
+  // latency (2 × engine block size / sample rate, from the metering frame).
+  serverStats: { cpu: number | null; memUsedMB: number | null; memTotalMB: number | null } | null;
+  audioLatencyMs: number | null;
+
   // Replace a channel's whole plugin chain (used by mastering presets).
   applyRack: (channelId: number, plugins: { uri: string; enabled?: boolean; params?: Record<string, number> }[]) => void;
 
@@ -237,6 +242,8 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   fxMeter: null,
   lufs: null,
   masterAnalysis: null,
+  serverStats: null,
+  audioLatencyMs: null,
   channels: buildChannels(),
   activeView: 'mixer',
   transportState: 'stopped',
@@ -700,6 +707,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           if (data.lufs) set({ lufs: data.lufs });
           if (data.master) set({ masterAnalysis: data.master });
           if (data.recPeaks) useDawStore.getState().pushRecPeaks(data.recPeaks);
+          if (data.transport?.buf && data.transport?.sr) {
+            const ms = Math.round((2 * data.transport.buf / data.transport.sr) * 1000 * 10) / 10;
+            if (get().audioLatencyMs !== ms) set({ audioLatencyMs: ms });
+          }
           if (data.transport) {
             const t = data.transport;
             // Engine transport is authoritative for both position and state.
@@ -715,6 +726,8 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           useDawStore.getState().loadProjectData(data.name, data.project);
         } else if (data.type === 'projects_list') {
           useDawStore.getState().setProjectList(data.projects || [], data.active);
+        } else if (data.type === 'server_stats') {
+          set({ serverStats: { cpu: data.cpu ?? null, memUsedMB: data.memUsedMB ?? null, memTotalMB: data.memTotalMB ?? null } });
         } else if (data.type === 'recording_projects_list') {
           useDawStore.getState().setRecordingProjects(data.projects || [], data.active ?? null);
         } else if (data.type === 'recording_project_error') {

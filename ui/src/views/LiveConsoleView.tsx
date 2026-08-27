@@ -11,6 +11,38 @@ import { LufsPanel } from '../components/mixer/LufsPanel';
 import { MasteringPanel } from '../components/mixer/MasteringPanel';
 import { SaveDialog, ConfirmDialog } from '../components/common/SaveDialog';
 
+// Compact box/engine telemetry for the right end of the toolbar:
+// CPU load and RAM from the server, audio round-trip latency from the engine.
+const StatCell = ({ label, value, tone }: { label: string; value: string; tone: string }) => (
+  <div className="flex flex-col items-end leading-none">
+    <span className="text-[8px] font-black tracking-widest text-gray-600">{label}</span>
+    <span className={`text-[11px] font-mono font-bold ${tone}`}>{value}</span>
+  </div>
+);
+const tone = (v: number | null, warn: number, bad: number) =>
+  v == null ? 'text-gray-600' : v >= bad ? 'text-red-400' : v >= warn ? 'text-amber-400' : 'text-green-400';
+
+const ServerStats = ({ stats, latencyMs }: {
+  stats: { cpu: number | null; memUsedMB: number | null; memTotalMB: number | null } | null;
+  latencyMs: number | null;
+}) => {
+  const cpu = stats?.cpu ?? null;
+  const used = stats?.memUsedMB ?? null;
+  const total = stats?.memTotalMB ?? null;
+  const memPct = used != null && total ? (used / total) * 100 : null;
+  return (
+    <div className="flex items-center gap-3 bg-[#050608] px-3 py-1 rounded border border-gray-800 shadow-inner">
+      <StatCell label="CPU" value={cpu == null ? '—' : `${cpu.toFixed(0)}%`} tone={tone(cpu, 60, 85)} />
+      <StatCell
+        label="RAM"
+        value={used == null || !total ? '—' : `${(used / 1024).toFixed(1)}/${(total / 1024).toFixed(1)}G`}
+        tone={tone(memPct, 75, 90)}
+      />
+      <StatCell label="LAT" value={latencyMs == null ? '—' : `${latencyMs.toFixed(1)}ms`} tone={tone(latencyMs, 12, 25)} />
+    </div>
+  );
+};
+
 // One vertical send fader — shared by AuxSendsPanel (columns = destination
 // buses, for a selected input channel) and SourceSendsPanel (columns =
 // source input channels, for a selected bus) since both are just "pick a
@@ -293,6 +325,8 @@ export const LiveConsoleView = () => {
   const openRecordingProject = useDawStore(state => state.openRecordingProject);
   const refreshRecordingProjects = useDawStore(state => state.refreshRecordingProjects);
   const toggleTransport = useMixerStore(state => state.toggleTransport);
+  const serverStats = useMixerStore(state => state.serverStats);
+  const audioLatencyMs = useMixerStore(state => state.audioLatencyMs);
   const activeView = useMixerStore(state => state.activeView);
   const setActiveView = useMixerStore(state => state.setActiveView);
   const selectedChannelId = useMixerStore(state => state.selectedChannelId);
@@ -457,9 +491,13 @@ export const LiveConsoleView = () => {
            </button>
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-          <div className="text-gray-400 font-bold tracking-widest text-xs">AES67-DECK</div>
+        <div className="flex items-center gap-3">
+          <ServerStats stats={serverStats} latencyMs={audioLatencyMs} />
+          <div className="w-px h-5 bg-gray-700" />
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+            <div className="text-gray-400 font-bold tracking-widest text-xs">AES67-DECK</div>
+          </div>
         </div>
       </div>
 
