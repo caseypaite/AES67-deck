@@ -1,9 +1,15 @@
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { execFileSync } from 'child_process';
 
 // Minimal RIFF/WAVE reader for the float (and 16-bit PCM) files the engine
 // writes, plus a min/max peak reducer at a few zoom tiers for waveform
 // drawing. Everything the timeline needs is the mono-summed envelope, so
 // that's all we keep — half the data of per-channel.
+//
+// Take files are lossless WavPack (.wv); those are decoded to a temp WAV via
+// `wvunpack` before parsing (the `wavpack` package must be installed).
 
 export const PEAK_TIERS = [256, 2048, 16384]; // frames per min/max pair
 
@@ -15,8 +21,25 @@ interface WavData {
   samples: Float32Array;
 }
 
-function readWav(path: string): WavData | null {
-  const b = fs.readFileSync(path);
+// Read a take file as a RIFF/WAVE buffer, decoding WavPack on the way.
+function readAudio(filePath: string): WavData | null {
+  if (/\.wv$/i.test(filePath)) {
+    const tmp = path.join(os.tmpdir(), `aes67-peaks-${process.pid}-${Date.now()}.wav`);
+    try {
+      execFileSync('wvunpack', ['-y', '-q', '-w', filePath, '-o', tmp], { stdio: 'ignore' });
+      const out = parseWav(fs.readFileSync(tmp));
+      return out;
+    } catch (e) {
+      console.error(`wvunpack failed for ${filePath}`, e);
+      return null;
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  }
+  return parseWav(fs.readFileSync(filePath));
+}
+
+function parseWav(b: Buffer): WavData | null {
   if (b.length < 44 || b.toString('ascii', 0, 4) !== 'RIFF' || b.toString('ascii', 8, 12) !== 'WAVE') {
     return null;
   }
@@ -69,8 +92,8 @@ export interface PeaksFile {
   rmsTiers: Record<string, number[]>;  // tier -> [rms,rms,...] mono, one per bucket
 }
 
-export function computePeaks(wavPath: string): PeaksFile | null {
-  const w = readWav(wavPath);
+export function computePeaks(srcPath: string): PeaksFile | null {
+  const w = readAudio(srcPath);
   if (!w) return null;
   const { channels, frames, samples } = w;
 
@@ -105,18 +128,18 @@ export function computePeaks(wavPath: string): PeaksFile | null {
   return { version: 2, sampleRate: w.sampleRate, frames, tiers, rmsTiers };
 }
 
-// Compute peaks for wavPath and cache next to it as <name>.peaks.json.
-// Returns the cached/created peaks, or null if the wav couldn't be read.
-export function ensurePeaks(wavPath: string): PeaksFile | null {
-  const cachePath = wavPath.replace(/\.wav$/i, '') + '.peaks.json';
+// Compute peaks for a take file and cache next to it as <name>.peaks.json.
+// Returns the cached/created peaks, or null if the file couldn't be read.
+export function ensurePeaks(srcPath: string): PeaksFile | null {
+  const cachePath = srcPath.replace(/\.(wav|wv)$/i, '') + '.peaks.json';
   try {
-    if (fs.existsSync(cachePath) && fs.statSync(cachePath).mtimeMs >= fs.statSync(wavPath).mtimeMs) {
+    if (fs.existsSync(cachePath) && fs.statSync(cachePath).mtimeMs >= fs.statSync(srcPath).mtimeMs) {
       const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8')) as PeaksFile;
       if (cached.version === 2) return cached;
       // fall through to recompute stale (v1) caches
     }
   } catch { /* recompute */ }
-  const peaks = computePeaks(wavPath);
+  const peaks = computePeaks(srcPath);
   if (peaks) {
     try { fs.writeFileSync(cachePath, JSON.stringify(peaks)); } catch { /* best effort */ }
   }

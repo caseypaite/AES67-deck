@@ -136,6 +136,7 @@ function takeManifestToClips(takeName: string, m: any): any[] {
   const end = Number(m.endFrame) || origin;
   const lengthSec = Math.max(0, (end - origin) / sr);
   const armed: number[] = Array.isArray(m.armed) ? m.armed : [];
+  const ext = typeof m.ext === 'string' && /^[a-z0-9]{2,4}$/.test(m.ext) ? m.ext : 'wv';
   const label = takeName.replace(/T(\d\d)-(\d\d)-(\d\d).*/, ' $1:$2');
   return armed.map((ch) => ({
     id: (globalThis.crypto as Crypto).randomUUID(),
@@ -145,7 +146,7 @@ function takeManifestToClips(takeName: string, m: any): any[] {
     color: 'bg-red-600',
     name: `Take${label} · CH${ch}`,
     takeDir: takeName,
-    file: `ch${String(ch).padStart(2, '0')}.wav`,
+    file: `ch${String(ch).padStart(2, '0')}.${ext}`,
     originFrame: origin,
     endFrame: end,
     sampleRate: sr,
@@ -639,10 +640,10 @@ wss.on('connection', (ws) => {
         // file on first request, then serve from disk.
         const takeDir = String(data.takeDir || '').replace(/[^0-9A-Za-z:_-]/g, '');
         const file = String(data.file || '').replace(/[^0-9A-Za-z._-]/g, '');
-        if (takeDir && /^ch\d+\.wav$/.test(file)) {
-          const wavPath = path.join(projectDir(activeProjectName), 'takes', takeDir, file);
+        if (takeDir && /^ch\d+\.(wav|wv)$/.test(file)) {
+          const srcPath = path.join(projectDir(activeProjectName), 'takes', takeDir, file);
           setImmediate(() => {
-            const peaks = fs.existsSync(wavPath) ? ensurePeaks(wavPath) : null;
+            const peaks = fs.existsSync(srcPath) ? ensurePeaks(srcPath) : null;
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'clip_peaks', clipId: data.clipId, takeDir, file, peaks }));
             }
@@ -734,6 +735,7 @@ function handleTakeFinished(msg: any): boolean {
     endFrame: Number(msg.endFrame) || 0,
     sampleRate: Number(msg.sampleRate) || 48000,
     armed: Array.isArray(msg.armed) ? msg.armed : [],
+    ext: typeof msg.ext === 'string' ? msg.ext : 'wv',
   };
   try {
     // Merge end frame into the manifest written at take_started.
