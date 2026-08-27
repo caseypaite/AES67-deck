@@ -39,7 +39,7 @@ export interface DaemonSink {
   capturePorts?: string[];
 }
 
-// Resolved state for one of the 4 fixed transmit groups (Phase 2), from the
+// Resolved state for one transmit group (Master / Monitor / AUX 1..8), from the
 // server's `daemon_state.txSources`.
 export interface TxSourceResolved {
   key: string;

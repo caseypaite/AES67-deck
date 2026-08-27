@@ -325,7 +325,7 @@ const OUTPUT_ROUTING_PATH = 'output_routing.json';
 const TALKBACK_CONFIG_PATH = 'talkback_config.json';
 const MIXER_STATE_PATH = 'mixer_state.json';
 // Phase 2 (plan/unified-aes67-network-control.md): operator overrides for the
-// 4 fixed transmit-Source groups, and the AES67_Source capture-channel block
+// fixed transmit-Source groups (Master, Monitor, Aux 1..8), and the AES67_Source capture-channel block
 // allocated to each subscribed receive Sink.
 const TX_SOURCES_PATH = 'tx_sources.json';
 const RX_SINKS_PATH = 'rx_sinks.json';
@@ -698,7 +698,7 @@ wss.on('connection', (ws) => {
           await refreshDaemonState();
         });
       } else if (data.type === 'set_tx_source') {
-        // Phase 2: enable/disable/rename one of the 4 fixed transmit groups.
+        // Phase 2: enable/disable/rename one transmit group (Master / Monitor / Aux 1..8).
         // Persist the override then converge the daemon.
         runDaemonOp(async () => {
           const key = String(data.key || '');
@@ -1318,8 +1318,9 @@ function sdpAddress(sdp: string): string {
 // auto-allocates AES67_Source capture channels to subscribed Sinks.
 // ===========================================================================
 
-// --- Transmit: 4 fixed Source groups, each reading a block of AES67_Sink
-//     playout channels the engine is pinned to (see applyBroadcastRouting). ---
+// --- Transmit: fixed stereo Source groups, each reading a pair of AES67_Sink
+//     playout channels the engine is pinned to (see applyBroadcastRouting).
+//     Master, Monitor, and Aux 1..8 — each its own 2-channel AES67 stream. ---
 interface TxSourceGroup {
   key: string;
   defaultName: string;
@@ -1328,16 +1329,14 @@ interface TxSourceGroup {
 }
 
 const TX_SOURCE_PLAN: TxSourceGroup[] = [
-  { key: 'master',  defaultName: 'Deck Master',  map: [0, 1],
-    enginePorts: ['out_L', 'out_R'] },
-  { key: 'monitor', defaultName: 'Deck Monitor', map: [2, 3],
-    enginePorts: ['monitor_L', 'monitor_R'] },
-  { key: 'aux1-4',  defaultName: 'Deck AUX 1-4', map: [4, 5, 6, 7, 8, 9, 10, 11],
-    enginePorts: ['bus_101_L', 'bus_101_R', 'bus_102_L', 'bus_102_R',
-                  'bus_103_L', 'bus_103_R', 'bus_104_L', 'bus_104_R'] },
-  { key: 'aux5-8',  defaultName: 'Deck AUX 5-8', map: [12, 13, 14, 15, 16, 17, 18, 19],
-    enginePorts: ['bus_105_L', 'bus_105_R', 'bus_106_L', 'bus_106_R',
-                  'bus_107_L', 'bus_107_R', 'bus_108_L', 'bus_108_R'] }
+  { key: 'master',  defaultName: 'Deck Master',  map: [0, 1], enginePorts: ['out_L', 'out_R'] },
+  { key: 'monitor', defaultName: 'Deck Monitor', map: [2, 3], enginePorts: ['monitor_L', 'monitor_R'] },
+  ...Array.from({ length: NUM_AUX }, (_, i) => ({
+    key: `aux${i + 1}`,
+    defaultName: `Deck AUX ${i + 1}`,
+    map: [4 + i * 2, 5 + i * 2],
+    enginePorts: [`bus_${AUX_BASE + i}_L`, `bus_${AUX_BASE + i}_R`],
+  })),
 ];
 
 // sourceId: the daemon Source id this group currently owns (null = none). It's
@@ -1355,6 +1354,14 @@ function getTxSourcePrefs(): TxSourcePrefs {
   try {
     if (fs.existsSync(TX_SOURCES_PATH)) {
       const raw = JSON.parse(fs.readFileSync(TX_SOURCES_PATH, 'utf8'));
+      // Migrate the old 8-channel bundled aux groups to the per-aux stereo
+      // ones: if aux1-4 was enabled, aux1..4 start enabled (and vice versa).
+      for (const [legacy, targets] of [['aux1-4', [1, 2, 3, 4]], ['aux5-8', [5, 6, 7, 8]]] as const) {
+        const lv = raw?.[legacy];
+        if (lv && typeof lv === 'object' && raw[`aux${targets[0]}`] === undefined) {
+          for (const n of targets) if (typeof lv.enabled === 'boolean') prefs[`aux${n}`].enabled = lv.enabled;
+        }
+      }
       for (const g of TX_SOURCE_PLAN) {
         const v = raw?.[g.key];
         if (v && typeof v === 'object') {
@@ -1377,10 +1384,22 @@ function saveTxSourcePrefs(prefs: TxSourcePrefs) {
 // Converge the daemon's transmit Sources to the enabled TX groups. Each group
 // owns one Source, tracked by id (name is a fallback for adoption). Returns
 // true if it issued any PUT/DELETE (so the caller re-fetches before broadcast).
-async function reconcileTxSources(daemonSources: any[]): Promise<boolean> {
+async function reconcileTxSources(daemonSourcesIn: any[]): Promise<boolean> {
   const prefs = getTxSourcePrefs();
   let changed = false;
   let prefsDirty = false;
+
+  // Sweep the legacy bundled aux sources ("Deck AUX 1-4" / "5-8", >2 channels)
+  // from the old 2-group layout, so their daemon ids free up for the new
+  // per-aux stereo sources created below.
+  let daemonSources = daemonSourcesIn;
+  const legacy = daemonSources.filter((s: any) =>
+    /^Deck AUX [15]-[48]$/.test(String(s.name)) && Array.isArray(s.map) && s.map.length > 2);
+  for (const s of legacy) {
+    const res = await daemonRequest('DELETE', `/api/source/${s.id}`);
+    if (res.ok) { changed = true; console.log(`reconcileTxSources: removed legacy bundled source "${s.name}"`); }
+  }
+  if (legacy.length) daemonSources = daemonSources.filter((s: any) => !legacy.includes(s));
 
   for (const g of TX_SOURCE_PLAN) {
     const pref = prefs[g.key];
@@ -1406,8 +1425,14 @@ async function reconcileTxSources(daemonSources: any[]): Promise<boolean> {
         ttl: 15, payload_type: 98, dscp: 34, refclk_ptp_traceable: false
       };
       const res = await daemonRequest('PUT', `/api/source/${id}`, body);
-      if (res.ok) changed = true;
-      else console.error(`reconcileTxSources PUT ${g.key} failed (${res.status})`, res.json);
+      if (res.ok) {
+        changed = true;
+        // Reflect the new/updated source in the working snapshot so the next
+        // group in this pass doesn't pick the same free id.
+        daemonSources = [...daemonSources.filter((s: any) => Number(s.id) !== id), { ...body, id }];
+      } else {
+        console.error(`reconcileTxSources PUT ${g.key} failed (${res.status})`, res.json);
+      }
     } else {
       if (existing) {
         const res = await daemonRequest('DELETE', `/api/source/${existing.id}`);

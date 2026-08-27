@@ -5,9 +5,9 @@ import { useMixerStore } from '../../stores/useMixerStore';
 // Unified aes67-linux-daemon control, surfaced inside the deck so the operator
 // never has to open the separate daemon WebUI on :8080. Read-only PTP/clock
 // status, create/delete for receive Sinks (auto-mapped onto mixer input
-// channels), and the 4 fixed transmit groups (Master / Monitor / AUX 1-4 /
-// AUX 5-8). All state comes from the server's `daemon_state` broadcast; every
-// mutation is a WS message the server proxies to the daemon's REST API.
+// channels), and the fixed transmit groups (Master / Monitor / AUX 1..8, each
+// its own stereo stream). All state comes from the server's `daemon_state`
+// broadcast; every mutation is a WS message the server proxies to the daemon.
 
 const send = (msg: Record<string, unknown>) => {
   const ws = useMixerStore.getState().ws;
