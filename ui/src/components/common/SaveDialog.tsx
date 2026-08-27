@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
-// Shared modal shell — matches the patchbay/FX dialog style.
+// Shared modal shell — matches the patchbay/FX dialog style. Rendered through
+// a portal to <body> so it clears every ancestor stacking context / overflow
+// clip (mastering panel, FX rack, …), not just its local subtree.
 function Shell({ title, onClose, children, width = 340 }: {
   title: string; onClose: () => void; children: React.ReactNode; width?: number;
 }) {
@@ -9,8 +12,8 @@ function Shell({ title, onClose, children, width = 340 }: {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
-  return (
-    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70" onClick={onClose}>
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70" onClick={onClose}>
       <div
         className="bg-[#1a1c22] border border-[#2a2d33] rounded-sm p-4 flex flex-col gap-3 shadow-2xl"
         style={{ width }}
@@ -19,7 +22,8 @@ function Shell({ title, onClose, children, width = 340 }: {
         <div className="font-bold text-white text-sm">{title}</div>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
