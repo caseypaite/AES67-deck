@@ -699,6 +699,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           set({ fxMeter: data.fx ?? null });
           if (data.lufs) set({ lufs: data.lufs });
           if (data.master) set({ masterAnalysis: data.master });
+          if (data.recPeaks) useDawStore.getState().pushRecPeaks(data.recPeaks);
           if (data.transport) {
             const t = data.transport;
             // Engine transport is authoritative for both position and state.
@@ -718,7 +719,13 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           useDawStore.getState().setRecordingProjects(data.projects || [], data.active ?? null);
         } else if (data.type === 'recording_project_error') {
           useDawStore.getState().setRecordingProjectError(data.reason || 'error');
+        } else if (data.type === 'take_started') {
+          const sr = Number(data.sampleRate) || 48000;
+          useDawStore.getState().beginRecordingClips(
+            Array.isArray(data.armed) ? data.armed : [],
+            (Number(data.originFrame) || 0) / sr, sr);
         } else if (data.type === 'take_committed') {
+          useDawStore.getState().endRecordingClips();
           useDawStore.getState().addCommittedClips(data.clips || [], !!data.overrun);
         } else if (data.type === 'clip_peaks') {
           if (data.peaks && data.takeDir && data.file) {
@@ -726,6 +733,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           }
         } else if (data.type === 'take_failed') {
           console.warn('multitrack take failed:', data.reason || 'unknown');
+          useDawStore.getState().endRecordingClips();
           set({ transportState: 'stopped' });
         }
       } catch (e) {

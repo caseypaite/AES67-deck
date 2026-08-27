@@ -21,6 +21,7 @@ export interface DawClip {
   gain?: number;         // linear playback gain, default 1
   fadeIn?: number;       // seconds — fade-in ramp at the clip head
   fadeOut?: number;      // seconds — fade-out ramp at the clip tail
+  recording?: boolean;   // transient placeholder growing during a live take
 }
 
 export interface DawMarker {
@@ -77,6 +78,11 @@ interface DawState {
   dragOverTrackId: number | null;         // lane highlighted as a vertical-move target
   marquee: { x0: number; y0: number; x1: number; y1: number } | null;
 
+  // Live recording: placeholder clips that grow with the transport, plus the
+  // coarse min/max envelope streamed on the metering frame. Cleared on commit.
+  recordingClips: Record<number, string>;          // trackId -> placeholder clip id
+  livePeaks: Record<string, number[]>;             // clip id -> flat [min,max,min,max,...]
+
   snapToGrid: boolean;
   gridSize: number;               // seconds
 
@@ -100,6 +106,10 @@ interface DawState {
 
   applyTransport: (frame: number, state: number, sr: number) => void;
   flagPlaybackUnderrun: () => void;
+
+  beginRecordingClips: (armed: number[], originSec: number, sr: number) => void;
+  pushRecPeaks: (byTrack: Record<string, number[]>) => void;
+  endRecordingClips: () => void;
 
   setPeaks: (key: string, data: PeaksData) => void;
   ensureClipPeaks: (clip: DawClip) => void;
@@ -162,7 +172,7 @@ export function formatTimecode(sec: number, fps: number): string {
 
 function serializeProject(s: DawState) {
   return {
-    clips: Object.values(s.clips),
+    clips: Object.values(s.clips).filter((c) => !c.recording),
     markers: Object.values(s.markers),
     trackHeights: s.trackHeights,
   };
@@ -220,6 +230,8 @@ export const useDawStore = create<DawState>()(
 
       dragOverTrackId: null,
       marquee: null,
+      recordingClips: {},
+      livePeaks: {},
 
       snapToGrid: true,
       gridSize: 1.0,
@@ -280,6 +292,19 @@ export const useDawStore = create<DawState>()(
         let recordOriginSec = s.recordOriginSec;
         if (st === 2 && s.engineState !== 2) recordOriginSec = sec; // take just started
         else if (st === 0) recordOriginSec = null;                  // parked
+        // Grow the live recording placeholders with the transport.
+        let clips = s.clips;
+        if (st === 2 && Object.keys(s.recordingClips).length) {
+          const origin = recordOriginSec ?? 0;
+          const len = Math.max(0, sec - origin);
+          const next = { ...clips };
+          for (const id of Object.values(s.recordingClips)) {
+            const c = next[id];
+            if (c) next[id] = { ...c, length: len };
+          }
+          clips = next;
+        }
+
         set({
           engineFrame: frame,
           engineState: st,
@@ -287,8 +312,53 @@ export const useDawStore = create<DawState>()(
           recordOriginSec,
           _engineSec: sec,
           _engineWall: performance.now(),
+          ...(clips !== s.clips ? { clips } : {}),
           // When stopped, snap exactly; while rolling, tickPlayhead interpolates.
           ...(st === 0 ? { playheadPosition: sec, timecode: formatTimecode(sec, s.fps) } : {}),
+        });
+      },
+
+      beginRecordingClips: (armed, originSec, sr) => {
+        set((state) => {
+          const recordingClips: Record<number, string> = {};
+          const livePeaks: Record<string, number[]> = {};
+          const nextClips = { ...state.clips };
+          for (const trackId of armed) {
+            const id = uuid();
+            recordingClips[trackId] = id;
+            livePeaks[id] = [];
+            nextClips[id] = {
+              id, trackId, start: originSec, length: 0,
+              color: 'bg-red-600', name: 'Recording…',
+              sampleRate: sr, recording: true,
+            };
+          }
+          return { clips: nextClips, recordingClips, livePeaks };
+        });
+      },
+
+      pushRecPeaks: (byTrack) => {
+        set((state) => {
+          if (!Object.keys(state.recordingClips).length) return state;
+          const livePeaks = { ...state.livePeaks };
+          for (const [tid, pairs] of Object.entries(byTrack)) {
+            const id = state.recordingClips[Number(tid)];
+            if (!id || !Array.isArray(pairs) || pairs.length < 2) continue;
+            const arr = livePeaks[id] ? livePeaks[id].slice() : [];
+            for (let i = 0; i + 1 < pairs.length; i += 2) arr.push(pairs[i], pairs[i + 1]);
+            if (arr.length > 400000) arr.splice(0, arr.length - 400000); // cap
+            livePeaks[id] = arr;
+          }
+          return { livePeaks };
+        });
+      },
+
+      endRecordingClips: () => {
+        set((state) => {
+          if (!Object.keys(state.recordingClips).length) return state;
+          const nextClips = { ...state.clips };
+          for (const id of Object.values(state.recordingClips)) delete nextClips[id];
+          return { clips: nextClips, recordingClips: {}, livePeaks: {} };
         });
       },
 
@@ -518,7 +588,7 @@ export const useDawStore = create<DawState>()(
       name: 'aes67-daw-project',
       partialize: (s) => ({
         projectName: s.projectName,
-        clips: s.clips,
+        clips: Object.fromEntries(Object.entries(s.clips).filter(([, c]) => !c.recording)),
         markers: s.markers,
         trackHeights: s.trackHeights,
         zoom: s.zoom,

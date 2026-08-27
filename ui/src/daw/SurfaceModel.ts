@@ -142,6 +142,7 @@ export class SurfaceModel {
     // Front-most clip first (last drawn wins visually).
     for (let i = clips.length - 1; i >= 0; i--) {
       const c = clips[i];
+      if (c.recording) continue; // the live take placeholder isn't editable
       const x0 = this.timeToX(c.start);
       const x1 = this.timeToX(c.start + c.length);
       if (px < x0 - 1 || px > x1 + 1) continue;
@@ -272,10 +273,14 @@ export class SurfaceModel {
     ctx.beginPath();
     ctx.rect(x, g.waveTop, wClip, g.waveH);
     ctx.clip();
-    const key = clipPeakKey(c);
-    const pk = key ? peaks[key] : undefined;
-    if (pk) this.drawWave(ctx, c, pk, x0, x1, g.waveTop, g.waveH, base);
-    else useDawStore.getState().ensureClipPeaks(c);
+    if (c.recording) {
+      this.drawLiveWave(ctx, c, x0, x1, g.waveTop, g.waveH, base);
+    } else {
+      const key = clipPeakKey(c);
+      const pk = key ? peaks[key] : undefined;
+      if (pk) this.drawWave(ctx, c, pk, x0, x1, g.waveTop, g.waveH, base);
+      else useDawStore.getState().ensureClipPeaks(c);
+    }
 
     // fade ramps (drawn over the waveform, darkening the ramp region)
     this.drawFades(ctx, c, x0, x1, g.waveTop, g.waveH);
@@ -291,9 +296,15 @@ export class SurfaceModel {
     }
     ctx.restore();
 
-    // border
-    ctx.strokeStyle = sel ? '#ffffff' : rgba(mix(base, WHITE, 0.25), 0.5);
-    ctx.lineWidth = sel ? 1.5 : 1;
+    // border — recording placeholders pulse
+    if (c.recording) {
+      const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 180);
+      ctx.strokeStyle = `rgba(255,90,90,${pulse.toFixed(3)})`;
+      ctx.lineWidth = 2;
+    } else {
+      ctx.strokeStyle = sel ? '#ffffff' : rgba(mix(base, WHITE, 0.25), 0.5);
+      ctx.lineWidth = sel ? 1.5 : 1;
+    }
     this.roundRectPath(ctx, x + 0.75, y + 0.75, wClip - 1.5, ch - 1.5, 3);
     ctx.stroke();
 
@@ -312,10 +323,18 @@ export class SurfaceModel {
       const labelX = Math.max(x0, 4) + 4;
       ctx.save();
       ctx.beginPath(); ctx.rect(x, y, wClip, CLIP_HEADER_H); ctx.clip();
-      ctx.fillStyle = 'rgba(255,255,255,0.92)';
       ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
       ctx.textBaseline = 'middle';
-      ctx.fillText(c.name, labelX, y + CLIP_HEADER_H / 2 + 0.5);
+      const midY = y + CLIP_HEADER_H / 2 + 0.5;
+      if (c.recording) {
+        ctx.fillStyle = `rgba(255,80,80,${(0.5 + 0.5 * Math.sin(performance.now() / 180)).toFixed(3)})`;
+        ctx.beginPath(); ctx.arc(labelX + 3, midY, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.92)';
+        ctx.fillText('REC', labelX + 10, midY);
+      } else {
+        ctx.fillStyle = 'rgba(255,255,255,0.92)';
+        ctx.fillText(c.name, labelX, midY);
+      }
       ctx.restore();
       ctx.textBaseline = 'alphabetic';
     }
@@ -349,6 +368,39 @@ export class SurfaceModel {
       ctx.fill();
       ctx.beginPath(); ctx.moveTo(x1 - fo, waveTop); ctx.lineTo(x1, waveTop + waveH); ctx.stroke();
     }
+  }
+
+  // Growing waveform during a live take: the coarse min/max envelope streamed
+  // on the metering frame, mapped evenly across the clip's current span.
+  private drawLiveWave(
+    ctx: CanvasRenderingContext2D, c: DawClip,
+    x0: number, x1: number, waveTop: number, waveH: number,
+    base: [number, number, number],
+  ) {
+    const lp = useDawStore.getState().livePeaks[c.id];
+    if (!lp || lp.length < 4) return;
+    const n = lp.length / 2;                    // min/max pairs
+    const span = Math.max(1, x1 - x0);
+    const mid = waveTop + waveH / 2;
+    const amp = (waveH / 2) * 0.92;
+    const visL = Math.max(Math.floor(x0), 0);
+    const visR = Math.min(Math.ceil(x1), this.width);
+    const at = (px: number) => {
+      const i = Math.min(n - 1, Math.max(0, Math.floor(((px - x0) / span) * n)));
+      return { mn: lp[i * 2], mx: lp[i * 2 + 1] };
+    };
+
+    ctx.fillStyle = rgba(mix(base, WHITE, 0.7), 0.9);
+    ctx.beginPath();
+    ctx.moveTo(visL, mid - at(visL).mx * amp);
+    for (let px = visL + 1; px <= visR; px++) ctx.lineTo(px, mid - at(px).mx * amp);
+    for (let px = visR; px >= visL; px--) ctx.lineTo(px, mid - at(px).mn * amp);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(0,0,0,0.28)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(visL, mid + 0.5); ctx.lineTo(visR, mid + 0.5); ctx.stroke();
   }
 
   private drawWave(
