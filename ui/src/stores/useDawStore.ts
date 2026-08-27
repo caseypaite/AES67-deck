@@ -46,6 +46,11 @@ interface DawState {
   projectName: string;
   projectList: string[];
 
+  // REAPER-compatible multitrack recording projects in the records directory.
+  recordingProjects: string[];
+  activeRecordingProject: string | null;
+  recordingProjectError: string | null;
+
   clips: Record<string, DawClip>;
   markers: Record<string, DawMarker>;
   trackHeights: Record<number, number>;
@@ -129,6 +134,13 @@ interface DawState {
   addCommittedClips: (clips: DawClip[], overrun: boolean) => void;
   newProject: (name: string) => void;
   openProject: (name: string) => void;
+
+  // Recording projects (REAPER .rpp bundles)
+  setRecordingProjects: (list: string[], active?: string | null) => void;
+  setRecordingProjectError: (msg: string | null) => void;
+  saveRecordingProject: (name: string) => void;
+  openRecordingProject: (name: string) => void;
+  refreshRecordingProjects: () => void;
 }
 
 // --- project persistence (debounced push to the server) ---
@@ -179,6 +191,9 @@ export const useDawStore = create<DawState>()(
     (set, get) => ({
       projectName: 'default',
       projectList: [],
+      recordingProjects: [],
+      activeRecordingProject: null,
+      recordingProjectError: null,
 
       clips: {},
       markers: {},
@@ -477,6 +492,19 @@ export const useDawStore = create<DawState>()(
 
       newProject: (name) => wsSend({ type: 'new_project', name }),
       openProject: (name) => wsSend({ type: 'load_project', name }),
+
+      setRecordingProjects: (list, active) =>
+        set({
+          recordingProjects: Array.isArray(list) ? list : [],
+          ...(active !== undefined ? { activeRecordingProject: active } : {}),
+        }),
+      setRecordingProjectError: (msg) => set({ recordingProjectError: msg }),
+      saveRecordingProject: (name) => {
+        set({ recordingProjectError: null });
+        wsSend({ type: 'save_recording_project', name, project: serializeProject(get()) });
+      },
+      openRecordingProject: (name) => wsSend({ type: 'open_recording_project', name }),
+      refreshRecordingProjects: () => wsSend({ type: 'list_recording_projects' }),
     }),
     {
       name: 'aes67-daw-project',

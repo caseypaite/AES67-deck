@@ -714,6 +714,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           useDawStore.getState().loadProjectData(data.name, data.project);
         } else if (data.type === 'projects_list') {
           useDawStore.getState().setProjectList(data.projects || [], data.active);
+        } else if (data.type === 'recording_projects_list') {
+          useDawStore.getState().setRecordingProjects(data.projects || [], data.active ?? null);
+        } else if (data.type === 'recording_project_error') {
+          useDawStore.getState().setRecordingProjectError(data.reason || 'error');
         } else if (data.type === 'take_committed') {
           useDawStore.getState().addCommittedClips(data.clips || [], !!data.overrun);
         } else if (data.type === 'clip_peaks') {

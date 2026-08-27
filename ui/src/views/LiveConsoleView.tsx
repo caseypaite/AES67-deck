@@ -286,6 +286,11 @@ export const LiveConsoleView = () => {
   const connectWebSocket = useMixerStore(state => state.connectWebSocket);
   const transportState = useMixerStore(state => state.transportState);
   const timecode = useDawStore(state => state.timecode);
+  const recordingProjects = useDawStore(state => state.recordingProjects);
+  const activeRecordingProject = useDawStore(state => state.activeRecordingProject);
+  const saveRecordingProject = useDawStore(state => state.saveRecordingProject);
+  const openRecordingProject = useDawStore(state => state.openRecordingProject);
+  const refreshRecordingProjects = useDawStore(state => state.refreshRecordingProjects);
   const toggleTransport = useMixerStore(state => state.toggleTransport);
   const activeView = useMixerStore(state => state.activeView);
   const setActiveView = useMixerStore(state => state.setActiveView);
@@ -309,8 +314,17 @@ export const LiveConsoleView = () => {
   useEffect(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'list_scenes' }));
+      ws.send(JSON.stringify({ type: 'list_recording_projects' }));
     }
   }, [ws]);
+
+  const recordingProjectError = useDawStore(state => state.recordingProjectError);
+  const setRecordingProjectError = useDawStore(state => state.setRecordingProjectError);
+  useEffect(() => {
+    if (!recordingProjectError) return;
+    const t = setTimeout(() => setRecordingProjectError(null), 4000);
+    return () => clearTimeout(t);
+  }, [recordingProjectError, setRecordingProjectError]);
 
   const handleSaveScene = () => {
     const name = prompt("Enter scene name to save:");
@@ -332,8 +346,27 @@ export const LiveConsoleView = () => {
     }
   };
 
+  const handleSaveProject = () => {
+    const suggested = activeRecordingProject || '';
+    const name = prompt('Save multitrack recording project as:', suggested);
+    if (!name || !name.trim()) return;
+    saveRecordingProject(name.trim());
+  };
+
+  const handleOpenProject = (name: string) => {
+    if (!name) return;
+    if (name !== activeRecordingProject &&
+        !confirm(`Open recording project "${name}"? The current timeline will be replaced.`)) return;
+    openRecordingProject(name);
+  };
+
   return (
     <div className="h-screen flex flex-col bg-[#0b0c10] text-white overflow-hidden font-sans">
+      {recordingProjectError && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-red-700 text-white text-xs font-bold rounded shadow-xl border border-red-400">
+          Recording project: {recordingProjectError}
+        </div>
+      )}
       {/* Top Toolbar */}
       <div className="h-14 bg-[#111318] border-b border-gray-800 flex items-center justify-between px-6 shrink-0 z-20 shadow-md">
         <div className="flex gap-2">
@@ -358,6 +391,27 @@ export const LiveConsoleView = () => {
         </div>
         
         <div className="flex gap-2 items-center">
+          {activeView === 'daw' && (
+            <>
+              <button
+                onClick={handleSaveProject}
+                title={activeRecordingProject ? `Saving to records/${activeRecordingProject}/` : 'Consolidate takes into a REAPER project'}
+                className="px-3 py-1.5 bg-[#1a1c22] hover:bg-blue-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]"
+              >
+                SAVE PROJECT
+              </button>
+              <select
+                onFocus={refreshRecordingProjects}
+                value={activeRecordingProject ?? ''}
+                onChange={e => { handleOpenProject(e.target.value); }}
+                className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-40 cursor-pointer shadow-sm"
+              >
+                <option value="">{activeRecordingProject ? 'OPEN PROJECT…' : 'OPEN PROJECT…'}</option>
+                {recordingProjects.map((p: string) => <option key={p} value={p}>{p}</option>)}
+              </select>
+              <div className="w-px h-5 bg-gray-700" />
+            </>
+          )}
           <button onClick={handleSaveScene} className="px-3 py-1.5 bg-[#1a1c22] hover:bg-green-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]">SAVE SCENE</button>
           <select onChange={e => { handleLoadScene(e.target.value); e.target.value = ''; }} className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-32 cursor-pointer shadow-sm">
              <option value="">LOAD SCENE...</option>
