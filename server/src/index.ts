@@ -26,6 +26,11 @@ const PATCHBAY_CONFIG_PATH = 'patchbay_config.json';
 const OUTPUT_ROUTING_PATH = 'output_routing.json';
 const TALKBACK_CONFIG_PATH = 'talkback_config.json';
 const MIXER_STATE_PATH = 'mixer_state.json';
+// Phase 2 (plan/unified-aes67-network-control.md): operator overrides for the
+// 4 fixed transmit-Source groups, and the AES67_Source capture-channel block
+// allocated to each subscribed receive Sink.
+const TX_SOURCES_PATH = 'tx_sources.json';
+const RX_SINKS_PATH = 'rx_sinks.json';
 
 // In-memory snapshot of all fader-level mixer state. Written to
 // mixer_state.json on every change (debounced 500ms) and replayed to the
@@ -195,7 +200,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'output_routing_loaded', outputs: getOutputRouting() }));
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
-  ws.send(JSON.stringify({ type: 'daemon_state', ...lastDaemonState }));
+  ws.send(JSON.stringify(daemonStateMessage()));
   ws.send(JSON.stringify({ type: 'mic_devices_loaded', devices: lastMicDevices }));
   if (lastPluginCatalog.length > 0) {
     ws.send(JSON.stringify({ type: 'plugin_list_loaded', plugins: lastPluginCatalog }));
@@ -300,6 +305,7 @@ wss.on('connection', (ws) => {
           await handlePatchbaySync(merged);
           await applyOutputRouting(mergedOutputs);
           await applyMonitorRouting();
+          await applyBroadcastRouting();
         })();
       } else if (data.type === 'sync_talkback_config') {
         const sourcePorts = Array.isArray(data.sourcePorts) ? data.sourcePorts.filter((p: any) => typeof p === 'string') : [];
@@ -323,45 +329,75 @@ wss.on('connection', (ws) => {
         });
       } else if (data.type === 'daemon_create_sink') {
         // Receive an AES67 stream: create a daemon Sink from a discovered
-        // remote's SDP (or a pasted one). map is the AES67_Source ALSA capture
-        // channels it lands on — [0,1] in Phase 1 (the bridge is 2ch); Phase 2
-        // widens it and allocates a block per sink.
-        (async () => {
+        // remote's SDP (or a pasted one), and hand it a contiguous block of
+        // AES67_Source capture channels (0..31) sized to the stream's channel
+        // count. reconcileRxSinks() re-asserts the block after a daemon
+        // restart; the block is persisted in rx_sinks.json.
+        runDaemonOp(async () => {
           const sinkId = lowestFreeDaemonId(lastDaemonState.sinks);
           if (sinkId < 0) { console.error('daemon_create_sink: no free sink id'); return; }
-          const map = Array.isArray(data.map) && data.map.length > 0
-            ? data.map.map((n: any) => Number(n)) : [0, 1];
+          const sdp = typeof data.sdp === 'string' ? data.sdp : '';
+          const source = typeof data.source === 'string' ? data.source : '';
+          const channels = Array.isArray(data.map) && data.map.length > 0
+            ? data.map.length : sdpChannelCount(sdp);
+          const assignments = getRxSinkAssignments();
+          const base = allocateCaptureBlock(channels, assignments, lastDaemonState.sinks);
+          if (base < 0) {
+            console.error(`daemon_create_sink: no ${channels}-ch capture block free (0..${RX_CAPTURE_CHANNELS - 1})`);
+            return;
+          }
+          const map = Array.from({ length: channels }, (_, i) => base + i);
+          const name = String(data.name || `Deck Sink ${sinkId}`);
           // ignore_refclk_gmid defaults true: the daemon's SDP parser rejects
           // (400 "cannot parse SDP") any stream whose a=ts-refclk gmid doesn't
           // match the daemon's current PTP grandmaster — which is every stream
           // whenever we're not yet locked to the same GM. The existing
           // appliance sink is configured the same way.
           const body = {
-            name: String(data.name || `Deck Sink ${sinkId}`),
+            name,
             io: 'Audio Device',
             use_sdp: true,
-            source: typeof data.source === 'string' ? data.source : '',
-            sdp: typeof data.sdp === 'string' ? data.sdp : '',
+            source,
+            sdp,
             delay: typeof data.delay === 'number' ? data.delay : 384,
             ignore_refclk_gmid: data.ignore_refclk_gmid !== false,
             map
           };
           const res = await daemonRequest('PUT', `/api/sink/${sinkId}`, body);
-          if (!res.ok) console.error(`daemon_create_sink failed (${res.status})`, res.json);
-          await pollDaemonState();
-        })();
+          if (!res.ok) { console.error(`daemon_create_sink failed (${res.status})`, res.json); return; }
+          assignments.push({ sinkId, streamName: name, address: sdpAddress(sdp), captureBase: base, channels });
+          saveRxSinkAssignments(assignments);
+          await refreshDaemonState();
+        });
       } else if (data.type === 'daemon_delete_sink') {
-        (async () => {
+        runDaemonOp(async () => {
           const id = Number(data.id);
           if (!Number.isInteger(id)) return;
           const res = await daemonRequest('DELETE', `/api/sink/${id}`);
           if (!res.ok) console.error(`daemon_delete_sink failed (${res.status})`, res.json);
-          await pollDaemonState();
-        })();
+          saveRxSinkAssignments(getRxSinkAssignments().filter((a) => a.sinkId !== id));
+          await refreshDaemonState();
+        });
+      } else if (data.type === 'set_tx_source') {
+        // Phase 2: enable/disable/rename one of the 4 fixed transmit groups.
+        // Persist the override then converge the daemon.
+        runDaemonOp(async () => {
+          const key = String(data.key || '');
+          if (!TX_SOURCE_PLAN.some((g) => g.key === key)) {
+            console.error(`set_tx_source: unknown group ${JSON.stringify(data.key)}`);
+            return;
+          }
+          const prefs = getTxSourcePrefs();
+          if (typeof data.enabled === 'boolean') prefs[key].enabled = data.enabled;
+          if (typeof data.name === 'string' && data.name.trim()) prefs[key].name = data.name.trim();
+          saveTxSourcePrefs(prefs);
+          if (lastDaemonState.reachable) await reconcileTxSources(lastDaemonState.sources);
+          await refreshDaemonState();
+        });
       } else if (data.type === 'daemon_create_source') {
         // Transmit: create a daemon Source that reads `map` ALSA playback
         // channels (fed by the engine via pw-link in Phase 2) and sends RTP.
-        (async () => {
+        runDaemonOp(async () => {
           const id = lowestFreeDaemonId(lastDaemonState.sources);
           if (id < 0) { console.error('daemon_create_source: no free source id'); return; }
           const map = Array.isArray(data.map) && data.map.length > 0
@@ -381,12 +417,12 @@ wss.on('connection', (ws) => {
           };
           const res = await daemonRequest('PUT', `/api/source/${id}`, body);
           if (!res.ok) console.error(`daemon_create_source failed (${res.status})`, res.json);
-          await pollDaemonState();
-        })();
+          await refreshDaemonState();
+        });
       } else if (data.type === 'daemon_update_source') {
         // Re-PUT an existing Source with the live config merged over the patch
         // (the daemon has no PATCH — every field must be present).
-        (async () => {
+        runDaemonOp(async () => {
           const id = Number(data.id);
           if (!Number.isInteger(id)) return;
           const current = lastDaemonState.sources.find((s: any) => Number(s.id) === id);
@@ -408,25 +444,25 @@ wss.on('connection', (ws) => {
           };
           const res = await daemonRequest('PUT', `/api/source/${id}`, body);
           if (!res.ok) console.error(`daemon_update_source failed (${res.status})`, res.json);
-          await pollDaemonState();
-        })();
+          await refreshDaemonState();
+        });
       } else if (data.type === 'daemon_delete_source') {
-        (async () => {
+        runDaemonOp(async () => {
           const id = Number(data.id);
           if (!Number.isInteger(id)) return;
           const res = await daemonRequest('DELETE', `/api/source/${id}`);
           if (!res.ok) console.error(`daemon_delete_source failed (${res.status})`, res.json);
-          await pollDaemonState();
-        })();
+          await refreshDaemonState();
+        });
       } else if (data.type === 'daemon_set_ptp') {
-        (async () => {
+        runDaemonOp(async () => {
           const domain = Number(data.domain);
           const dscp = Number(data.dscp);
           if (!Number.isInteger(domain) || !Number.isInteger(dscp)) return;
           const res = await daemonRequest('POST', '/api/ptp/config', { domain, dscp });
           if (!res.ok) console.error(`daemon_set_ptp failed (${res.status})`, res.json);
-          await pollDaemonState();
-        })();
+          await refreshDaemonState();
+        });
       } else if (data.type && allowedTypes.includes(data.type)) {
         // Intercept mixer state changes: update in-memory snapshot, persist
         // to disk (debounced), and fan-out to all other connected clients.
@@ -500,6 +536,7 @@ const ipcServer = net.createServer((socket) => {
     await handlePatchbaySync(getPatchbayMappings());
     await applyOutputRouting(getOutputRouting());
     await applyMonitorRouting();
+    await applyBroadcastRouting();
     const talkbackCfg = getTalkbackConfig();
     await applyTalkbackRouting(talkbackCfg);
     // applyTalkbackRouting only wires the mic source side (pw-link); the
@@ -666,7 +703,262 @@ function broadcastToClients(msg: string) {
   });
 }
 
-async function pollDaemonState() {
+// Multicast address from an SDP connection line, for display / persistence.
+function sdpAddress(sdp: string): string {
+  const m = /c=IN IP4 ([0-9.]+)/.exec(sdp || '');
+  return m ? m[1] : '';
+}
+
+// ===========================================================================
+// Phase 2 — network I/O for the mix (plan/unified-aes67-network-control.md).
+// No engine change: the 20 mix-product ports already exist; this pins the
+// engine->AES67_Sink link map, auto-provisions the transmit Sources, and
+// auto-allocates AES67_Source capture channels to subscribed Sinks.
+// ===========================================================================
+
+// --- Transmit: 4 fixed Source groups, each reading a block of AES67_Sink
+//     playout channels the engine is pinned to (see applyBroadcastRouting). ---
+interface TxSourceGroup {
+  key: string;
+  defaultName: string;
+  map: number[];          // 0-indexed AES67_Sink playout channels
+  enginePorts: string[];  // AES67_Deck output ports feeding those channels, in order
+}
+
+const TX_SOURCE_PLAN: TxSourceGroup[] = [
+  { key: 'master',  defaultName: 'Deck Master',  map: [0, 1],
+    enginePorts: ['out_L', 'out_R'] },
+  { key: 'monitor', defaultName: 'Deck Monitor', map: [2, 3],
+    enginePorts: ['monitor_L', 'monitor_R'] },
+  { key: 'aux1-4',  defaultName: 'Deck AUX 1-4', map: [4, 5, 6, 7, 8, 9, 10, 11],
+    enginePorts: ['bus_101_L', 'bus_101_R', 'bus_102_L', 'bus_102_R',
+                  'bus_103_L', 'bus_103_R', 'bus_104_L', 'bus_104_R'] },
+  { key: 'aux5-8',  defaultName: 'Deck AUX 5-8', map: [12, 13, 14, 15, 16, 17, 18, 19],
+    enginePorts: ['bus_105_L', 'bus_105_R', 'bus_106_L', 'bus_106_R',
+                  'bus_107_L', 'bus_107_R', 'bus_108_L', 'bus_108_R'] }
+];
+
+// sourceId: the daemon Source id this group currently owns (null = none). It's
+// the identity used for reconcile so a rename PUTs in place instead of
+// orphaning the old-named Source. Name is only a fallback match (adopts a
+// Source left over from a daemon restart / an earlier server version).
+interface TxSourcePref { enabled: boolean; name: string; sourceId: number | null; }
+type TxSourcePrefs = Record<string, TxSourcePref>;
+
+// Operator overrides, per group. Default: every group disabled — the operator
+// enables them incrementally (Phase 2 caveat: watch PTP offset / xruns).
+function getTxSourcePrefs(): TxSourcePrefs {
+  const prefs: TxSourcePrefs = {};
+  for (const g of TX_SOURCE_PLAN) prefs[g.key] = { enabled: false, name: g.defaultName, sourceId: null };
+  try {
+    if (fs.existsSync(TX_SOURCES_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(TX_SOURCES_PATH, 'utf8'));
+      for (const g of TX_SOURCE_PLAN) {
+        const v = raw?.[g.key];
+        if (v && typeof v === 'object') {
+          if (typeof v.enabled === 'boolean') prefs[g.key].enabled = v.enabled;
+          if (typeof v.name === 'string' && v.name.trim()) prefs[g.key].name = v.name.trim();
+          if (Number.isInteger(v.sourceId)) prefs[g.key].sourceId = v.sourceId;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Error reading tx_sources.json, using defaults', e);
+  }
+  return prefs;
+}
+
+function saveTxSourcePrefs(prefs: TxSourcePrefs) {
+  fs.writeFileSync(TX_SOURCES_PATH, JSON.stringify(prefs, null, 2));
+}
+
+// Converge the daemon's transmit Sources to the enabled TX groups. Each group
+// owns one Source, tracked by id (name is a fallback for adoption). Returns
+// true if it issued any PUT/DELETE (so the caller re-fetches before broadcast).
+async function reconcileTxSources(daemonSources: any[]): Promise<boolean> {
+  const prefs = getTxSourcePrefs();
+  let changed = false;
+  let prefsDirty = false;
+
+  for (const g of TX_SOURCE_PLAN) {
+    const pref = prefs[g.key];
+    let existing = pref.sourceId != null
+      ? daemonSources.find((s: any) => Number(s.id) === pref.sourceId)
+      : undefined;
+    if (!existing) existing = daemonSources.find((s: any) => s.name === pref.name);
+
+    if (pref.enabled) {
+      const mapOk = existing && Array.isArray(existing.map) &&
+        existing.map.length === g.map.length &&
+        existing.map.every((v: number, i: number) => v === g.map[i]);
+      const ok = existing && mapOk && existing.enabled === true && existing.name === pref.name;
+      const id = existing ? Number(existing.id)
+        : (pref.sourceId != null && !daemonSources.some((s: any) => Number(s.id) === pref.sourceId)
+          ? pref.sourceId : lowestFreeDaemonId(daemonSources));
+      if (id !== pref.sourceId) { pref.sourceId = id; prefsDirty = true; }
+      if (ok) continue;
+      if (id < 0) { console.error(`reconcileTxSources: no free source id for ${g.key}`); continue; }
+      const body = {
+        enabled: true, name: pref.name, io: 'Audio Device', map: g.map,
+        max_samples_per_packet: 48, codec: 'L24', address: existing?.address || '',
+        ttl: 15, payload_type: 98, dscp: 34, refclk_ptp_traceable: false
+      };
+      const res = await daemonRequest('PUT', `/api/source/${id}`, body);
+      if (res.ok) changed = true;
+      else console.error(`reconcileTxSources PUT ${g.key} failed (${res.status})`, res.json);
+    } else {
+      if (existing) {
+        const res = await daemonRequest('DELETE', `/api/source/${existing.id}`);
+        if (res.ok) changed = true;
+        else console.error(`reconcileTxSources DELETE ${g.key} failed (${res.status})`, res.json);
+      }
+      if (pref.sourceId != null) { pref.sourceId = null; prefsDirty = true; }
+    }
+  }
+
+  if (prefsDirty) saveTxSourcePrefs(prefs);
+  return changed;
+}
+
+// Resolved per-group TX state for the UI.
+function resolveTxSources(daemonSources: any[], ptpLocked: boolean) {
+  const prefs = getTxSourcePrefs();
+  return TX_SOURCE_PLAN.map((g) => {
+    const pref = prefs[g.key];
+    const live = (pref.sourceId != null && daemonSources.find((s: any) => Number(s.id) === pref.sourceId))
+      || daemonSources.find((s: any) => s.name === pref.name);
+    return {
+      key: g.key,
+      name: pref.name,
+      enabled: pref.enabled,
+      channels: g.map.length,
+      address: live?.address || '',
+      present: !!live,
+      running: !!live && live.enabled === true && ptpLocked
+    };
+  });
+}
+
+// --- Receive: allocate a contiguous AES67_Source capture-channel block to
+//     each subscribed Sink, and keep the daemon's sink `map` matching it. ---
+const RX_CAPTURE_CHANNELS = 32;
+
+interface RxSinkAssignment {
+  sinkId: number;
+  streamName: string;
+  address: string;
+  captureBase: number;
+  channels: number;
+}
+
+function getRxSinkAssignments(): RxSinkAssignment[] {
+  try {
+    if (fs.existsSync(RX_SINKS_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(RX_SINKS_PATH, 'utf8'));
+      if (Array.isArray(raw)) {
+        return raw.filter((a: any) =>
+          a && Number.isInteger(a.sinkId) && Number.isInteger(a.captureBase) &&
+          Number.isInteger(a.channels) && a.channels > 0);
+      }
+    }
+  } catch (e) {
+    console.error('Error reading rx_sinks.json, starting fresh', e);
+  }
+  return [];
+}
+
+function saveRxSinkAssignments(list: RxSinkAssignment[]) {
+  fs.writeFileSync(RX_SINKS_PATH, JSON.stringify(list, null, 2));
+}
+
+// Lowest capture channel where `count` contiguous channels are free. Counts
+// both our persisted blocks and the live `map` of every current daemon sink
+// (a sink configured outside the deck, e.g. the pre-existing appliance sink,
+// still occupies capture channels). -1 if it won't fit in 0..N-1.
+function allocateCaptureBlock(count: number, assignments: RxSinkAssignment[], daemonSinks: any[]): number {
+  const used = new Array(RX_CAPTURE_CHANNELS).fill(false);
+  const mark = (start: number, len: number) => {
+    for (let i = start; i < start + len && i < RX_CAPTURE_CHANNELS; i++) used[i] = true;
+  };
+  for (const a of assignments) mark(a.captureBase, a.channels);
+  for (const s of daemonSinks || []) {
+    if (Array.isArray(s.map)) for (const ch of s.map) if (Number.isInteger(ch)) used[ch] = true;
+  }
+  for (let base = 0; base + count <= RX_CAPTURE_CHANNELS; base++) {
+    if (!used.slice(base, base + count).some(Boolean)) return base;
+  }
+  return -1;
+}
+
+// Channel count from an SDP's first audio rtpmap ("...L24/48000/8").
+function sdpChannelCount(sdp: string): number {
+  const m = /a=rtpmap:\d+\s+[A-Za-z0-9]+\/\d+\/(\d+)/.exec(sdp || '');
+  return m ? Math.max(1, Number(m[1])) : 2;
+}
+
+// AES67_Source capture ports a sink's live map resolves to, for the UI.
+function sinkCapturePorts(sink: any): string[] {
+  if (!Array.isArray(sink.map)) return [];
+  return sink.map.map((n: number) => `AES67_Source:capture_AUX${n}`);
+}
+
+// After each poll: drop assignments whose sink is gone, and re-PUT any sink
+// whose live `map` drifted from its persisted block (covers a daemon restart
+// that reloaded sinks with different maps). Returns true if it issued a PUT.
+async function reconcileRxSinks(daemonSinks: any[]): Promise<boolean> {
+  const assignments = getRxSinkAssignments();
+  const liveIds = new Set(daemonSinks.map((s: any) => Number(s.id)));
+  const kept = assignments.filter((a) => liveIds.has(a.sinkId));
+  if (kept.length !== assignments.length) saveRxSinkAssignments(kept);
+
+  let changed = false;
+  for (const a of kept) {
+    const live = daemonSinks.find((s: any) => Number(s.id) === a.sinkId);
+    if (!live) continue;
+    const want = Array.from({ length: a.channels }, (_, i) => a.captureBase + i);
+    const mapOk = Array.isArray(live.map) && live.map.length === want.length &&
+      live.map.every((v: number, i: number) => v === want[i]);
+    if (mapOk) continue;
+    const body = {
+      name: live.name, io: live.io || 'Audio Device', use_sdp: !!live.use_sdp,
+      source: live.source || '', sdp: live.sdp || '',
+      delay: typeof live.delay === 'number' ? live.delay : 384,
+      ignore_refclk_gmid: live.ignore_refclk_gmid !== false, map: want
+    };
+    const res = await daemonRequest('PUT', `/api/sink/${a.sinkId}`, body);
+    if (res.ok) changed = true;
+    else console.error(`reconcileRxSinks PUT sink ${a.sinkId} failed (${res.status})`, res.json);
+  }
+  return changed;
+}
+
+// All daemon-mutating work (WS handlers + the periodic reconcile) runs through
+// this single promise chain, so two commands — or a command racing the 5s
+// poll — can never both allocate the same source id / capture block off a
+// stale snapshot.
+let daemonOpChain: Promise<unknown> = Promise.resolve();
+function runDaemonOp<T>(fn: () => Promise<T>): Promise<T> {
+  const result = daemonOpChain.then(fn, fn);
+  daemonOpChain = result.catch(() => undefined);
+  return result;
+}
+
+// The enriched `daemon_state` payload — daemon snapshot plus per-Sink
+// capturePorts and resolved txSources. Used by the poll and the WS greeting.
+function daemonStateMessage() {
+  const ptpLocked = lastDaemonState.ptp?.status === 'locked';
+  return {
+    type: 'daemon_state',
+    ...lastDaemonState,
+    sinks: lastDaemonState.sinks.map((s: any) => ({ ...s, capturePorts: sinkCapturePorts(s) })),
+    txSources: resolveTxSources(lastDaemonState.sources, ptpLocked)
+  };
+}
+
+// Fetch a fresh daemon snapshot, converge it to persisted intent, and
+// broadcast. NOT self-locking — always call via pollDaemonState() (interval)
+// or inside a runDaemonOp() block (WS handlers), never bare.
+async function refreshDaemonState() {
   const [configRes, ptpRes, sourcesRes, sinksRes, remoteRes] = await Promise.all([
     daemonRequest('GET', '/api/config'),
     daemonRequest('GET', '/api/ptp/status'),
@@ -692,6 +984,21 @@ async function pollDaemonState() {
       sinks: Array.isArray(sinksRes.json?.sinks) ? sinksRes.json.sinks : [],
       remote: Array.isArray(remoteRes.json?.remote_sources) ? remoteRes.json.remote_sources : []
     };
+
+    // Phase 2: converge the daemon to persisted intent (enabled TX groups,
+    // per-Sink capture blocks). Re-fetch if anything moved so the broadcast
+    // below reflects the converged state, not the pre-reconcile snapshot.
+    const txChanged = await reconcileTxSources(lastDaemonState.sources);
+    const rxChanged = await reconcileRxSinks(lastDaemonState.sinks);
+    if (txChanged || rxChanged) {
+      const [s2, k2] = await Promise.all([
+        daemonRequest('GET', '/api/sources'),
+        daemonRequest('GET', '/api/sinks')
+      ]);
+      if (Array.isArray(s2.json?.sources)) lastDaemonState.sources = s2.json.sources;
+      if (Array.isArray(k2.json?.sinks)) lastDaemonState.sinks = k2.json.sinks;
+    }
+
     lastDaemonDestinations = lastDaemonState.sources.map((s: any) => ({
       name: typeof s.name === 'string' && s.name ? s.name : `Source ${s.id}`,
       address: typeof s.address === 'string' ? s.address : ''
@@ -700,8 +1007,12 @@ async function pollDaemonState() {
     lastDaemonState = { ...lastDaemonState, reachable: false };
   }
 
-  broadcastToClients(JSON.stringify({ type: 'daemon_state', ...lastDaemonState }));
+  broadcastToClients(JSON.stringify(daemonStateMessage()));
   broadcastToClients(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable: reachable }));
+}
+
+function pollDaemonState() {
+  return runDaemonOp(refreshDaemonState);
 }
 
 setInterval(pollDaemonState, DAEMON_POLL_INTERVAL_MS);
@@ -1207,6 +1518,27 @@ async function applyMonitorRouting() {
   await pwLink(['AES67_Deck:monitor_L', HARDWARE_OUT_L]);
   await pwLink(['AES67_Deck:monitor_R', HARDWARE_OUT_R]);
   console.log('Monitor routing applied successfully');
+}
+
+// Phase 2: pin each engine mix-product output port to its fixed AES67_Sink
+// playout channel (TX_SOURCE_PLAN). Idempotent; only removes stale links from
+// those engine ports to a *different* AES67_Sink channel — Output-Endpoint
+// links target other nodes and are left alone. MUST run after
+// applyOutputRouting / applyMonitorRouting in any block that also touches
+// these ports: those do a blanket disconnectAllOutputsOf on out_/bus_/monitor_
+// and would otherwise tear this map down.
+async function applyBroadcastRouting() {
+  for (const g of TX_SOURCE_PLAN) {
+    for (let i = 0; i < g.enginePorts.length; i++) {
+      const src = `AES67_Deck:${g.enginePorts[i]}`;
+      const dst = `AES67_Sink:playback_AUX${g.map[i]}`;
+      for (const d of await findLinksFrom(src)) {
+        if (d.startsWith('AES67_Sink:') && d !== dst) await pwLink(['-d', src, d]);
+      }
+      await pwLink([src, dst]);
+    }
+  }
+  console.log('Broadcast routing applied successfully');
 }
 
 // Wires the talkback mic's configured source ports to the engine's dedicated

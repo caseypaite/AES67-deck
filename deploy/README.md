@@ -155,5 +155,48 @@ frame size. Re-verify the negotiated `hw_params` (`cat
 /proc/asound/card0/pcm0p/sub0/hw_params`) once a GM is present and the
 device actually runs; the driver hints an "expected" buffer of 192.
 
+## AES67 network I/O for the mix (plan Phase 2)
+
+`20-aes67-ravenna-bridge.conf` opens the RAVENNA PCM as **AES67_Sink = 20
+playout ch** (the deck's mix products) and **AES67_Source = 32 capture ch**
+(subscribed streams), both `AUX0..N` positions → ports
+`AES67_Sink:playback_AUX{n}` / `AES67_Source:capture_AUX{n}`. The server:
+
+- pins each engine mix-product output to its fixed sink channel on every
+  engine (re)connect and patchbay apply (`applyBroadcastRouting`) — Master
+  L/R → AUX0-1, Monitor L/R → AUX2-3, `bus_101..108` L/R → AUX4-19;
+- auto-provisions the 4 transmit **Sources** (Master / Monitor / AUX 1-4 /
+  AUX 5-8) from `tx_sources.json`, converging the daemon on every poll
+  (`reconcileTxSources`). Groups default **disabled** — enable them from the
+  deck's PATCHBAY → AES67 NETWORK panel;
+- allocates a contiguous `AES67_Source` capture block to each **Sink** it
+  creates, persisted in `rx_sinks.json` and re-asserted after a daemon
+  restart (`reconcileRxSinks`). Subscribed sinks show up in the SOURCES
+  registry with ports pre-filled.
+
+No engine rebuild — all 20 mix-product JACK ports already exist. The
+per-bus **Output Endpoints** (DESTINATIONS panel) still route to non-AES67
+hardware; Master/Aux/Monitor now *also* always have a dedicated AES67
+stream regardless of that assignment.
+
+**Caveats (operational):**
+
+- **PTP lock required to transmit *and* receive** — no grandmaster ⇒
+  Sources/Sinks exist but don't run.
+- **Deploy:** reinstall the pipewire drop-in and restart PipeWire (this
+  kills the engine — the JACK server restarts under it — and it comes back;
+  the server re-drives every pw-link on reconnect). No engine rebuild.
+  Then confirm the driver accepted the wider config:
+  `cat /proc/asound/card0/pcm0p/sub0/hw_params` (20-ch playout) and
+  `.../pcm0c/sub0/hw_params` (32-ch capture) — both are well under the
+  driver's `channels_max = 128`, but if it balks, drop `AES67_Source` to
+  16 ch in the drop-in.
+  `pw-link -l | grep AES67_Sink:playback_AUX` should show the 20 engine
+  links; `curl $DAEMON/api/sources` the enabled Deck Sources.
+- **Bandwidth / CPU:** 20-ch TX L24 @ 48 k @ 1 ms ≈ 24 Mbit/s + ~4 000
+  pkt/s across 4 streams, plus subscribed RX, with software PTP on the
+  i5-4570 — comfortable, but enable TX groups incrementally and watch
+  `/var/log/aes67-watch.log`, PTP offset, and engine xruns.
+
 `ptp/phc-stability-check.py <dev> <seconds>` characterises a free-running
 PHC (rate offset + jitter vs the undisciplined TSC) before you rely on it.

@@ -4,9 +4,10 @@ import { useMixerStore } from '../../stores/useMixerStore';
 
 // Unified aes67-linux-daemon control, surfaced inside the deck so the operator
 // never has to open the separate daemon WebUI on :8080. Read-only PTP/clock
-// status plus create/delete for receive Sinks and transmit Sources. All state
-// comes from the server's `daemon_state` broadcast; every mutation is a WS
-// message the server proxies to the daemon's REST API (see server/src/index.ts).
+// status, create/delete for receive Sinks (auto-mapped onto mixer input
+// channels), and the 4 fixed transmit groups (Master / Monitor / AUX 1-4 /
+// AUX 5-8). All state comes from the server's `daemon_state` broadcast; every
+// mutation is a WS message the server proxies to the daemon's REST API.
 
 const send = (msg: Record<string, unknown>) => {
   const ws = useMixerStore.getState().ws;
@@ -17,6 +18,22 @@ const send = (msg: Record<string, unknown>) => {
 const sdpAddress = (sdp: string): string => {
   const m = /c=IN IP4 ([0-9.]+)/.exec(sdp || '');
   return m ? m[1] : '';
+};
+
+// "AES67_Source:capture_AUX4" -> 4
+const captureIndex = (port: string): number | null => {
+  const m = /capture_AUX(\d+)$/.exec(port);
+  return m ? Number(m[1]) : null;
+};
+
+// Compact "AUX4–AUX7" (or "AUX4" for one) from a capturePorts list.
+const captureRange = (ports: string[] | undefined): string => {
+  if (!ports || ports.length === 0) return '—';
+  const idx = ports.map(captureIndex).filter((n): n is number => n != null);
+  if (idx.length === 0) return '—';
+  const lo = Math.min(...idx);
+  const hi = Math.max(...idx);
+  return lo === hi ? `AUX${lo}` : `AUX${lo}–AUX${hi}`;
 };
 
 const HEADER = 'text-[10px] font-black tracking-widest uppercase text-gray-400';
@@ -78,16 +95,24 @@ const PtpBlock = () => {
 const ReceiveBlock = () => {
   const sinks = usePatchbayStore((s) => s.daemonSinks);
   const remotes = usePatchbayStore((s) => s.daemonRemoteSources);
+  const mappings = usePatchbayStore((s) => s.mappings);
   const reachable = usePatchbayStore((s) => s.daemonReachable);
 
   const [pickRemoteId, setPickRemoteId] = useState('');
   const [manualSdp, setManualSdp] = useState('');
   const [showManual, setShowManual] = useState(false);
 
+  // Which input channels currently select a given sink's derived stream.
+  const mappedChannels = (sinkId: number): number[] =>
+    Object.values(mappings)
+      .filter((m) => m.sourceStreamId === `daemon-sink-${sinkId}`)
+      .map((m) => m.channelId)
+      .sort((a, b) => a - b);
+
   const addFromRemote = () => {
     const r = remotes.find((x) => x.id === pickRemoteId);
     if (!r) return;
-    send({ type: 'daemon_create_sink', name: r.name || `Sink`, sdp: r.sdp });
+    send({ type: 'daemon_create_sink', name: r.name || 'Sink', sdp: r.sdp });
     setPickRemoteId('');
   };
 
@@ -111,30 +136,41 @@ const ReceiveBlock = () => {
               <th className="py-1 pr-3 font-black">ID</th>
               <th className="py-1 pr-3 font-black">NAME</th>
               <th className="py-1 pr-3 font-black">ADDRESS</th>
-              <th className="py-1 pr-3 font-black">CH</th>
+              <th className="py-1 pr-3 font-black">CAPTURE</th>
+              <th className="py-1 pr-3 font-black">MAPPED</th>
               <th className="py-1"></th>
             </tr>
           </thead>
           <tbody>
-            {sinks.map((sk) => (
-              <tr key={sk.id} className="border-t border-[#1a1c22]">
-                <td className="py-1 pr-3 font-mono text-gray-500">{sk.id}</td>
-                <td className="py-1 pr-3 text-gray-200 truncate max-w-[140px]">{sk.name}</td>
-                <td className="py-1 pr-3 font-mono text-cyan-400">{sdpAddress(sk.sdp) || '—'}</td>
-                <td className="py-1 pr-3 font-mono text-gray-400">{sk.map?.length ?? 0}</td>
-                <td className="py-1">
-                  <button
-                    onClick={() => send({ type: 'daemon_delete_sink', id: sk.id })}
-                    className="text-[9px] font-black tracking-widest uppercase text-red-400 hover:text-red-300"
-                  >
-                    DELETE
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {sinks.map((sk) => {
+              const chans = mappedChannels(sk.id);
+              return (
+                <tr key={sk.id} className="border-t border-[#1a1c22]">
+                  <td className="py-1 pr-3 font-mono text-gray-500">{sk.id}</td>
+                  <td className="py-1 pr-3 text-gray-200 truncate max-w-[140px]">{sk.name}</td>
+                  <td className="py-1 pr-3 font-mono text-cyan-400">{sdpAddress(sk.sdp) || '—'}</td>
+                  <td className="py-1 pr-3 font-mono text-gray-400">{captureRange(sk.capturePorts)}</td>
+                  <td className="py-1 pr-3 font-mono text-gray-400">
+                    {chans.length ? chans.map((c) => `CH ${c}`).join(', ') : <span className="text-gray-600">unmapped</span>}
+                  </td>
+                  <td className="py-1">
+                    <button
+                      onClick={() => send({ type: 'daemon_delete_sink', id: sk.id })}
+                      className="text-[9px] font-black tracking-widest uppercase text-red-400 hover:text-red-300"
+                    >
+                      DELETE
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
+
+      <div className="text-[9px] text-gray-600">
+        Subscribed streams appear in the SOURCES registry below with ports pre-filled — assign one to a channel there.
+      </div>
 
       <div className="flex items-center gap-2 flex-wrap">
         <select
@@ -189,92 +225,66 @@ const ReceiveBlock = () => {
 };
 
 const TransmitBlock = () => {
-  const sources = usePatchbayStore((s) => s.daemonSources);
-  const reachable = usePatchbayStore((s) => s.daemonReachable);
-
-  const [name, setName] = useState('');
-  const [channels, setChannels] = useState(2);
-
-  const addSource = () => {
-    if (!name.trim()) return;
-    const map = Array.from({ length: channels }, (_, i) => i);
-    send({ type: 'daemon_create_source', name: name.trim(), map });
-    setName('');
-    setChannels(2);
-  };
+  const txSources = usePatchbayStore((s) => s.txSources);
+  const ptp = usePatchbayStore((s) => s.ptpStatus);
+  const locked = ptp?.status === 'locked';
 
   return (
     <div className="flex flex-col gap-2">
       <div className={SUBHEAD}>TRANSMIT (SOURCES)</div>
 
-      {sources.length === 0 ? (
-        <div className="text-[11px] text-gray-500 italic">No transmit streams configured.</div>
-      ) : (
-        <table className="w-full text-left border-collapse text-xs">
-          <thead>
-            <tr className="text-[9px] font-black tracking-widest uppercase text-gray-600">
-              <th className="py-1 pr-3 font-black">ID</th>
-              <th className="py-1 pr-3 font-black">NAME</th>
-              <th className="py-1 pr-3 font-black">ADDRESS</th>
-              <th className="py-1 pr-3 font-black">CH</th>
-              <th className="py-1 pr-3 font-black">STATE</th>
-              <th className="py-1"></th>
+      <table className="w-full text-left border-collapse text-xs">
+        <thead>
+          <tr className="text-[9px] font-black tracking-widest uppercase text-gray-600">
+            <th className="py-1 pr-2 font-black">ON</th>
+            <th className="py-1 pr-3 font-black">NAME</th>
+            <th className="py-1 pr-3 font-black">ADDRESS</th>
+            <th className="py-1 pr-3 font-black">CH</th>
+            <th className="py-1 font-black">STATE</th>
+          </tr>
+        </thead>
+        <tbody>
+          {txSources.map((g) => (
+            <tr key={g.key} className="border-t border-[#1a1c22]">
+              <td className="py-1 pr-2">
+                <input
+                  type="checkbox"
+                  checked={g.enabled}
+                  onChange={(e) => send({ type: 'set_tx_source', key: g.key, enabled: e.target.checked })}
+                  className="accent-green-500"
+                />
+              </td>
+              <td className="py-1 pr-3">
+                <input
+                  key={g.name}
+                  defaultValue={g.name}
+                  onBlur={(e) => {
+                    const v = e.target.value.trim();
+                    if (v && v !== g.name) send({ type: 'set_tx_source', key: g.key, name: v });
+                  }}
+                  className={`${INPUT} w-36 py-0.5`}
+                />
+              </td>
+              <td className="py-1 pr-3 font-mono text-cyan-400">{g.address || '—'}</td>
+              <td className="py-1 pr-3 font-mono text-gray-400">{g.channels}</td>
+              <td className="py-1 font-mono">
+                {!g.enabled ? (
+                  <span className="text-gray-600">off</span>
+                ) : !g.present ? (
+                  <span className="text-amber-400">pending</span>
+                ) : locked ? (
+                  <span className="text-green-400">running</span>
+                ) : (
+                  <span className="text-amber-400">no clock</span>
+                )}
+              </td>
             </tr>
-          </thead>
-          <tbody>
-            {sources.map((src) => (
-              <tr key={src.id} className="border-t border-[#1a1c22]">
-                <td className="py-1 pr-3 font-mono text-gray-500">{src.id}</td>
-                <td className="py-1 pr-3 text-gray-200 truncate max-w-[140px]">{src.name}</td>
-                <td className="py-1 pr-3 font-mono text-cyan-400">{src.address || '—'}</td>
-                <td className="py-1 pr-3 font-mono text-gray-400">{src.map?.length ?? 0}</td>
-                <td className="py-1 pr-3">
-                  <button
-                    onClick={() => send({ type: 'daemon_update_source', id: src.id, enabled: !src.enabled })}
-                    className={`text-[9px] font-black tracking-widest uppercase ${
-                      src.enabled ? 'text-green-400 hover:text-green-300' : 'text-gray-500 hover:text-gray-300'
-                    }`}
-                  >
-                    {src.enabled ? 'ENABLED' : 'DISABLED'}
-                  </button>
-                </td>
-                <td className="py-1">
-                  <button
-                    onClick={() => send({ type: 'daemon_delete_source', id: src.id })}
-                    className="text-[9px] font-black tracking-widest uppercase text-red-400 hover:text-red-300"
-                  >
-                    DELETE
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+          ))}
+        </tbody>
+      </table>
 
-      <div className="flex items-end gap-2 flex-wrap">
-        <div className="flex flex-col gap-1">
-          <label className="text-[9px] font-black tracking-widest uppercase text-gray-500">NAME</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} disabled={!reachable} placeholder="Deck Master" className={`${INPUT} w-40 disabled:opacity-40`} />
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className="text-[9px] font-black tracking-widest uppercase text-gray-500">CHANNELS</label>
-          <div className="flex items-center gap-2 bg-[#0b0c10] px-2 py-1 rounded border border-[#2a2d33]">
-            <button onClick={() => setChannels((c) => Math.max(1, c - 1))} className="text-gray-400 hover:text-white pb-0.5">◀</button>
-            <span className="font-mono text-white text-xs w-4 text-center">{channels}</span>
-            <button onClick={() => setChannels((c) => Math.min(8, c + 1))} className="text-gray-400 hover:text-white pb-0.5">▶</button>
-          </div>
-        </div>
-        <button
-          onClick={addSource}
-          disabled={!name.trim()}
-          className="bg-green-600 hover:bg-green-500 disabled:opacity-40 text-white text-[10px] font-black tracking-widest uppercase px-3 py-1.5 rounded-sm transition-colors mb-0.5"
-        >
-          ADD SOURCE
-        </button>
-      </div>
       <div className="text-[9px] text-gray-600">
-        Phase 1: Sources exist on the daemon but nothing feeds them yet — the engine→network link map lands in Phase 2.
+        Master/Monitor/Aux always have a dedicated AES67 stream here regardless of any Output-Endpoint (DESTINATIONS) assignment.
       </div>
     </div>
   );

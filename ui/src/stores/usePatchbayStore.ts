@@ -25,7 +25,8 @@ export interface Aes67Stream {
 // reload.
 
 // A configured receive stream on the daemon. `map` is the list of 0-indexed
-// AES67_Source ALSA capture channels this sink lands on.
+// AES67_Source ALSA capture channels this sink lands on; `capturePorts` is the
+// server's resolution of that map to real PipeWire port names (Phase 2).
 export interface DaemonSink {
   id: number;
   name: string;
@@ -35,6 +36,19 @@ export interface DaemonSink {
   delay: number;
   ignore_refclk_gmid: boolean;
   map: number[];
+  capturePorts?: string[];
+}
+
+// Resolved state for one of the 4 fixed transmit groups (Phase 2), from the
+// server's `daemon_state.txSources`.
+export interface TxSourceResolved {
+  key: string;
+  name: string;
+  enabled: boolean;
+  channels: number;
+  address: string;
+  present: boolean;
+  running: boolean;
 }
 
 // A configured transmit stream on the daemon. `map` is the list of 0-indexed
@@ -80,6 +94,7 @@ export interface DaemonStatePayload {
   sources: DaemonSource[];
   sinks: DaemonSink[];
   remote: DaemonRemoteSource[];
+  txSources?: TxSourceResolved[];
 }
 
 // Input channels are source-only: they can be mapped to an AES67/PipeWire
@@ -140,6 +155,12 @@ interface PatchbayState {
   daemonSinks: DaemonSink[];
   daemonSources: DaemonSource[];
   daemonRemoteSources: DaemonRemoteSource[];
+  txSources: TxSourceResolved[];
+  // Subscribed daemon Sinks folded into the source registry (Phase 2): each
+  // becomes a read-only Aes67Stream with ports[] pre-filled from the server's
+  // capture-channel allocation, so it's immediately selectable in the SOURCES
+  // patchbay with no manual port entry.
+  daemonSinkStreams: Aes67Stream[];
   setDaemonState: (payload: DaemonStatePayload) => void;
 
   // Live-detected local capture devices, for the Talkback mic dropdown.
@@ -241,6 +262,8 @@ export const usePatchbayStore = create<PatchbayState>()(
   daemonSinks: [],
   daemonSources: [],
   daemonRemoteSources: [],
+  txSources: [],
+  daemonSinkStreams: [],
 
   micDevices: [],
 
@@ -396,13 +419,25 @@ export const usePatchbayStore = create<PatchbayState>()(
   },
 
   setDaemonState: (payload) => {
+    const sinks = Array.isArray(payload.sinks) ? payload.sinks : [];
     set({
       daemonReachable: !!payload.reachable,
       daemonConfig: payload.config ?? null,
       ptpStatus: payload.ptp ?? null,
-      daemonSinks: Array.isArray(payload.sinks) ? payload.sinks : [],
+      daemonSinks: sinks,
       daemonSources: Array.isArray(payload.sources) ? payload.sources : [],
-      daemonRemoteSources: Array.isArray(payload.remote) ? payload.remote : []
+      daemonRemoteSources: Array.isArray(payload.remote) ? payload.remote : [],
+      txSources: Array.isArray(payload.txSources) ? payload.txSources : [],
+      daemonSinkStreams: sinks
+        .filter(s => Array.isArray(s.capturePorts) && s.capturePorts.length > 0)
+        .map(s => ({
+          id: `daemon-sink-${s.id}`,
+          name: s.name || `Sink ${s.id}`,
+          address: (/c=IN IP4 ([0-9.]+)/.exec(s.sdp || '')?.[1]) || 'AES67 (received)',
+          channels: s.capturePorts!.length,
+          ports: s.capturePorts!,
+          lastSeen: Date.now()
+        }))
     });
   },
 
@@ -431,6 +466,8 @@ export const usePatchbayStore = create<PatchbayState>()(
         delete copy.daemonSinks;
         delete copy.daemonSources;
         delete copy.daemonRemoteSources;
+        delete copy.txSources;
+        delete copy.daemonSinkStreams;
         return copy as unknown as PatchbayState;
       },
       // Fields added after this store was first persisted won't exist in

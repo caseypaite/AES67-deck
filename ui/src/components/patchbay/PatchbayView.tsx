@@ -398,7 +398,7 @@ export const PatchbayView = () => {
   const channelsArray = Object.values(channels).filter(ch => ch.type === 'input').sort((a, b) => a.id - b.id);
 
   const {
-    streams, manualStreams, mappings,
+    streams, manualStreams, mappings, daemonSinkStreams,
     discoveredDestinations, manualDestinations, outputMappings, daemonReachable,
     addManualStream, removeManualStream, setSourceMapping,
     setStreamChannels, setStreamPorts,
@@ -406,7 +406,9 @@ export const PatchbayView = () => {
     setOutputMapping
   } = usePatchbayStore();
 
-  const allStreams = [...streams, ...manualStreams];
+  // daemonSinkStreams: subscribed AES67 receive Sinks, ports pre-filled by the
+  // server. Read-only here — created/removed from the NETWORK panel above.
+  const allStreams = [...streams, ...manualStreams, ...daemonSinkStreams];
   const allDestinations = [...discoveredDestinations, ...manualDestinations];
 
   const applyPatchbayMatrix = () => {
@@ -478,6 +480,9 @@ export const PatchbayView = () => {
               <>
                 {streams.map(s => (
                   <EndpointCard key={s.id} item={s} isManual={false} discoveredLabel="DISC." onSetChannels={setStreamChannels} onSetPorts={setStreamPorts} />
+                ))}
+                {daemonSinkStreams.map(s => (
+                  <EndpointCard key={s.id} item={s} isManual={false} discoveredLabel="SINK" onSetChannels={setStreamChannels} onSetPorts={setStreamPorts} />
                 ))}
                 {manualStreams.map(s => (
                   <EndpointCard key={s.id} item={s} isManual={true} discoveredLabel="DISC." onSetChannels={setStreamChannels} onSetPorts={setStreamPorts} onRemove={removeManualStream} />
