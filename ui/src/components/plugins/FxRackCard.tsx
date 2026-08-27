@@ -151,6 +151,122 @@ const AddEffectPopover = ({
   );
 };
 
+// ─── Load-preset popover ─────────────────────────────────────────────────────
+
+const LOAD_POPOVER_WIDTH = 264;
+
+// Body-portal, fixed-position panel anchored to the FX rack card so its header
+// lines up with the rack's title bar and it opens into the detail area to the
+// right — no `overflow-hidden` ancestor can clip it and the whole list stays
+// on screen (internal scroll, height clamped to the viewport).
+const LoadPresetPopover = ({
+  anchor,
+  presets,
+  onApplyChain,
+  onLoadPreset,
+  onDeletePreset,
+  onClose,
+}: {
+  anchor: HTMLElement;
+  presets: string[];
+  onApplyChain: (chain: (typeof FX_CHAINS)[number]) => void;
+  onLoadPreset: (name: string) => void;
+  onDeletePreset: (name: string) => void;
+  onClose: () => void;
+}) => {
+  const [pos, setPos] = useState<{ left: number; top: number; maxHeight: number }>(() => {
+    const r = anchor.getBoundingClientRect();
+    return {
+      left: Math.max(8, Math.min(r.right + 6, window.innerWidth - LOAD_POPOVER_WIDTH - 8)),
+      top: Math.max(8, r.top),
+      maxHeight: window.innerHeight - Math.max(8, r.top) - 12,
+    };
+  });
+
+  useLayoutEffect(() => {
+    const place = () => {
+      const r = anchor.getBoundingClientRect();
+      const top = Math.max(8, r.top);
+      setPos({
+        left: Math.max(8, Math.min(r.right + 6, window.innerWidth - LOAD_POPOVER_WIDTH - 8)),
+        top,
+        maxHeight: window.innerHeight - top - 12,
+      });
+    };
+    place();
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [anchor]);
+
+  const groups: FxChainGroup[] = ['Vocals', 'Instruments'];
+
+  return createPortal(
+    <div className="fixed inset-0 z-[100]" onClick={onClose}>
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{ position: 'fixed', left: pos.left, top: pos.top, width: LOAD_POPOVER_WIDTH, maxHeight: Math.max(200, pos.maxHeight) }}
+        className="metal-face metal-grain border border-black/70 rounded shadow-2xl overflow-hidden flex flex-col"
+      >
+        <div className="metal-face-rack flex items-center justify-between px-3 py-2 border-b-2 border-black/50 shrink-0">
+          <span className="text-[8px] font-black tracking-widest text-engrave">LOAD FX CHAIN</span>
+          <button onClick={onClose} className="text-[10px] text-gray-500 hover:text-gray-200 leading-none">✕</button>
+        </div>
+
+        <div className="flex flex-col flex-1 min-h-0 overflow-y-auto custom-scrollbar metal-well">
+          {groups.map(group => (
+            <React.Fragment key={group}>
+              <div className="text-[8px] font-black tracking-widest text-engrave px-3 py-1.5 border-b border-black/40 bg-black/25 sticky top-0 z-10">
+                {group.toUpperCase()}
+              </div>
+              {FX_CHAINS.filter(c => c.group === group).map(chain => (
+                <button
+                  key={chain.id}
+                  onClick={() => { onApplyChain(chain); onClose(); }}
+                  title={chain.desc}
+                  className="text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 border-b border-black/30 transition-colors"
+                >
+                  <div className="font-bold truncate">{chain.name}</div>
+                  <div className="text-[8px] text-gray-500 leading-tight line-clamp-2">{chain.desc}</div>
+                </button>
+              ))}
+            </React.Fragment>
+          ))}
+
+          <div className="text-[8px] font-black tracking-widest text-engrave px-3 py-1.5 border-y border-black/40 bg-black/25 sticky top-0 z-10">
+            SAVED PRESETS
+          </div>
+          {presets.length === 0 ? (
+            <div className="text-[9px] text-gray-600 px-3 py-3 text-center">No saved presets.</div>
+          ) : (
+            presets.map(name => (
+              <div key={name} className="flex items-center border-b border-black/30 last:border-0">
+                <button
+                  onClick={() => { onLoadPreset(name); onClose(); }}
+                  className="flex-1 text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 transition-colors"
+                >
+                  {name}
+                </button>
+                <button
+                  onClick={() => onDeletePreset(name)}
+                  className="px-2 py-1.5 text-[9px] text-gray-600 hover:text-red-400 transition-colors"
+                  title="Delete preset"
+                >
+                  ✕
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+};
+
 // ─── Single slot row ─────────────────────────────────────────────────────────
 
 const PluginSlot = ({
@@ -273,6 +389,7 @@ export const FxRackCard = () => {
   const [draggedIdx,   setDraggedIdx]   = useState<number | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null); // plugin.id
   const addBtnRef = useRef<HTMLButtonElement>(null);
+  const rackRef = useRef<HTMLDivElement>(null);
 
   // Request preset list whenever the popover opens
   const handleOpenPresets = () => {
@@ -307,7 +424,7 @@ export const FxRackCard = () => {
         />
       )}
       {/* ── Rack Card (square / fixed width = full panel height) ── */}
-      <div className="metal-face-rack metal-grain relative flex flex-col border-r-2 border-black/70 shrink-0 h-full min-h-0"
+      <div ref={rackRef} className="metal-face-rack metal-grain relative flex flex-col border-r-2 border-black/70 shrink-0 h-full min-h-0"
            style={{ width: 'var(--rack-width, 200px)' }}>
 
         {/* Nameplate header */}
@@ -327,75 +444,23 @@ export const FxRackCard = () => {
           >
             SAVE
           </button>
-          <div className="relative flex-1">
-            <button
-              onClick={handleOpenPresets}
-              className="metal-btn w-full text-[8px] font-black tracking-widest text-amber-300 rounded-[3px] px-1 py-1"
-            >
-              LOAD
-            </button>
-            {showPresets && (
-              <div className="metal-face metal-grain absolute top-full left-0 mt-1 z-50 w-[240px] border border-black/70 rounded shadow-2xl overflow-hidden">
-                <div className="flex flex-col max-h-[320px] overflow-y-auto custom-scrollbar metal-well">
-                  {(['Vocals', 'Instruments'] as FxChainGroup[]).map(group => (
-                    <React.Fragment key={group}>
-                      <div className="text-[8px] font-black tracking-widest text-engrave px-2 py-1.5 border-b-2 border-black/50 sticky top-0 metal-face-rack z-10">
-                        {group.toUpperCase()}
-                      </div>
-                      {FX_CHAINS.filter(c => c.group === group).map(chain => (
-                        <button
-                          key={chain.id}
-                          onClick={() => {
-                            applyRack(selectedChannelId, chain.plugins);
-                            setSelectedSlot(null);
-                            setShowPresets(false);
-                          }}
-                          title={chain.desc}
-                          className="text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 border-b border-black/40 transition-colors"
-                        >
-                          <div className="font-bold truncate">{chain.name}</div>
-                          <div className="text-[8px] text-gray-500 leading-tight line-clamp-2">{chain.desc}</div>
-                        </button>
-                      ))}
-                    </React.Fragment>
-                  ))}
-                  <div className="text-[8px] font-black tracking-widest text-engrave px-2 py-1.5 border-y-2 border-black/50 sticky top-0 metal-face-rack z-10">
-                    SAVED PRESETS
-                  </div>
-                  {rackPresets.length === 0 ? (
-                    <div className="text-[9px] text-gray-600 px-3 py-3 text-center">No saved presets.</div>
-                  ) : (
-                    rackPresets.map(name => (
-                      <div key={name} className="flex items-center border-b border-black/40 last:border-0">
-                        <button
-                          onClick={() => { loadRackPreset(name); setShowPresets(false); }}
-                          className="flex-1 text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 transition-colors"
-                        >
-                          {name}
-                        </button>
-                        <button
-                          onClick={() => deleteRackPreset(name)}
-                          className="px-2 py-1.5 text-[9px] text-gray-600 hover:text-red-400 transition-colors"
-                          title="Delete preset"
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <div className="p-1.5 border-t-2 border-black/50 metal-face-rack flex justify-end">
-                  <button
-                    onClick={() => setShowPresets(false)}
-                    className="text-[8px] text-gray-500 hover:text-gray-300 font-bold tracking-widest px-2"
-                  >
-                    CLOSE
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
+          <button
+            onClick={handleOpenPresets}
+            className="metal-btn flex-1 text-[8px] font-black tracking-widest text-amber-300 rounded-[3px] px-1 py-1"
+          >
+            LOAD
+          </button>
         </div>
+        {showPresets && rackRef.current && (
+          <LoadPresetPopover
+            anchor={rackRef.current}
+            presets={rackPresets}
+            onApplyChain={(chain) => { applyRack(selectedChannelId, chain.plugins); setSelectedSlot(null); }}
+            onLoadPreset={loadRackPreset}
+            onDeletePreset={deleteRackPreset}
+            onClose={() => setShowPresets(false)}
+          />
+        )}
 
         {/* Plugin slots — min-h-0 so this scrolls internally instead of
             growing the card (which would push INSERT EFFECT out of view). */}
