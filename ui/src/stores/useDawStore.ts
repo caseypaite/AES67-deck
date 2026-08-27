@@ -28,6 +28,17 @@ export interface DawMarker {
   color?: string;
 }
 
+export interface PeaksData {
+  version: number;
+  sampleRate: number;
+  frames: number;
+  tiers: Record<string, number[]>; // tier(spf) -> [min,max,min,max,...] mono
+}
+
+export function clipPeakKey(clip: Pick<DawClip, 'takeDir' | 'file'>): string | null {
+  return clip.takeDir && clip.file ? `${clip.takeDir}/${clip.file}` : null;
+}
+
 interface DawState {
   projectName: string;
   projectList: string[];
@@ -39,6 +50,8 @@ interface DawState {
   playheadPosition: number;       // seconds — interpolated from the engine clock
   recordStartTime: number | null; // legacy field, unused by the engine-driven flow
   zoom: number;                   // pixels per second
+  scrollX: number;                // arrange-surface horizontal scroll (px)
+  scrollY: number;                // arrange-surface vertical scroll (px)
 
   // Engine transport follow (the engine owns the clock; see useMixerStore's
   // `metering` handler which calls applyTransport on every frame).
@@ -58,7 +71,10 @@ interface DawState {
   lastOverrun: boolean;           // last committed take reported a disk overrun
   playbackUnderrun: boolean;      // the timeline reader couldn't keep playback fed
 
+  peaks: Record<string, PeaksData>; // clipPeakKey -> waveform peaks (not persisted)
+
   setZoom: (zoom: number) => void;
+  setScroll: (x: number, y: number) => void;
   setPlayheadPosition: (pos: number) => void;
   locate: (sec: number) => void;
   tickPlayhead: () => void;
@@ -68,6 +84,9 @@ interface DawState {
 
   applyTransport: (frame: number, state: number, sr: number) => void;
   flagPlaybackUnderrun: () => void;
+
+  setPeaks: (key: string, data: PeaksData) => void;
+  ensureClipPeaks: (clip: DawClip) => void;
 
   addClip: (clip: DawClip) => void;
   updateClip: (id: string, updates: Partial<DawClip>) => void;
@@ -98,6 +117,7 @@ interface DawState {
 // --- project persistence (debounced push to the server) ---
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let applyingRemote = false;
+const requestedPeaks = new Set<string>(); // clipPeakKeys with a get_clip_peaks in flight
 
 function serializeProject(s: DawState) {
   return {
@@ -141,6 +161,8 @@ export const useDawStore = create<DawState>()(
       playheadPosition: 0,
       recordStartTime: null,
       zoom: 10,
+      scrollX: 0,
+      scrollY: 0,
 
       engineState: 0,
       engineFrame: 0,
@@ -157,9 +179,19 @@ export const useDawStore = create<DawState>()(
 
       lastOverrun: false,
       playbackUnderrun: false,
+      peaks: {},
 
-      setZoom: (zoom) => set({ zoom: Math.max(2, Math.min(100, zoom)) }),
+      setZoom: (zoom) => set({ zoom: Math.max(2, Math.min(400, zoom)) }),
+      setScroll: (x, y) => set({ scrollX: Math.max(0, x), scrollY: Math.max(0, y) }),
       flagPlaybackUnderrun: () => { if (!get().playbackUnderrun) set({ playbackUnderrun: true }); },
+
+      setPeaks: (key, data) => set((s) => ({ peaks: { ...s.peaks, [key]: data } })),
+      ensureClipPeaks: (clip) => {
+        const key = clipPeakKey(clip);
+        if (!key || get().peaks[key] || requestedPeaks.has(key)) return;
+        requestedPeaks.add(key);
+        wsSend({ type: 'get_clip_peaks', clipId: clip.id, takeDir: clip.takeDir, file: clip.file });
+      },
 
       setPlayheadPosition: (pos) => set({ playheadPosition: Math.max(0, pos) }),
 

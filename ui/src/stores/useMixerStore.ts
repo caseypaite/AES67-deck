@@ -718,6 +718,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           useDawStore.getState().setProjectList(data.projects || [], data.active);
         } else if (data.type === 'take_committed') {
           useDawStore.getState().addCommittedClips(data.clips || [], !!data.overrun);
+        } else if (data.type === 'clip_peaks') {
+          if (data.peaks && data.takeDir && data.file) {
+            useDawStore.getState().setPeaks(`${data.takeDir}/${data.file}`, data.peaks);
+          }
         } else if (data.type === 'take_failed') {
           console.warn('multitrack take failed:', data.reason || 'unknown');
           set({ transportState: 'stopped' });
