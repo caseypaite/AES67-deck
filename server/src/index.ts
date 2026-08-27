@@ -1301,8 +1301,10 @@ function mergePatchbayMappings(incoming: any): Record<string, any> {
 // the operator to hear locally. Not user-editable (Monitor never appears in
 // output_routing.json); Master and the Aux buses have no forced default of
 // their own and are freely mapped to any destination via Output Endpoints.
-const HARDWARE_OUT_L = 'alsa_output.pci-0000_06_00.6.pro-output-0:playback_AUX0';
-const HARDWARE_OUT_R = 'alsa_output.pci-0000_06_00.6.pro-output-0:playback_AUX1';
+// ck-aes67: the on-board Intel PCH analog stereo out (00:1b.0). There is no
+// pro-audio / HDMI sink on this box.
+const HARDWARE_OUT_L = 'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FL';
+const HARDWARE_OUT_R = 'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FR';
 
 // A bus's output-endpoint assignment: the destination ports plus whether
 // they carry an identical mono downmix rather than a distinct L/R pair.
