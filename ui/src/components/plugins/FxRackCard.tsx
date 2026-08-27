@@ -179,7 +179,7 @@ const LoadPresetPopover = ({
     return {
       left: Math.max(8, Math.min(r.right + 6, window.innerWidth - LOAD_POPOVER_WIDTH - 8)),
       top: Math.max(8, r.top),
-      maxHeight: window.innerHeight - Math.max(8, r.top) - 12,
+      maxHeight: window.innerHeight - Math.max(8, r.top) - 62,
     };
   });
 
@@ -190,7 +190,7 @@ const LoadPresetPopover = ({
       setPos({
         left: Math.max(8, Math.min(r.right + 6, window.innerWidth - LOAD_POPOVER_WIDTH - 8)),
         top,
-        maxHeight: window.innerHeight - top - 12,
+        maxHeight: window.innerHeight - top - 62,
       });
     };
     place();
@@ -217,26 +217,7 @@ const LoadPresetPopover = ({
         </div>
 
         <div className="flex flex-col flex-1 min-h-0 overflow-y-auto custom-scrollbar metal-well">
-          {groups.map(group => (
-            <React.Fragment key={group}>
-              <div className="text-[8px] font-black tracking-widest text-engrave px-3 py-1.5 border-b border-black/40 bg-black/25 sticky top-0 z-10">
-                {group.toUpperCase()}
-              </div>
-              {FX_CHAINS.filter(c => c.group === group).map(chain => (
-                <button
-                  key={chain.id}
-                  onClick={() => { onApplyChain(chain); onClose(); }}
-                  title={chain.desc}
-                  className="text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 border-b border-black/30 transition-colors"
-                >
-                  <div className="font-bold truncate">{chain.name}</div>
-                  <div className="text-[8px] text-gray-500 leading-tight line-clamp-2">{chain.desc}</div>
-                </button>
-              ))}
-            </React.Fragment>
-          ))}
-
-          <div className="text-[8px] font-black tracking-widest text-engrave px-3 py-1.5 border-y border-black/40 bg-black/25 sticky top-0 z-10">
+          <div className="text-[8px] font-black tracking-widest text-engrave px-3 py-1.5 border-b border-black/40 bg-black/25 sticky top-0 z-10">
             SAVED PRESETS
           </div>
           {presets.length === 0 ? (
@@ -260,6 +241,25 @@ const LoadPresetPopover = ({
               </div>
             ))
           )}
+
+          {groups.map(group => (
+            <React.Fragment key={group}>
+              <div className="text-[8px] font-black tracking-widest text-engrave px-3 py-1.5 border-y border-black/40 bg-black/25 sticky top-0 z-10">
+                {group.toUpperCase()}
+              </div>
+              {FX_CHAINS.filter(c => c.group === group).map(chain => (
+                <button
+                  key={chain.id}
+                  onClick={() => { onApplyChain(chain); onClose(); }}
+                  title={chain.desc}
+                  className="text-left px-3 py-1.5 text-[10px] text-gray-300 hover:text-white hover:bg-white/5 border-b border-black/30 transition-colors"
+                >
+                  <div className="font-bold truncate">{chain.name}</div>
+                  <div className="text-[8px] text-gray-500 leading-tight line-clamp-2">{chain.desc}</div>
+                </button>
+              ))}
+            </React.Fragment>
+          ))}
         </div>
       </div>
     </div>,
