@@ -1,7 +1,10 @@
 import { useRef } from 'react';
 import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore, type Channel } from '../stores/useMixerStore';
-import { RULER_H, DEFAULT_TRACK_H, LANE_H } from './SurfaceModel';
+import { RULER_H, DEFAULT_TRACK_H, LANE_H, TRACK_BG_ODD, TRACK_BG_EVEN } from './SurfaceModel';
+
+// Neutral (off-state) button — legible on the lightened track rows.
+const OFF_BTN = 'bg-[#3b414d] text-gray-200 hover:bg-[#474e5c]';
 
 // Left column of track headers. Height-adaptive: a tall track shows the full
 // control set, a short one collapses to name + arm. Scrolls in lockstep with
@@ -46,9 +49,9 @@ export function TrackPanel({ width }: { width: number }) {
   };
 
   return (
-    <div ref={outerRef} onWheel={onWheel} className="shrink-0 bg-[#14161a] border-r border-black/60 relative overflow-hidden" style={{ width }}>
+    <div ref={outerRef} onWheel={onWheel} className="shrink-0 bg-[#0f1114] border-r border-black/70 relative overflow-hidden" style={{ width }}>
       <div className="h-full" style={{ transform: `translateY(${-scrollY}px)` }}>
-        <div style={{ height: RULER_H }} className="border-b border-black/60 bg-[#101216] flex items-center px-3 text-[10px] font-black tracking-widest text-gray-500">
+        <div style={{ height: RULER_H }} className="border-b border-black/70 bg-[#0c0e12] flex items-center px-3 text-[10px] font-black tracking-widest text-gray-300">
           TRACKS
         </div>
         {tracks.map((t) => {
@@ -60,15 +63,15 @@ export function TrackPanel({ width }: { width: number }) {
           return (
             <div
               key={t.id}
-              className={`relative border-b border-black/50 px-2 ${t.id % 2 ? 'bg-[#1a1d23]' : 'bg-[#181b20]'}`}
-              style={{ height: h }}
+              className="relative border-b border-black/70 px-2"
+              style={{ height: h, background: t.id % 2 ? TRACK_BG_ODD : TRACK_BG_EVEN }}
             >
               <div className="flex items-center justify-between pt-1.5">
                 {lanes > 0 && (
                   <button
                     onClick={() => toggleLaneExpand(t.id)}
                     title={expanded ? 'Hide take lanes' : `Show ${lanes} take lane${lanes > 1 ? 's' : ''}`}
-                    className="mr-1 w-4 h-4 shrink-0 flex items-center justify-center text-[9px] text-gray-400 bg-[#2a2c33] hover:bg-[#333] rounded"
+                    className={`mr-1 w-4 h-4 shrink-0 flex items-center justify-center text-[9px] rounded ${OFF_BTN}`}
                   >
                     {expanded ? '▾' : '▸'}
                   </button>
@@ -76,12 +79,12 @@ export function TrackPanel({ width }: { width: number }) {
                 <input
                   value={t.name}
                   onChange={(e) => renameChannel(t.id, e.target.value)}
-                  className="bg-transparent text-gray-200 text-xs font-semibold w-full mr-1 outline-none focus:bg-black/30 rounded px-1"
+                  className="bg-transparent text-gray-50 text-xs font-semibold w-full mr-1 outline-none focus:bg-black/40 rounded px-1"
                 />
                 {lanes > 0 && (
-                  <span className="text-[8px] text-gray-500 bg-black/40 px-1 rounded shrink-0 mr-1" title="take lanes">⧉{lanes}</span>
+                  <span className="text-[8px] text-gray-200 bg-black/55 px-1 rounded shrink-0 mr-1" title="take lanes">⧉{lanes}</span>
                 )}
-                <span className="text-[9px] text-gray-600 bg-black/40 px-1 rounded shrink-0">{t.id}</span>
+                <span className="text-[9px] text-gray-200 bg-black/55 px-1 rounded shrink-0">{t.id}</span>
               </div>
               <div className="flex gap-1 mt-1">
                 {(['arm', 'solo', 'mute'] as const).map((k) => {
@@ -91,7 +94,7 @@ export function TrackPanel({ width }: { width: number }) {
                     <button
                       key={k}
                       onClick={() => setChannelValue(t.id, k, !on)}
-                      className={`w-5 h-5 rounded text-[9px] font-bold flex items-center justify-center transition-colors ${on ? col : 'bg-[#2a2c33] text-gray-500 hover:bg-[#333]'}`}
+                      className={`w-5 h-5 rounded text-[9px] font-bold flex items-center justify-center transition-colors ${on ? col : OFF_BTN}`}
                     >
                       {k[0].toUpperCase()}
                     </button>
@@ -103,7 +106,7 @@ export function TrackPanel({ width }: { width: number }) {
                     <button
                       onClick={() => setChannelMonitorInput(t.id, !live)}
                       title={live ? 'Monitoring live input (click for timeline)' : 'Following the timeline (click to pin live input)'}
-                      className={`w-6 h-5 rounded text-[8px] font-bold flex items-center justify-center transition-colors ml-auto ${live ? 'bg-amber-500 text-black' : 'bg-[#2a2c33] text-gray-500 hover:bg-[#333]'}`}
+                      className={`w-6 h-5 rounded text-[8px] font-bold flex items-center justify-center transition-colors ml-auto ${live ? 'bg-amber-500 text-black' : OFF_BTN}`}
                     >
                       {live ? 'IN' : 'TL'}
                     </button>
@@ -119,7 +122,7 @@ export function TrackPanel({ width }: { width: number }) {
               {expanded && Array.from({ length: lanes }, (_, k) => (
                 <div
                   key={k}
-                  className="absolute left-0 right-0 border-t border-white/[0.07] text-[8px] text-gray-600 pl-1"
+                  className="absolute left-0 right-0 border-t border-white/15 bg-black/25 text-[8px] font-bold text-gray-300 pl-1"
                   style={{ top: compH + LANE_H * k, height: LANE_H }}
                 >
                   take {k + 1}
