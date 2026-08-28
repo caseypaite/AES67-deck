@@ -10,6 +10,11 @@ export const DEFAULT_TRACK_H = 96;
 const MIN_TRACK_H = 48;
 export const LANE_H = 60;   // height of one take lane on an expanded track
 
+// Track-row backgrounds — shared by the canvas and the TrackPanel so the two
+// stay aligned. Kept a clear step apart for legible alternation.
+export const TRACK_BG_ODD = '#242a35';
+export const TRACK_BG_EVEN = '#1b2028';
+
 const CLIP_HEADER_H = 14;   // label strip inside the clip
 const EDGE = 7;             // trim hit zone (px) — padded in hitTest for touch
 const HANDLE_R = 5;         // fade / gain grip radius (px)
@@ -327,7 +332,7 @@ export class SurfaceModel {
     for (let t = Math.floor(tStart / minor) * minor; t < tEnd; t += minor) {
       const x = Math.round(this.timeToX(t)) + 0.5;
       const isMajor = Math.abs(t / major - Math.round(t / major)) < 1e-6;
-      ctx.strokeStyle = isMajor ? 'rgba(255,255,255,0.13)' : 'rgba(255,255,255,0.05)';
+      ctx.strokeStyle = isMajor ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.08)';
       ctx.beginPath(); ctx.moveTo(x, RULER_H); ctx.lineTo(x, h); ctx.stroke();
     }
 
@@ -342,13 +347,13 @@ export class SurfaceModel {
     }
     for (const tr of tracks) {
       if (tr.y + tr.height < RULER_H || tr.y > h) continue;
-      ctx.fillStyle = (tr.id % 2) ? '#1a1d23' : '#181b20';
+      ctx.fillStyle = (tr.id % 2) ? TRACK_BG_ODD : TRACK_BG_EVEN;
       ctx.fillRect(0, tr.y, w, tr.height);
       if (dropTrack === tr.id && daw.dragOverLane == null) {
         ctx.fillStyle = 'rgba(90,140,255,0.10)';
         ctx.fillRect(0, tr.y, w, tr.height);
       }
-      ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      ctx.strokeStyle = 'rgba(0,0,0,0.75)';
       ctx.beginPath(); ctx.moveTo(0, tr.y + tr.height - 0.5); ctx.lineTo(w, tr.y + tr.height - 0.5); ctx.stroke();
 
       const trackClips = clipsByTrack.get(tr.id) || [];
@@ -375,11 +380,11 @@ export class SurfaceModel {
 
         if (band.lane > 0) {
           // take lane: separator + a wash so the comp lane reads as primary
-          ctx.fillStyle = 'rgba(0,0,0,0.22)';
+          ctx.fillStyle = 'rgba(0,0,0,0.30)';
           ctx.fillRect(0, band.y, w, band.h);
-          ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+          ctx.strokeStyle = 'rgba(255,255,255,0.12)';
           ctx.beginPath(); ctx.moveTo(0, band.y + 0.5); ctx.lineTo(w, band.y + 0.5); ctx.stroke();
-          ctx.fillStyle = 'rgba(255,255,255,0.28)';
+          ctx.fillStyle = 'rgba(255,255,255,0.5)';
           ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
           ctx.textBaseline = 'top';
           ctx.fillText(String(band.lane), 4, band.y + 3);
@@ -733,24 +738,24 @@ export class SurfaceModel {
 
   private drawRuler(ctx: CanvasRenderingContext2D, tStart: number, tEnd: number, major: number, minor: number) {
     const w = this.width;
-    ctx.fillStyle = '#101216';
+    ctx.fillStyle = '#0c0e12';
     ctx.fillRect(0, 0, w, RULER_H);
-    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
     ctx.beginPath(); ctx.moveTo(0, RULER_H - 0.5); ctx.lineTo(w, RULER_H - 0.5); ctx.stroke();
 
     const daw = useDawStore.getState();
     const bars = daw.gridMode === 'bars';
     const label = (t: number) => bars ? `${secToBBT(t, daw.tempo, daw.timeSig.num).bar}` : fmtRuler(t);
 
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillStyle = 'rgba(255,255,255,0.78)';
     ctx.font = '10px ui-monospace, monospace';
     for (let t = Math.floor(tStart / major) * major; t < tEnd; t += major) {
       const x = this.timeToX(t);
-      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.4)';
       ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H - 8); ctx.lineTo(x + 0.5, RULER_H); ctx.stroke();
       ctx.fillText(label(t), x + 3, 11);
     }
-    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
     for (let t = Math.floor(tStart / minor) * minor; t < tEnd; t += minor) {
       const x = this.timeToX(t);
       ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H - 4); ctx.lineTo(x + 0.5, RULER_H); ctx.stroke();
