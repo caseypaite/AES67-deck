@@ -84,6 +84,12 @@ void IpcClient::run() {
     // the socket. A non-blocking send() can accept a partial write (or none);
     // the leftover has to survive to the next loop or the JSON stream tears.
     std::string tx_pending;
+    // Inbound: a newline-delimited JSON command may span several recv() calls
+    // (and a single command — e.g. load_rack / set_timeline — can be many KB).
+    // Accumulate here and only dispatch complete lines; the trailing partial
+    // waits for the next chunk. Without this, big messages parse-fail and are
+    // silently dropped (stale FX chains, missed timeline pushes).
+    std::string rx_pending;
     using json = nlohmann::json;
 
     while (running_) {
@@ -107,26 +113,29 @@ void IpcClient::run() {
             }
 
             std::cout << "C++ IPC connected to " << socket_path_ << std::endl;
-            
+            rx_pending.clear();   // no stale partial from a previous connection
+
             // Set non-blocking
             int flags = fcntl(sock_fd_, F_GETFL, 0);
             fcntl(sock_fd_, F_SETFL, flags | O_NONBLOCK);
         }
 
         // Read incoming commands
-        char rx_buf[1024];
-        int n = recv(sock_fd_, rx_buf, sizeof(rx_buf) - 1, 0);
+        char rx_buf[65536];
+        int n = recv(sock_fd_, rx_buf, sizeof(rx_buf), 0);
         if (n > 0) {
-            rx_buf[n] = '\0';
-            std::string payload(rx_buf);
-            
+            rx_pending.append(rx_buf, n);
+
             std::vector<std::string> lines;
-            size_t pos = 0;
-            while ((pos = payload.find('\n')) != std::string::npos) {
-                lines.push_back(payload.substr(0, pos));
-                payload.erase(0, pos + 1);
+            size_t pos;
+            while ((pos = rx_pending.find('\n')) != std::string::npos) {
+                lines.push_back(rx_pending.substr(0, pos));
+                rx_pending.erase(0, pos + 1);
             }
-            if (!payload.empty()) lines.push_back(payload);
+            // Anything left in rx_pending is an incomplete line — keep it for
+            // the next recv(). Guard against an unbounded partial from a broken
+            // peer.
+            if (rx_pending.size() > 4 * 1024 * 1024) rx_pending.clear();
 
             for (const auto& line : lines) {
                 if (line.empty()) continue;

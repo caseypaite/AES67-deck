@@ -494,6 +494,45 @@ function loadFxRacks() {
   }
 }
 
+// Push one channel's mirrored insert chain to the engine as a load_rack
+// (Clear + Add-per-plugin). Returns whether anything was sent.
+function sendLoadRack(channel: number): boolean {
+  const chain = fxRacks[String(channel)];
+  if (!engineSocket || !Array.isArray(chain) || chain.length === 0) return false;
+  engineSocket.write(JSON.stringify({
+    type: 'load_rack', channel,
+    plugins: chain.map((p) => ({ uri: p.uri, enabled: p.enabled, params: p.params })),
+  }) + '\n');
+  return true;
+}
+
+// Self-heal: the engine echoes its real insert-chain lengths on `fxN`. If that
+// disagrees with our mirror for more than a few seconds (e.g. a load_rack got
+// dropped), re-push that channel. Grace period avoids fighting the normal
+// async apply right after an edit.
+const fxDriftSince = new Map<number, number>();
+function reconcileFxRacks(fxN: Record<string, number> | undefined): void {
+  if (!engineSocket || !fxN || typeof fxN !== 'object') return;
+  const now = Date.now();
+  const channels = new Set<number>([
+    ...Object.keys(fxRacks).map(Number),
+    ...Object.keys(fxN).map(Number),
+  ]);
+  for (const ch of channels) {
+    const want = fxRacks[String(ch)]?.length ?? 0;
+    const have = Number(fxN[String(ch)] ?? 0);
+    if (want === have) { fxDriftSince.delete(ch); continue; }
+    const since = fxDriftSince.get(ch);
+    if (since == null) { fxDriftSince.set(ch, now); continue; }
+    if (now - since > 3000) {
+      console.warn(`FX chain drift on ch ${ch}: engine ${have}, mirror ${want} — re-pushing`);
+      if (want === 0) engineSocket.write(JSON.stringify({ type: 'load_rack', channel: ch, plugins: [] }) + '\n');
+      else sendLoadRack(ch);
+      fxDriftSince.set(ch, now + 5000); // extra cooldown before another attempt
+    }
+  }
+}
+
 function saveFxRacks() {
   if (fxRacksSaveTimer) clearTimeout(fxRacksSaveTimer);
   fxRacksSaveTimer = setTimeout(() => {
@@ -2404,14 +2443,7 @@ const ipcServer = net.createServer((socket) => {
     }
     // Rebuild each channel's FX insert chain from the persisted snapshot.
     let rackCount = 0;
-    for (const [chId, chain] of Object.entries(fxRacks)) {
-      if (!engineSocket || !Array.isArray(chain) || chain.length === 0) continue;
-      engineSocket.write(JSON.stringify({
-        type: 'load_rack', channel: Number(chId),
-        plugins: chain.map((p) => ({ uri: p.uri, enabled: p.enabled, params: p.params })),
-      }) + '\n');
-      rackCount++;
-    }
+    for (const [chId] of Object.entries(fxRacks)) { if (sendLoadRack(Number(chId))) rackCount++; }
     if (rackCount > 0) console.log(`FX racks restored to engine: ${rackCount} channels.`);
     // Replay the active project's timeline so playback works after an engine
     // restart, same self-heal contract as routing.
@@ -2442,6 +2474,7 @@ const ipcServer = net.createServer((socket) => {
             maybePunch(parsed.transport);         // Phase 3e: auto drop-in/out + loop-record split
             maybeFinishBounce(parsed.transport);  // Phase 4: bounce done → report the file
             maybeRunAutomation(parsed.transport); // Phase 5: play automation envelopes
+            reconcileFxRacks(parsed.fxN);         // heal a dropped load_rack
             maybeAdvancePlaylist(parsed.transport); // Phase 5: back-to-back playout
             if (parsed.tc && typeof parsed.tc.tod === 'number') lastTodSec = parsed.tc.tod;
             if (parsed.transport && typeof parsed.transport.sr === 'number') lastSampleRate = parsed.transport.sr;

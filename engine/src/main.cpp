@@ -1633,6 +1633,22 @@ int main(int argc, char** argv) {
                 offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
             }
 
+            // ── Live insert-chain lengths ── so the server/UI can detect (and
+            //    heal) a drift between what they think the rack holds and what
+            //    the engine actually has. Only non-empty chains are listed.
+            {
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, ",\"fxN\":{");
+                bool ff = true;
+                for (const auto& pr : channels) {
+                    const size_t nfx = pr.second.insert_chain.size();
+                    if (nfx == 0) continue;
+                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                        "%s\"%d\":%zu", ff ? "" : ",", pr.first, nfx);
+                    ff = false;
+                }
+                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+            }
+
             // ── Transport position (engine-owned clock; UI/server follow).
             //    `buf` = the process block size, for the toolbar latency readout.
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
