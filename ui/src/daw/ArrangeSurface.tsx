@@ -164,26 +164,51 @@ export function ArrangeSurface() {
         return;
       }
 
-      // Phase 4 — take comping: swipe horizontally across a take lane (empty
-      // area or a take clip) to make that take the active one over the range.
+      // Phase 4 — take comping. On a take lane: an empty-area drag always
+      // swipes-to-comp; a drag on a take clip picks its gesture from the first
+      // move — mostly-horizontal = swipe-to-comp, mostly-vertical = move the
+      // clip (between lanes / tracks / along time).
       if ((hit.kind === 'take-lane' || (hit.kind === 'clip' && (hit.lane ?? 0) > 0))
           && hit.trackId != null && hit.lane) {
         const trackId = hit.trackId, lane = hit.lane;
-        const t0 = model.xToTime(e.clientX - rect.left);
-        let a = t0, b = t0, swiped = false;
-        drag(
-          (ev) => {
-            swiped = true;
+        const clipL = hit.clipId ? s.clips[hit.clipId] : undefined;
+        if (clipL) s.setSelectedClips([clipL.id]);
+        const sx = e.clientX, sy = e.clientY;
+        const t0 = model.xToTime(sx - rect.left);
+        const clip0Start = clipL?.start ?? 0;
+        const clip0Lane = clipL?.lane ?? 0;
+        let mode: '' | 'swipe' | 'move' = clipL ? '' : 'swipe';
+
+        const move = (ev: PointerEvent) => {
+          const dx = ev.clientX - sx, dy = ev.clientY - sy;
+          if (!mode) {
+            if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+            mode = Math.abs(dx) >= Math.abs(dy) ? 'swipe' : 'move';
+          }
+          if (mode === 'swipe') {
             const t = Math.max(0, model.xToTime(ev.clientX - rect.left));
-            a = Math.min(t0, t); b = Math.max(t0, t);
-            daw.getState().setCompPreview({ trackId, lane, fromSec: a, toSec: b });
-          },
-          () => {
+            daw.getState().setCompPreview({ trackId, lane, fromSec: Math.min(t0, t), toSec: Math.max(t0, t) });
+          } else if (clipL) {
+            daw.getState().updateClip(clipL.id, { start: Math.max(0, snap(clip0Start + dx / daw.getState().zoom)) });
+            const p = pt(ev);
+            const tgt = model.trackAtY(p.py);
+            const band = tgt ? model.laneAtY(tgt, p.py) : null;
+            const changed = !!tgt && (tgt.id !== trackId || (band ? band.lane : 0) !== clip0Lane);
+            daw.getState().setDragOverTrack(changed ? tgt!.id : null, changed ? (band ? band.lane : 0) : null);
+          }
+        };
+        drag(move, () => {
+          if (mode === 'swipe') {
+            const cp = daw.getState().compPreview;
             daw.getState().setCompPreview(null);
-            if (swiped && b - a > 0.03) daw.getState().compPick(trackId, a, b, lane);
-            else if (hit.clipId) s.setSelectedClips([hit.clipId]);
-          },
-        );
+            if (cp && cp.toSec - cp.fromSec > 0.03) daw.getState().compPick(trackId, cp.fromSec, cp.toSec, lane);
+          } else if (mode === 'move' && clipL) {
+            const over = daw.getState().dragOverTrackId;
+            const overLane = daw.getState().dragOverLane;
+            if (over != null) daw.getState().updateClip(clipL.id, { trackId: over, lane: (overLane ?? 0) || undefined });
+            daw.getState().setDragOverTrack(null);
+          }
+        });
         return;
       }
 
@@ -265,13 +290,18 @@ export function ArrangeSurface() {
         if (sel.length === 1) {
           const p = pt(ev);
           const tgt = model.trackAtY(p.py);
-          daw.getState().setDragOverTrack(tgt && tgt.id !== originTrack ? tgt.id : null);
+          const band = tgt ? model.laneAtY(tgt, p.py) : null;
+          const originLane = clip.lane || 0;
+          const changed = !!tgt && (tgt.id !== originTrack || (band ? band.lane : 0) !== originLane);
+          daw.getState().setDragOverTrack(changed ? tgt!.id : null, changed ? (band ? band.lane : 0) : null);
         }
       };
       drag(move, () => {
         const over = daw.getState().dragOverTrackId;
-        if (moved && sel.length === 1 && over != null && over !== originTrack) {
-          daw.getState().updateClip(clip.id, { trackId: over });
+        const overLane = daw.getState().dragOverLane;
+        if (moved && sel.length === 1 && over != null) {
+          const L = Math.max(0, overLane ?? 0);
+          daw.getState().updateClip(clip.id, { trackId: over, lane: L || undefined });
         }
         daw.getState().setDragOverTrack(null);
       });
