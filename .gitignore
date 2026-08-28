@@ -12,6 +12,7 @@ server/talkback_config.json
 server/mixer_state.json
 server/fx_racks.json
 server/vsc_config.json
+server/loudness_config.json
 
 # Saved DAW scenes (user session data)
 scenes/*.json
@@ -21,6 +22,12 @@ projects/
 
 # REAPER-compatible multitrack recording projects (.rpp + consolidated media)
 records/
+
+# As-run logs: loudness CSV + exported compliance reports (Phase 3c)
+logs/
+
+# Browser smoke test: run artifacts (browser lives in node_modules, already ignored)
+test/browser/.work/
 
 # Editor / OS
 .DS_Store

@@ -71,6 +71,16 @@ interface DawState {
   _engineSec: number;             // engine position (s) at the last transport msg
   _engineWall: number;            // performance.now() at the last transport msg
 
+  // Wall-clock anchor for the current take, for the as-run CSV's WallClock
+  // column: a marker at timeline second t occurred at
+  // _takeStartedAtMs + (t - _takeOriginSec) * 1000. Null when not recording.
+  _takeStartedAtMs: number | null;
+  _takeOriginSec: number;
+
+  // TIMELINE side-panel visibility (persisted so layout is sticky).
+  cuesOpen: boolean;
+  loudnessOpen: boolean;
+
   selectedClipIds: string[];
   clipboard: DawClip[];
 
@@ -106,6 +116,9 @@ interface DawState {
 
   applyTransport: (frame: number, state: number, sr: number) => void;
   flagPlaybackUnderrun: () => void;
+
+  setCuesOpen: (v: boolean) => void;
+  setLoudnessOpen: (v: boolean) => void;
 
   beginRecordingClips: (armed: number[], originSec: number, sr: number) => void;
   pushRecPeaks: (byTrack: Record<string, number[]>) => void;
@@ -224,6 +237,10 @@ export const useDawStore = create<DawState>()(
       recordOriginSec: null,
       _engineSec: 0,
       _engineWall: 0,
+      _takeStartedAtMs: null,
+      _takeOriginSec: 0,
+      cuesOpen: false,
+      loudnessOpen: false,
 
       selectedClipIds: [],
       clipboard: [],
@@ -245,6 +262,9 @@ export const useDawStore = create<DawState>()(
       setZoom: (zoom) => set({ zoom: Math.max(2, Math.min(400, zoom)) }),
       setScroll: (x, y) => set({ scrollX: Math.max(0, x), scrollY: Math.max(0, y) }),
       flagPlaybackUnderrun: () => { if (!get().playbackUnderrun) set({ playbackUnderrun: true }); },
+
+      setCuesOpen: (v) => set({ cuesOpen: v }),
+      setLoudnessOpen: (v) => set({ loudnessOpen: v }),
 
       setPeaks: (key, data) => {
         requestedPeaks.delete(key);
@@ -290,8 +310,16 @@ export const useDawStore = create<DawState>()(
         const sec = frame / sampleRate;
         const st = (state === 2 ? 2 : state === 1 ? 1 : 0) as 0 | 1 | 2;
         let recordOriginSec = s.recordOriginSec;
-        if (st === 2 && s.engineState !== 2) recordOriginSec = sec; // take just started
-        else if (st === 0) recordOriginSec = null;                  // parked
+        let takeStartedAtMs = s._takeStartedAtMs;
+        let takeOriginSec = s._takeOriginSec;
+        if (st === 2 && s.engineState !== 2) {                      // take just started
+          recordOriginSec = sec;
+          takeStartedAtMs = Date.now();
+          takeOriginSec = sec;
+        } else if (st === 0) {                                      // parked
+          recordOriginSec = null;
+          takeStartedAtMs = null;
+        }
         // Grow the live recording placeholders with the transport.
         let clips = s.clips;
         if (st === 2 && Object.keys(s.recordingClips).length) {
@@ -310,6 +338,8 @@ export const useDawStore = create<DawState>()(
           engineState: st,
           sampleRate,
           recordOriginSec,
+          _takeStartedAtMs: takeStartedAtMs,
+          _takeOriginSec: takeOriginSec,
           _engineSec: sec,
           _engineWall: performance.now(),
           ...(clips !== s.clips ? { clips } : {}),
@@ -595,6 +625,8 @@ export const useDawStore = create<DawState>()(
         snapToGrid: s.snapToGrid,
         gridSize: s.gridSize,
         fps: s.fps,
+        cuesOpen: s.cuesOpen,
+        loudnessOpen: s.loudnessOpen,
       }),
     }
   )

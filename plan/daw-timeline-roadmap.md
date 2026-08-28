@@ -229,24 +229,37 @@ work in `plan/unified-aes67-network-control.md`.
 - Not done: recurring/calendar schedules (daily HH:MM only); post-insert VSC
   capture tap (open question 4).
 
-### 3b. Markers & cue list
+### 3b. Markers & cue list — DONE 2026-08-28
 
-- Named markers on the ruler (`DawView.tsx` ruler block `:224-234`), add-at-
-  playhead, drag, jump-to (`,`/`.` keys), colour.
-- Persisted in the project (1c). Export as a timestamped CSV/log for as-run
-  documentation. Split-take-on-marker uses these.
+- [x] Named markers on the ruler, add-at-playhead (`M`), jump-to (`,`/`.`),
+  drag — landed in 3a; split-take-on-marker uses these.
+- [x] Cue-list side panel (`ui/src/components/daw/CueListPanel.tsx`, toggled
+  from the timeline toolbar): markers sorted by time, inline rename, colour
+  cycle, jump, delete, current-cue highlight, add-at-playhead.
+- [x] As-run CSV export (`Cue,Name,Timecode,Seconds,WallClock`) — client-side
+  via `ui/src/lib/download.ts`; `WallClock` derived from the active take's
+  wall-clock anchor (`useDawStore._takeStartedAtMs` / `_takeOriginSec`).
 
-### 3c. Loudness logging (compliance)
+### 3c. Loudness logging (compliance) — DONE 2026-08-28
 
 The engine already computes BS.1770 M/S/I + true-peak on the master
-(`main.cpp:900+`, README "Metering & analysis"). Log it over time:
+(`main.cpp:1200+`, README "Metering & analysis"). Logged over time:
 
-- Server subscribes to the loudness fields on the metering frame, appends
-  `{wallClock, projectFrame, M, S, I, TP}` to `logs/loudness-<date>.csv` at
-  ~1 Hz while transport is rolling or always-on.
-- UI: a loudness-history strip under the timeline (Integrated vs the −14 / −23
-  target line), and a "compliance report" export for a marked region
-  (EBU R128 / ATSC A/85 deliverables).
+- [x] Server parses the loudness fields off the metering frame in the IPC
+  handler (`maybeLogLoudness`), appends
+  `wallClock,projectFrame,sec,M,S,I,TP` to `logs/loudness-<date>.csv` at ~1 Hz
+  while the transport is rolling (settings toggle for always-on). In-memory
+  ring backs the UI strip.
+- [x] `loudness_config.json` — target (−14 / −23 / −24) + `logWhileStopped`;
+  WS `get`/`set_loudness_config`.
+- [x] UI loudness-history strip (`ui/src/components/daw/LoudnessHistory.tsx`):
+  Short-term area + Integrated line vs the target band, live M/S/I/TP readout,
+  target selector.
+- [x] Compliance-report export for the region bracketing the playhead
+  (`export_loudness_report` → `logs/report-<name>-<ts>.csv` with a summary
+  header: integrated, short-term max/mean, true-peak max, PASS/FAIL). Metrics
+  derived from the 1 Hz samples — noted in the report, not a sample-accurate
+  re-measure (that needs the Phase 4 bounce path).
 
 ### 3d. Timecode & sync
 
