@@ -165,7 +165,9 @@ void IpcClient::run() {
                                type == "transport_set_punch" || type == "set_metronome" ||
                                type == "bounce_start" || type == "bounce_abort" ||
                                type == "start_multitrack_record" || type == "stop_multitrack_record" ||
-                               type == "set_timeline" || type == "set_monitor_input_mask") {
+                               type == "set_timeline" || type == "set_monitor_input_mask" ||
+                               type == "transport_set_timecode" || type == "ltc_gen" ||
+                               type == "mtc_gen" || type == "ltc_chase") {
                         if (transport_callback_) transport_callback_(j);
                     } else {
                         int channel = j.value("channel", -1);

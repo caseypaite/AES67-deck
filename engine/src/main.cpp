@@ -10,7 +10,9 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <ctime>
 #include <jack/ringbuffer.h>
+#include <jack/midiport.h>
 #include "audio/JackClient.h"
 #include "plugins/Lv2Host.h"
 #include "ipc/IpcClient.h"
@@ -18,6 +20,7 @@
 #include "recorder/DiskWriter.h"
 #include "recorder/MultitrackRecorder.h"
 #include "playback/TimelinePlayer.h"
+#include "timecode/Timecode.h"
 
 using namespace aes67_deck;
 
@@ -289,6 +292,33 @@ static std::atomic<double> g_metro_fpb{24000.0};   // frames per beat = sr*60/bp
 static std::atomic<int>    g_metro_signum{4};
 static std::atomic<int>    g_metro_dest{0};        // 0 monitor, 1 master, 2 both
 
+// Count-in (plan Phase 5 tail) — N frames of metronome-only before the transport
+// rolls / recording begins. Set from the IPC thread with transport_play /
+// start_multitrack_record; counted down on the audio thread, which freezes the
+// transport and skips the recorder tap until it reaches 0. Uses g_metro_fpb /
+// g_metro_signum for the click (the server keeps those current with the tempo
+// even when the metronome is off).
+static std::atomic<int64_t> g_countin_frames{0};   // frames still to run (echoed)
+static std::atomic<int64_t> g_countin_total{0};    // its value when it started (for beat index)
+
+// Timecode & sync (plan/daw-timeline-roadmap.md Phase 3d). Written from the IPC
+// thread, read every audio block. The engine generates LTC on `ltc_out` + MTC
+// on `mtc_out`, and chases LTC on `ltc_in` (drives transport_locate). Status is
+// echoed on the metering frame's `tc` key.
+static std::atomic<int>     g_tc_fps{30};            // 24 | 25 | 30 (nominal integer rate)
+static std::atomic<int>     g_tc_df{0};              // 29.97 drop-frame (fps 30 only)
+static std::atomic<int>     g_tc_source{0};          // 0 = project transport, 1 = PTP time-of-day
+static std::atomic<int64_t> g_tc_offset_frames{0};   // project-zero -> TC start (in TC frames)
+static std::atomic<int>     g_ltc_gen{0};
+static std::atomic<float>   g_ltc_level{0.35f};
+static std::atomic<int>     g_mtc_gen{0};
+static std::atomic<int>     g_ltc_chase{0};
+static std::atomic<int>     g_ltc_chase_locked{0};   // echoed
+static std::atomic<int64_t> g_ltc_chase_frame{-1};   // last decoded TC frame, echoed (-1 = none)
+static std::atomic<double>  g_ltc_chase_err{0.0};    // flywheel: smoothed transport-vs-LTC error (ms), echoed
+static std::atomic<double>  g_tod_sec{0.0};          // seconds-of-day at the last block, echoed
+static std::atomic<float>   g_ltc_in_peak{0.0f};     // peak |ltc_in| while chasing, echoed (signal-present hint)
+
 // Virtual-soundcheck per-channel monitor source override. Bit (i-1) set => input
 // channel i monitors its LIVE JACK input even while the timeline is playing
 // (state 1); clear => it follows the transport like normal. Written from the IPC
@@ -426,6 +456,11 @@ int main(int argc, char** argv) {
     jack.register_input_port("talkback_R");
     const int TALKBACK_PORT_L = 2 * NUM_CHANNELS;
     const int TALKBACK_PORT_R = 2 * NUM_CHANNELS + 1;
+    // LTC chase input (plan Phase 3d) — appended so the positional indices above
+    // are unchanged. The operator patches a source (an AES67 receiver, a
+    // hardware loop) to this port.
+    jack.register_input_port("ltc_in");
+    const int LTC_IN_PORT = 2 * NUM_CHANNELS + 2;
 
     // Outputs: out_L/R (0,1), bus_101_L/R..bus_108_L/R (2..2+2*NUM_AUX-1),
     // then monitor_L/R.
@@ -440,6 +475,12 @@ int main(int argc, char** argv) {
     jack.register_output_port("monitor_R");
     const int MONITOR_PORT_L = 2 + 2 * NUM_AUX;
     const int MONITOR_PORT_R = 2 + 2 * NUM_AUX + 1;
+    // LTC generator output (plan Phase 3d) — appended, positional indices above
+    // unchanged. Patchbay-routable to any AES67 sink channel.
+    jack.register_output_port("ltc_out");
+    const int LTC_OUT_PORT = 2 + 2 * NUM_AUX + 2;
+    // MTC generator — a JACK MIDI port, kept in its own list.
+    jack.register_midi_output_port("mtc_out");
 
     ipc.set_command_callback([&channels, &recorder, &jack, &talkback](const std::string& type, int channel_id, int bus_id, float value) {
         if (channels.find(channel_id) != channels.end()) {
@@ -518,6 +559,9 @@ int main(int argc, char** argv) {
             // Don't clobber an in-progress recording (state 2).
             if (g_transport.state.load(std::memory_order_relaxed) != 2)
                 g_transport.state.store(1, std::memory_order_relaxed);
+            const int64_t ci = j.value("countinFrames", (int64_t)0);
+            if (ci > 0) { g_countin_total.store(ci, std::memory_order_relaxed);
+                          g_countin_frames.store(ci, std::memory_order_relaxed); }
 
         } else if (type == "transport_stop") {
             if (mtr.is_recording()) {
@@ -533,6 +577,7 @@ int main(int argc, char** argv) {
                 ipc.send_json(done.dump());
             }
             g_transport.state.store(0, std::memory_order_relaxed);
+            g_countin_frames.store(0, std::memory_order_relaxed);
 
         } else if (type == "transport_locate") {
             int64_t f = j.value("frame", (int64_t)0);
@@ -541,6 +586,32 @@ int main(int argc, char** argv) {
 
         } else if (type == "set_monitor_input_mask") {
             g_monitor_input_mask.store(j.value("mask", (uint32_t)0), std::memory_order_relaxed);
+
+        } else if (type == "transport_set_timecode") {
+            int fps = j.value("fps", 30);
+            if (fps != 24 && fps != 25 && fps != 30) fps = 30;
+            g_tc_fps.store(fps, std::memory_order_relaxed);
+            g_tc_df.store((j.value("df", false) && fps == 30) ? 1 : 0, std::memory_order_relaxed);
+            g_tc_source.store(j.value("source", std::string("project")) == "tod" ? 1 : 0,
+                              std::memory_order_relaxed);
+            g_tc_offset_frames.store(j.value("offsetFrames", (int64_t)0), std::memory_order_relaxed);
+
+        } else if (type == "ltc_gen") {
+            g_ltc_gen.store(j.value("enabled", false) ? 1 : 0, std::memory_order_relaxed);
+            float lv = j.value("level", 0.35f);
+            g_ltc_level.store(lv < 0.0f ? 0.0f : lv > 1.0f ? 1.0f : lv, std::memory_order_relaxed);
+
+        } else if (type == "mtc_gen") {
+            g_mtc_gen.store(j.value("enabled", false) ? 1 : 0, std::memory_order_relaxed);
+
+        } else if (type == "ltc_chase") {
+            g_ltc_chase.store(j.value("enabled", false) ? 1 : 0, std::memory_order_relaxed);
+            if (!j.value("enabled", false)) {
+                g_ltc_chase_locked.store(0, std::memory_order_relaxed);
+                g_ltc_chase_frame.store(-1, std::memory_order_relaxed);
+                g_ltc_in_peak.store(0.0f, std::memory_order_relaxed);
+                g_ltc_chase_err.store(0.0, std::memory_order_relaxed);
+            }
 
         } else if (type == "transport_set_loop") {
             uint64_t s = j.value("start", (uint64_t)0);
@@ -615,6 +686,11 @@ int main(int argc, char** argv) {
                 return;
             }
             g_transport.state.store(2, std::memory_order_relaxed);
+            {
+                const int64_t ci = j.value("countinFrames", (int64_t)0);
+                if (ci > 0) { g_countin_total.store(ci, std::memory_order_relaxed);
+                              g_countin_frames.store(ci, std::memory_order_relaxed); }
+            }
             nlohmann::json started{{"type", "take_started"}, {"dir", mtr.dir()},
                                    {"originFrame", origin}, {"sampleRate", sr_i},
                                    {"armed", mtr.armed()}, {"ext", mtr.file_ext()}};
@@ -740,11 +816,27 @@ int main(int argc, char** argv) {
     // Metronome click voice (audio thread only).
     double metro_remain = 0.0, metro_phase = 0.0, metro_freq = 1000.0, metro_amp = 0.0;
     long long metro_last_beat = -1;
+    // Count-in click voice (audio thread only) — plan Phase 5 tail.
+    double ci_remain = 0.0, ci_phase = 0.0, ci_freq = 1000.0, ci_amp = 0.0;
+    long long ci_last_beat = -1;
     std::vector<float> tmp_L(8192, 0.0f);
     std::vector<float> tmp_R(8192, 0.0f);
     std::vector<float> tmp_out_L(8192, 0.0f);
     std::vector<float> tmp_out_R(8192, 0.0f);
     std::vector<char> meter_json(32768, 0);   // headroom for live-record peak batches
+
+    // Timecode & sync engines (audio thread only) — plan Phase 3d.
+    timecode::LtcEncoder ltc_enc;
+    timecode::LtcDecoder ltc_dec;
+    timecode::MtcEncoder mtc_enc;
+    timecode::MtcEvent   mtc_events[48];
+    int chase_starve_blocks = 0;
+    bool ltc_anchored = false;       // flywheel: transport jam-synced to the incoming LTC
+    bool ltc_chase_prev = false;
+    double ltc_err_smooth = 0.0;     // samples (transport behind LTC = positive)
+    int  ltc_corr = 0;               // per-block transport nudge toward zero error
+    int  ltc_recue_votes = 0;        // consecutive gross-error decodes before a re-cue
+    int  ltc_settle_blocks = 0;      // fast-converge window right after anchoring
 
     jack.set_process_callback([&](jack_nframes_t nframes) {
         auto inputs = jack.get_input_ports();
@@ -764,6 +856,163 @@ int main(int argc, char** argv) {
         const uint64_t block_start_frame = g_transport.frame.load(std::memory_order_relaxed);
         const int transport_state = g_transport.state.load(std::memory_order_relaxed);
         player.set_transport(block_start_frame, transport_state);
+
+        // ── Count-in (plan Phase 5 tail) ── while frames remain: clicks only,
+        // transport frozen, nothing mixed or recorded. Ends exactly on a block
+        // boundary, after which the normal path resumes with the transport at
+        // its origin and the recorder tap live.
+        {
+            int64_t countin = g_countin_frames.load(std::memory_order_relaxed);
+            if (countin > 0) {
+                for (jack_port_t* p : outputs) {
+                    float* b = jack.get_buffer(p, nframes);
+                    if (b) std::memset(b, 0, sizeof(float) * nframes);
+                }
+                for (jack_port_t* mp : jack.get_midi_output_ports())
+                    jack_midi_clear_buffer(jack_port_get_buffer(mp, nframes));
+
+                const int64_t total = std::max<int64_t>(1, g_countin_total.load(std::memory_order_relaxed));
+                const double  fpb   = std::max(1.0, g_metro_fpb.load(std::memory_order_relaxed));
+                const int     signum = std::max(1, g_metro_signum.load(std::memory_order_relaxed));
+                const int     dest   = g_metro_dest.load(std::memory_order_relaxed);
+                float* oL = jack.get_buffer(outputs[0], nframes);
+                float* oR = jack.get_buffer(outputs[1], nframes);
+                float* mL = outputs.size() > (size_t)MONITOR_PORT_L ? jack.get_buffer(outputs[MONITOR_PORT_L], nframes) : nullptr;
+                float* mR = outputs.size() > (size_t)MONITOR_PORT_R ? jack.get_buffer(outputs[MONITOR_PORT_R], nframes) : nullptr;
+                const bool to_mon = (dest == 0 || dest == 2);
+                const bool to_mst = (dest == 1 || dest == 2);
+                const double CI_LEN = sr * 0.035;   // 35 ms click
+
+                for (jack_nframes_t s = 0; s < nframes && countin > 0; ++s, --countin) {
+                    const int64_t elapsed = total - countin;
+                    const long long beat = (long long)((double)elapsed / fpb);
+                    if (beat != ci_last_beat) {
+                        ci_last_beat = beat;
+                        const bool down = (beat % signum) == 0;
+                        ci_freq = down ? 1760.0 : 1245.0;
+                        ci_amp  = down ? 0.5 : 0.3;
+                        ci_remain = CI_LEN;
+                        ci_phase = 0.0;
+                    }
+                    if (ci_remain > 0.0) {
+                        const double env = ci_remain / CI_LEN;
+                        const float smp = (float)(std::sin(ci_phase) * ci_amp * env * env);
+                        if (to_mon) { if (mL) mL[s] += smp; if (mR) mR[s] += smp; }
+                        if (to_mst) { if (oL) oL[s] += smp; if (oR) oR[s] += smp; }
+                        ci_phase += 2.0 * M_PI * ci_freq / sr;
+                        ci_remain -= 1.0;
+                    }
+                }
+                g_countin_frames.store(countin, std::memory_order_relaxed);
+
+                // Throttled minimal metering so the UI can show the count-in.
+                frame_counter += static_cast<int>(nframes);
+                if (frame_counter >= meter_interval_frames) {
+                    frame_counter = 0;
+                    snprintf(meter_json.data(), meter_json.size(),
+                        "{\"type\":\"metering\",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d},"
+                        "\"tc\":{\"countin\":%lld}}",
+                        static_cast<unsigned long long>(block_start_frame), transport_state,
+                        static_cast<int>(sr), static_cast<long long>(countin));
+                    ipc.send_multichannel_metering(meter_json.data());
+                }
+                return;
+            }
+            ci_last_beat = -1;
+        }
+
+        // ── Timecode & sync (plan Phase 3d) ── sample the PTP-disciplined wall
+        // clock, work out the timecode at sample 0 of this block, then chase
+        // incoming LTC (generation happens after the mix, near the end).
+        struct timespec ts_now;
+        clock_gettime(CLOCK_REALTIME, &ts_now);
+        const double tod_sec = static_cast<double>(ts_now.tv_sec % 86400) + ts_now.tv_nsec * 1e-9;
+        g_tod_sec.store(tod_sec, std::memory_order_relaxed);
+        const int  tc_fps    = g_tc_fps.load(std::memory_order_relaxed);
+        const bool tc_df     = g_tc_df.load(std::memory_order_relaxed) != 0;
+        const int  tc_source = g_tc_source.load(std::memory_order_relaxed);
+        const int64_t tc_off = g_tc_offset_frames.load(std::memory_order_relaxed);
+        const double sr_per_tcf = timecode::sr_per_tc_frame(sr, tc_fps, tc_df);
+        int64_t tc_frame0 = tc_source == 1
+            ? static_cast<int64_t>(std::llround(tod_sec * sr / sr_per_tcf))
+            : static_cast<int64_t>(std::llround(block_start_frame / sr_per_tcf)) + tc_off;
+        if (tc_frame0 < 0) tc_frame0 = 0;
+
+        // ── LTC chase (plan Phase 3d follow-up: jam-sync then flywheel) ──
+        // On the first clean decode we jam the transport once; after that we
+        // trust the JACK clock (same PTP media clock the LTC rides on this box)
+        // and only re-jam on a gross discontinuity. Dropouts are ridden through
+        // — the transport never stops on signal loss once anchored.
+        const bool chase_on = g_ltc_chase.load(std::memory_order_relaxed) != 0;
+        ltc_corr = 0;
+        if (chase_on && inputs.size() > static_cast<size_t>(LTC_IN_PORT)) {
+            if (!ltc_chase_prev) {
+                ltc_anchored = false; ltc_err_smooth = 0.0; chase_starve_blocks = 0;
+                ltc_recue_votes = 0; ltc_settle_blocks = 0;
+                ltc_dec.reset();   // drop any stale shift-register / bit-clock state
+            }
+            if (ltc_settle_blocks > 0) --ltc_settle_blocks;
+            float* ltc_in = jack.get_buffer(inputs[LTC_IN_PORT], nframes);
+            if (ltc_in) {
+                float pk = 0.0f;
+                for (jack_nframes_t s = 0; s < nframes; ++s) pk = std::max(pk, std::fabs(ltc_in[s]));
+                g_ltc_in_peak.store(pk, std::memory_order_relaxed);
+            }
+            const bool got = ltc_in && ltc_dec.process(ltc_in, nframes, sr_per_tcf / 160.0);
+            if (got) {
+                chase_starve_blocks = 0;
+                timecode::SmpteTime st = ltc_dec.last();
+                const int64_t dec_tcf = timecode::smpte_to_frames(st, tc_fps, tc_df);
+                g_ltc_chase_frame.store(dec_tcf, std::memory_order_relaxed);
+                g_ltc_chase_locked.store(1, std::memory_order_relaxed);
+                const double now_samp =
+                    static_cast<double>(dec_tcf + 1 - tc_off) * sr_per_tcf - ltc_dec.end_offset();
+                int64_t target = static_cast<int64_t>(std::llround(now_samp));
+                if (target < 0) target = 0;
+                const int64_t err = target - static_cast<int64_t>(block_start_frame);
+                if (!ltc_anchored) {
+                    g_transport.locate_to.store(target, std::memory_order_relaxed);   // jam once
+                    ltc_anchored = true;
+                    ltc_err_smooth = 0.0;
+                    ltc_recue_votes = 0;
+                    ltc_settle_blocks = 512;   // ~2 s fast-converge window
+                    if (g_transport.state.load(std::memory_order_relaxed) == 0)
+                        g_transport.state.store(1, std::memory_order_relaxed);
+                } else if (std::llabs(err) > static_cast<int64_t>(0.5 * sr)) {
+                    // A gross error — but only re-cue after several agreeing
+                    // decodes so a single garbled frame can't slam the transport.
+                    if (++ltc_recue_votes >= 5) {
+                        g_transport.locate_to.store(target, std::memory_order_relaxed);
+                        ltc_err_smooth = 0.0;
+                        ltc_recue_votes = 0;
+                        ltc_settle_blocks = 512;
+                    }
+                } else if (ltc_settle_blocks > 0 &&
+                           std::llabs(err) > static_cast<int64_t>(0.4 * sr_per_tcf)) {
+                    // Fast converge just after (re-)acquiring: a handful of small
+                    // locates instead of waiting for the servo.
+                    g_transport.locate_to.store(target, std::memory_order_relaxed);
+                    ltc_err_smooth = 0.0;
+                    ltc_recue_votes = 0;
+                } else {
+                    ltc_recue_votes = 0;
+                    // Flywheel servo: slew a few samples/block toward the LTC.
+                    // Forward nudges are free; a small backward nudge stays well
+                    // under TimelinePlayer's discontinuity threshold.
+                    ltc_err_smooth += (static_cast<double>(err) - ltc_err_smooth) * 0.0625;
+                    ltc_corr = std::clamp(static_cast<int>(std::llround(ltc_err_smooth * 0.08)), -6, 6);
+                }
+                g_ltc_chase_err.store(ltc_err_smooth * 1000.0 / sr, std::memory_order_relaxed);
+            } else if (ltc_anchored) {
+                // Flywheel through the dropout; drop the LOCK lamp only after a
+                // long sustained loss — the transport keeps rolling regardless.
+                if (++chase_starve_blocks * static_cast<int>(nframes) > static_cast<int>(sr * 5.0))
+                    g_ltc_chase_locked.store(0, std::memory_order_relaxed);
+            } else if (++chase_starve_blocks * static_cast<int>(nframes) > static_cast<int>(sr * 0.25)) {
+                g_ltc_chase_locked.store(0, std::memory_order_relaxed);
+            }
+        }
+        ltc_chase_prev = chase_on;
 
         // Apply any queued plugin-chain mutations before processing any
         // channel this cycle — insert_chain is only ever touched here, on
@@ -1405,6 +1654,23 @@ int main(int argc, char** argv) {
                 g_bounce_state.load(std::memory_order_relaxed),
                 recorder.had_overrun() ? 1 : 0);
 
+            // ── Timecode & sync status (plan Phase 3d) ──
+            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                ",\"tc\":{\"src\":%d,\"fps\":%d,\"df\":%d,\"off\":%lld,\"tod\":%.3f,"
+                "\"gen\":%d,\"mtc\":%d,\"chase\":%d,\"lock\":%d,\"in\":%lld,\"inpk\":%.3f,"
+                "\"countin\":%lld,\"err\":%.1f,\"fly\":%d}",
+                tc_source, tc_fps, tc_df ? 1 : 0, static_cast<long long>(tc_off),
+                g_tod_sec.load(std::memory_order_relaxed),
+                g_ltc_gen.load(std::memory_order_relaxed),
+                g_mtc_gen.load(std::memory_order_relaxed),
+                g_ltc_chase.load(std::memory_order_relaxed),
+                g_ltc_chase_locked.load(std::memory_order_relaxed),
+                static_cast<long long>(g_ltc_chase_frame.load(std::memory_order_relaxed)),
+                g_ltc_in_peak.load(std::memory_order_relaxed),
+                static_cast<long long>(g_countin_frames.load(std::memory_order_relaxed)),
+                g_ltc_chase_err.load(std::memory_order_relaxed),
+                ltc_anchored ? 1 : 0);
+
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 
             ipc.send_multichannel_metering(meter_json.data());
@@ -1417,9 +1683,51 @@ int main(int argc, char** argv) {
             g_bounce_state.compare_exchange_strong(finished, 0, std::memory_order_relaxed);
         }
 
+        // ── Timecode generators (plan Phase 3d) ── run after the mix so the
+        // LTC carrier never leaks into a bus. Free-run while the source is
+        // time-of-day or the transport is rolling.
+        {
+            const timecode::SmpteTime tc0 =
+                timecode::frames_to_smpte(tc_frame0, tc_fps, tc_df);
+            const bool tc_running = (tc_source == 1) || (transport_state != 0);
+
+            if (outputs.size() > static_cast<size_t>(LTC_OUT_PORT)) {
+                float* lo = jack.get_buffer(outputs[LTC_OUT_PORT], nframes);
+                if (lo) {
+                    if (g_ltc_gen.load(std::memory_order_relaxed))
+                        ltc_enc.generate(lo, static_cast<int>(nframes), tc0, tc_running,
+                                         sr_per_tcf, tc_fps, tc_df,
+                                         g_ltc_level.load(std::memory_order_relaxed));
+                    else
+                        std::memset(lo, 0, sizeof(float) * nframes);
+                }
+            }
+
+            auto midi_ports = jack.get_midi_output_ports();
+            if (!midi_ports.empty()) {
+                void* mb = jack_port_get_buffer(midi_ports[0], nframes);
+                jack_midi_clear_buffer(mb);
+                if (g_mtc_gen.load(std::memory_order_relaxed)) {
+                    const int ne = mtc_enc.generate(tc0, tc_running, sr_per_tcf, tc_fps,
+                                                    tc_df, static_cast<int>(nframes),
+                                                    mtc_events, 48);
+                    for (int e = 0; e < ne; ++e) {
+                        jack_nframes_t at = static_cast<jack_nframes_t>(
+                            std::clamp(mtc_events[e].offset, 0, static_cast<int>(nframes) - 1));
+                        jack_midi_data_t* d = jack_midi_event_reserve(mb, at, mtc_events[e].len);
+                        if (d) std::memcpy(d, mtc_events[e].bytes, mtc_events[e].len);
+                    }
+                }
+            }
+        }
+
         // ── Transport ── advance the clock past the block just processed.
         if (transport_state != 0) {
-            uint64_t next = block_start_frame + nframes;
+            // ltc_corr: flywheel-chase servo nudge (bounded ±6 samples/block, so
+            // the net advance never trips TimelinePlayer's discontinuity check).
+            int64_t adv = static_cast<int64_t>(nframes) + ltc_corr;
+            if (adv < 1) adv = 1;
+            uint64_t next = block_start_frame + static_cast<uint64_t>(adv);
             if (g_transport.loop_enabled.load(std::memory_order_relaxed)) {
                 const uint64_t ls = g_transport.loop_start.load(std::memory_order_relaxed);
                 const uint64_t le = g_transport.loop_end.load(std::memory_order_relaxed);

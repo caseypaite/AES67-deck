@@ -30,6 +30,7 @@ export interface RppTrack {
 export interface RppProject {
   sampleRate: number;
   tempo: number;
+  timeSig?: { num: number; den: number };
   tracks: RppTrack[];
   markers: { position: number; name: string }[];
 }
@@ -73,7 +74,7 @@ export function buildRpp(p: RppProject): string {
   L.push(`  SAMPLERATE ${p.sampleRate || 48000} 0 0`);
   L.push('  LOCK 1');
   L.push('  GLOBAL_AUTO -1');
-  L.push(`  TEMPO ${p.tempo || 120} 4 4`);
+  L.push(`  TEMPO ${p.tempo || 120} ${p.timeSig?.num || 4} ${p.timeSig?.den || 4}`);
   L.push('  PLAYRATE 1 0 0.25 4');
   L.push('  SELECTION 0 0');
   L.push('  SELECTION2 0 0');
@@ -219,7 +220,12 @@ export function parseRpp(text: string): RppProject {
   if (!root || root.tag !== 'REAPER_PROJECT') return proj;
 
   proj.sampleRate = num(lineVal(root, 'SAMPLERATE')?.[0], 48000) || 48000;
-  proj.tempo = num(lineVal(root, 'TEMPO')?.[0], 120) || 120;
+  const tempoLine = lineVal(root, 'TEMPO');
+  proj.tempo = num(tempoLine?.[0], 120) || 120;
+  if (tempoLine && tempoLine.length >= 3) {
+    const tn = num(tempoLine[1], 4), td = num(tempoLine[2], 4);
+    if (tn >= 1 && td >= 1) proj.timeSig = { num: tn, den: td };
+  }
 
   for (const l of root.lines) {
     if (l[0] === 'MARKER' && l.length >= 4 && l[4] !== '1' /* not a region */) {

@@ -20,6 +20,9 @@ public:
 
     void register_input_port(const std::string& port_name);
     void register_output_port(const std::string& port_name);
+    // MIDI output port (JACK_DEFAULT_MIDI_TYPE) — kept separate from the audio
+    // output list so positional audio-port indices stay stable. Used for MTC.
+    void register_midi_output_port(const std::string& port_name);
 
     void set_process_callback(std::function<void(jack_nframes_t)> callback);
 
@@ -32,6 +35,7 @@ public:
     // Access registered ports
     const std::vector<jack_port_t*>& get_input_ports() const { return input_ports_; }
     const std::vector<jack_port_t*>& get_output_ports() const { return output_ports_; }
+    const std::vector<jack_port_t*>& get_midi_output_ports() const { return midi_output_ports_; }
 
 private:
     static int process_callback_wrapper(jack_nframes_t nframes, void* arg);
@@ -42,6 +46,7 @@ private:
     
     std::vector<jack_port_t*> input_ports_;
     std::vector<jack_port_t*> output_ports_;
+    std::vector<jack_port_t*> midi_output_ports_;
     
     std::function<void(jack_nframes_t)> process_callback_;
 };

@@ -1,7 +1,8 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore, type Channel } from '../stores/useMixerStore';
-import { RULER_H, DEFAULT_TRACK_H, LANE_H, TRACK_BG_ODD, TRACK_BG_EVEN } from './SurfaceModel';
+import { RULER_H, DEFAULT_TRACK_H, LANE_H, AUTO_LANE_H, TRACK_BG_ODD, TRACK_BG_EVEN } from './SurfaceModel';
+import { AutoLanePicker } from '../components/daw/AutoLanePicker';
 
 // Neutral (off-state) button — legible on the lightened track rows.
 const OFF_BTN = 'bg-[#3b414d] text-gray-200 hover:bg-[#474e5c]';
@@ -23,7 +24,15 @@ export function TrackPanel({ width }: { width: number }) {
   const clips = useDawStore((s) => s.clips);
   const laneExpand = useDawStore((s) => s.laneExpand);
   const toggleLaneExpand = useDawStore((s) => s.toggleLaneExpand);
+  const automation = useDawStore((s) => s.automation);
+  const autoExpand = useDawStore((s) => s.autoExpand);
+  const toggleAutoExpand = useDawStore((s) => s.toggleAutoExpand);
+  const removeAutoLane = useDawStore((s) => s.removeAutoLane);
+  const setAutoLaneEnabled = useDawStore((s) => s.setAutoLaneEnabled);
+  const setAutoLaneArmed = useDawStore((s) => s.setAutoLaneArmed);
+  const automationMode = useDawStore((s) => s.automationMode);
   const outerRef = useRef<HTMLDivElement>(null);
+  const [pickerFor, setPickerFor] = useState<number | null>(null);
 
   const tracks = Object.values(channels).filter((c: Channel) => c.type === 'input').sort((a, b) => a.id - b.id);
 
@@ -33,11 +42,16 @@ export function TrackPanel({ width }: { width: number }) {
     const L = c.lane || 0;
     if (L > (laneCounts[c.trackId] || 0)) laneCounts[c.trackId] = L;
   }
+  const autoByTrack: Record<number, typeof automation[string][]> = {};
+  for (const lane of Object.values(automation)) (autoByTrack[lane.target.channelId] ||= []).push(lane);
 
   const contentH = RULER_H + tracks.reduce((sum, t) => {
     const compH = heights[t.id] || DEFAULT_TRACK_H;
     const lanes = laneCounts[t.id] || 0;
-    return sum + compH + (laneExpand[t.id] && lanes > 0 ? LANE_H * lanes : 0);
+    const autos = autoByTrack[t.id]?.length || 0;
+    return sum + compH
+      + (laneExpand[t.id] && lanes > 0 ? LANE_H * lanes : 0)
+      + (autoExpand[t.id] && autos > 0 ? AUTO_LANE_H * autos : 0);
   }, 0);
 
   // Wheel over the track headers scrolls the shared vertical position, so you
@@ -58,7 +72,10 @@ export function TrackPanel({ width }: { width: number }) {
           const compH = heights[t.id] || DEFAULT_TRACK_H;
           const lanes = laneCounts[t.id] || 0;
           const expanded = !!laneExpand[t.id] && lanes > 0;
-          const h = compH + (expanded ? LANE_H * lanes : 0);
+          const autoLanes = autoByTrack[t.id] || [];
+          const autoOpen = !!autoExpand[t.id] && autoLanes.length > 0;
+          const h = compH + (expanded ? LANE_H * lanes : 0) + (autoOpen ? AUTO_LANE_H * autoLanes.length : 0);
+          const autoTop = compH + (expanded ? LANE_H * lanes : 0);
           const compact = compH < 74;
           return (
             <div
@@ -84,8 +101,21 @@ export function TrackPanel({ width }: { width: number }) {
                 {lanes > 0 && (
                   <span className="text-[8px] text-gray-200 bg-black/55 px-1 rounded shrink-0 mr-1" title="take lanes">⧉{lanes}</span>
                 )}
+                {autoLanes.length > 0 && (
+                  <button
+                    onClick={() => toggleAutoExpand(t.id)}
+                    title={autoOpen ? 'Hide automation lanes' : `Show ${autoLanes.length} automation lane${autoLanes.length > 1 ? 's' : ''}`}
+                    className={`text-[8px] px-1 rounded shrink-0 mr-1 ${autoOpen ? 'bg-sky-700 text-white' : OFF_BTN}`}
+                  >⌁{autoLanes.length}</button>
+                )}
+                <button
+                  onClick={() => setPickerFor(pickerFor === t.id ? null : t.id)}
+                  title="Add an automation lane"
+                  className={`w-4 h-4 shrink-0 mr-1 flex items-center justify-center text-[10px] rounded ${OFF_BTN}`}
+                >+</button>
                 <span className="text-[9px] text-gray-200 bg-black/55 px-1 rounded shrink-0">{t.id}</span>
               </div>
+              {pickerFor === t.id && <AutoLanePicker channelId={t.id} onClose={() => setPickerFor(null)} />}
               <div className="flex gap-1 mt-1">
                 {(['arm', 'solo', 'mute'] as const).map((k) => {
                   const on = t[k];
@@ -126,6 +156,32 @@ export function TrackPanel({ width }: { width: number }) {
                   style={{ top: compH + LANE_H * k, height: LANE_H }}
                 >
                   take {k + 1}
+                </div>
+              ))}
+              {autoOpen && autoLanes.map((lane, k) => (
+                <div
+                  key={lane.id}
+                  className="absolute left-0 right-0 border-t border-white/15 bg-black/35 px-1 py-0.5 flex flex-col gap-0.5"
+                  style={{ top: autoTop + AUTO_LANE_H * k, height: AUTO_LANE_H }}
+                >
+                  <div className="text-[8px] font-bold text-sky-300 truncate" title={lane.target.label}>⌁ {lane.target.label}</div>
+                  <div className="flex gap-1 items-center">
+                    <button
+                      onClick={() => setAutoLaneEnabled(lane.id, !lane.enabled)}
+                      title="Read (play this envelope)"
+                      className={`px-1 rounded text-[8px] font-bold ${lane.enabled ? 'bg-sky-600 text-white' : OFF_BTN}`}
+                    >R</button>
+                    <button
+                      onClick={() => setAutoLaneArmed(lane.id, !lane.armed)}
+                      title="Arm for write-capture (needs automation mode = WRITE)"
+                      className={`px-1 rounded text-[8px] font-bold ${lane.armed ? 'bg-red-600 text-white' : OFF_BTN} ${automationMode !== 'write' ? 'opacity-50' : ''}`}
+                    >W</button>
+                    <button
+                      onClick={() => removeAutoLane(lane.id)}
+                      title="Delete lane"
+                      className={`ml-auto px-1 rounded text-[8px] font-bold ${OFF_BTN} hover:!bg-red-700`}
+                    >✕</button>
+                  </div>
                 </div>
               ))}
               <div

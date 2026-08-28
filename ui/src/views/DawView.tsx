@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react';
-import { useDawStore } from '../stores/useDawStore';
+import { useDawStore, beatSec } from '../stores/useDawStore';
 import { useMixerStore } from '../stores/useMixerStore';
 import { ArrangeSurface } from '../daw/ArrangeSurface';
 import { TrackPanel } from '../daw/TrackPanel';
 import { CueListPanel } from '../components/daw/CueListPanel';
 import { LoudnessHistory } from '../components/daw/LoudnessHistory';
 import { BounceDialog } from '../components/daw/BounceDialog';
+import { TimecodePanel } from '../components/daw/TimecodePanel';
+import { VideoPanel } from '../components/daw/VideoPanel';
+import { PlaylistPanel } from '../components/daw/PlaylistPanel';
 
 const PANEL_W = 208;
 
@@ -15,7 +18,7 @@ export const DawView = () => {
   const snapToGrid = useDawStore((s) => s.snapToGrid);
   const setSnapToGrid = useDawStore((s) => s.setSnapToGrid);
   const fps = useDawStore((s) => s.fps);
-  const setFps = useDawStore((s) => s.setFps);
+  const dropFrame = useDawStore((s) => s.dropFrame);
   const tempo = useDawStore((s) => s.tempo);
   const setTempo = useDawStore((s) => s.setTempo);
   const timeSig = useDawStore((s) => s.timeSig);
@@ -26,6 +29,21 @@ export const DawView = () => {
   const setMetronomeOn = useDawStore((s) => s.setMetronomeOn);
   const metroDest = useDawStore((s) => s.metroDest);
   const setMetroDest = useDawStore((s) => s.setMetroDest);
+  const beatDiv = useDawStore((s) => s.beatDiv);
+  const setBeatDiv = useDawStore((s) => s.setBeatDiv);
+  const countInBars = useDawStore((s) => s.countInBars);
+  const setCountInBars = useDawStore((s) => s.setCountInBars);
+  const countInActive = useDawStore((s) => s.countInActive);
+  const compCrossfadeSec = useDawStore((s) => s.compCrossfadeSec);
+  const setCompCrossfadeSec = useDawStore((s) => s.setCompCrossfadeSec);
+  const automationMode = useDawStore((s) => s.automationMode);
+  const setAutomationMode = useDawStore((s) => s.setAutomationMode);
+  const videoOpen = useDawStore((s) => s.videoOpen);
+  const setVideoOpen = useDawStore((s) => s.setVideoOpen);
+  const hasVideo = useDawStore((s) => !!s.video);
+  const playlistOpen = useDawStore((s) => s.playlistOpen);
+  const setPlaylistOpen = useDawStore((s) => s.setPlaylistOpen);
+  const playlistRunning = useDawStore((s) => s.playlistStatus.running);
   const lastOverrun = useDawStore((s) => s.lastOverrun);
   const playbackUnderrun = useDawStore((s) => s.playbackUnderrun);
   const cuesOpen = useDawStore((s) => s.cuesOpen);
@@ -33,7 +51,13 @@ export const DawView = () => {
   const loudnessOpen = useDawStore((s) => s.loudnessOpen);
   const setLoudnessOpen = useDawStore((s) => s.setLoudnessOpen);
   const [bounceOpen, setBounceOpen] = useState(false);
+  const [tcOpen, setTcOpen] = useState(false);
   const bounceState = useDawStore((s) => s.bounceState);
+  const ltcChaseOn = useDawStore((s) => s.ltcChaseOn);
+  const ltcChaseLocked = useDawStore((s) => s.ltcChaseLocked);
+  const tcSource = useDawStore((s) => s.tcSource);
+  const ltcGenOn = useDawStore((s) => s.ltcGenOn);
+  const mtcGenOn = useDawStore((s) => s.mtcGenOn);
   const vscMessage = useMixerStore((s) => s.vscStatus.message);
   const vscDiskLow = useMixerStore((s) => s.vscStatus.diskLow);
 
@@ -94,7 +118,11 @@ export const DawView = () => {
         const d = useDawStore.getState();
         if (!d.selectedClipIds.length) return;
         e.preventDefault();
-        const fine = e.altKey ? 1 / d.fps : (d.snapToGrid ? d.gridSize : 0.1);
+        const fine = e.altKey
+          ? 1 / d.fps
+          : d.gridMode === 'bars'
+            ? beatSec(d.tempo) / Math.max(1, d.beatDiv)
+            : (d.snapToGrid ? d.gridSize : 0.1);
         const step = (e.shiftKey ? fine * 5 : fine) * (e.key === 'ArrowLeft' ? -1 : 1);
         d.nudgeSelected(step);
       }
@@ -128,15 +156,18 @@ export const DawView = () => {
     `px-2.5 py-1 text-xs font-bold rounded transition-colors ${active ? activeCls : OFF}`;
 
   return (
-    <div className="w-full h-full flex flex-col bg-[#16181d] select-none outline-none" tabIndex={0}>
+    <div className="relative w-full h-full flex flex-col bg-[#16181d] select-none outline-none" tabIndex={0}>
       <div className="flex-1 min-h-0 flex overflow-hidden">
         <TrackPanel width={PANEL_W} />
         <ArrangeSurface />
         {cuesOpen && <CueListPanel />}
+        {playlistOpen && <PlaylistPanel />}
       </div>
 
+      {videoOpen && <VideoPanel />}
       {loudnessOpen && <LoudnessHistory />}
       {bounceOpen && <BounceDialog onClose={() => setBounceOpen(false)} />}
+      {tcOpen && <TimecodePanel onClose={() => setTcOpen(false)} />}
 
       {(lastOverrun || playbackUnderrun) && (
         <div className="absolute bottom-[46px] left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400">
@@ -146,6 +177,13 @@ export const DawView = () => {
       {(vscMessage || vscDiskLow) && (
         <div className={`absolute bottom-[46px] left-8 z-40 px-3 py-1.5 rounded text-white text-xs font-bold shadow-xl border ${(lastOverrun || playbackUnderrun) ? 'translate-y-[-32px] ' : ''}${vscDiskLow ? 'bg-red-700 border-red-400' : 'bg-blue-700 border-blue-400'}`}>
           {vscDiskLow ? '⚠ ' : ''}{vscMessage || 'Disk space low'}
+        </div>
+      )}
+      {countInActive > 0 && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center pointer-events-none">
+          <div className="px-8 py-4 rounded-xl bg-amber-600/90 text-white text-4xl font-black tracking-widest shadow-2xl animate-pulse">
+            COUNT-IN
+          </div>
         </div>
       )}
 
@@ -187,10 +225,25 @@ export const DawView = () => {
           className={`shrink-0 ${tBtn(cuesOpen)}`}>CUES</button>
         <button onClick={() => setLoudnessOpen(!loudnessOpen)} title="Loudness log"
           className={`shrink-0 ${tBtn(loudnessOpen)}`}>LUFS</button>
+        <button onClick={() => setVideoOpen(!videoOpen)} title="Reference video monitor"
+          className={`shrink-0 ${tBtn(videoOpen, hasVideo ? 'bg-purple-600 text-white' : 'bg-blue-600 text-white')}`}>VIDEO</button>
+        <button onClick={() => setPlaylistOpen(!playlistOpen)} title="Playout playlist — queue projects back-to-back"
+          className={`shrink-0 ${tBtn(playlistOpen || playlistRunning, playlistRunning ? 'bg-emerald-600 text-white animate-pulse' : 'bg-blue-600 text-white')}`}>PLAYLIST</button>
         <button onClick={() => setBounceOpen(true)} title="Bounce a region (or the whole project) through the master chain to a WAV"
           className={`shrink-0 ${tBtn(bounceState === 'running')} ${bounceState === 'running' ? 'animate-pulse' : ''}`}>BOUNCE</button>
+        <button
+          onClick={() => setAutomationMode(automationMode === 'off' ? 'read' : automationMode === 'read' ? 'write' : 'off')}
+          title="Automation: OFF · READ (play envelopes) · WRITE (capture armed-lane moves)"
+          className={`shrink-0 ${tBtn(automationMode !== 'off', automationMode === 'write' ? 'bg-red-600 text-white' : 'bg-sky-600 text-white')}`}
+        >AUTO {automationMode === 'off' ? '' : automationMode === 'read' ? 'R' : 'W'}</button>
         <div className="w-px h-6 bg-[#3a3f48] mx-1 shrink-0" />
         <button onClick={() => setSnapToGrid(!snapToGrid)} title="Snap to grid" className={`shrink-0 ${tBtn(snapToGrid)}`}>SNAP</button>
+        <label className="flex items-center gap-1 text-[10px] font-bold text-gray-300 pl-1 shrink-0" title="Comp seam crossfade length (ms)">
+          XF
+          <input type="number" min={0} max={100} step={1} value={Math.round(compCrossfadeSec * 1000)}
+            onChange={(e) => setCompCrossfadeSec((Number(e.target.value) || 0) / 1000)}
+            className="w-10 bg-[#1a1d23] border border-[#3a3f48] rounded px-1 py-0.5 text-right text-gray-100 outline-none" />
+        </label>
         <button
           onClick={() => setGridMode(gridMode === 'bars' ? 'time' : 'bars')}
           title="Ruler / grid: bars+beats or timecode"
@@ -210,6 +263,11 @@ export const DawView = () => {
               className={`px-1.5 py-1 shrink-0 text-xs font-bold rounded font-mono transition-colors ${OFF}`}
             >{timeSig.num}/{timeSig.den}</button>
             <button
+              onClick={() => setBeatDiv(beatDiv === 1 ? 2 : beatDiv === 2 ? 4 : 1)}
+              title="Musical snap subdivision"
+              className={`px-1.5 py-1 shrink-0 text-[10px] font-bold rounded font-mono transition-colors ${OFF}`}
+            >1/{beatDiv * timeSig.den}</button>
+            <button
               onClick={() => setMetronomeOn(!metronomeOn)}
               title="Metronome click while the transport rolls"
               className={`shrink-0 ${tBtn(metronomeOn, 'bg-emerald-600 text-white')}`}
@@ -219,10 +277,30 @@ export const DawView = () => {
               title="Metronome routing: monitor bus, master, or both"
               className={`px-1.5 py-1 shrink-0 text-[10px] font-bold rounded font-mono transition-colors ${OFF}`}
             >{metroDest === 'monitor' ? 'MON' : metroDest === 'master' ? 'MST' : 'M+M'}</button>
+            <button
+              onClick={() => setCountInBars(countInBars >= 2 ? 0 : countInBars + 1)}
+              title="Count-in bars before the transport rolls / recording opens"
+              className={`px-1.5 py-1 shrink-0 text-[10px] font-bold rounded font-mono transition-colors ${countInBars > 0 ? 'bg-amber-600 text-white' : OFF}`}
+            >CI {countInBars}</button>
           </>
-        ) : (
-          <button onClick={() => setFps(fps === 30 ? 25 : 30)} title="Timecode frame rate"
-            className={`px-2 py-1 shrink-0 text-xs font-bold rounded transition-colors ${OFF}`}>{fps} fps</button>
+        ) : null}
+        <button
+          onClick={() => setTcOpen((v) => !v)}
+          title="Timecode & sync — LTC / MTC generator, LTC chase, PTP time-of-day"
+          className={`shrink-0 ${tBtn(tcOpen || ltcGenOn || mtcGenOn || ltcChaseOn)}`}
+        >
+          TC {fps}{dropFrame ? 'DF' : ''}
+        </button>
+        {(ltcGenOn || mtcGenOn) && (
+          <span className="shrink-0 text-[9px] font-bold text-blue-400 px-0.5" title="Timecode generator running">
+            {tcSource === 'tod' ? 'ToD' : 'GEN'}
+          </span>
+        )}
+        {ltcChaseOn && (
+          <span className={`shrink-0 text-[9px] font-black px-1 rounded ${ltcChaseLocked ? 'bg-emerald-600 text-white' : 'bg-[#363c47] text-gray-400 animate-pulse'}`}
+            title={ltcChaseLocked ? 'Chasing external LTC — engine drives the transport' : 'LTC chase armed, waiting for signal'}>
+            CHASE
+          </span>
         )}
         <div className="w-px h-6 bg-[#3a3f48] mx-1 shrink-0" />
         <button className={`w-7 h-7 shrink-0 flex items-center justify-center rounded transition-colors ${OFF}`} onClick={() => setZoom(zoom / 1.3)}>−</button>

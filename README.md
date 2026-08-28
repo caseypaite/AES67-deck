@@ -34,9 +34,10 @@ Three processes talk over local sockets:
 - **`engine/`** — C++ real-time DSP. A JACK client (`AES67_Deck`) that owns the
   32-in mixing graph, LV2 plugin hosting (lilv), a sample-accurate transport
   clock, multitrack disk capture, disk-streaming timeline playback, metering
-  and loudness. The audio callback is lock-free; plugin-chain edits, the clip
-  schedule and transport commands are marshalled through ring buffers — never
-  allocating or locking on the RT thread.
+  and loudness, and SMPTE timecode (LTC gen/decode on `ltc_out` / `ltc_in`,
+  MTC on the `mtc_out` MIDI port). The audio callback is lock-free; plugin-chain
+  edits, the clip schedule and transport commands are marshalled through ring
+  buffers — never allocating or locking on the RT thread.
 - **`server/`** — Node/TypeScript bridge. Forwards a fixed allow-list of
   UI→engine commands, relays every engine→UI message (metering + transport
   ride along), proxies the AES67 daemon's REST API, and **persists the whole
@@ -171,6 +172,28 @@ regenerate with `npm run showcase` in [`test/browser/`](test/browser/).</sub>
   fade envelope.
 - **Markers** on the ruler — add at playhead (`M`), drag, jump prev/next
   (`,` / `.`), delete.
+- **Timecode & sync** — `TC` panel: generated timecode locked to the project
+  transport (+ offset) or **PTP time-of-day** (the deck is the AES67
+  grandmaster, so this is network-locked). Hand-rolled SMPTE **LTC generator**
+  (24 / 25 / 30 / 29.97-DF) on a dedicated `ltc_out` JACK port (also a mono
+  AES67 TX source), **MTC** on a `mtc_out` MIDI port, and **LTC chase** on
+  `ltc_in` — jam-sync once, then **flywheel** on the JACK clock (rides through
+  dropouts), with a `LOCKED / FLYWHEEL` lamp + incoming-TC readout; the console
+  transport is locked out while chasing. `take.json` is stamped with the PTP
+  wall clock + SMPTE at the take origin.
+- **Bars/beats** — musical grid + `beatDiv` snap, **count-in** (`CI n`, engine
+  freezes the transport + tap for N bars of clicks), and a **metronome**;
+  tempo / time-sig / count-in are stored in the project and the `.rpp`.
+- **Automation lanes** — fader / pan / plugin-param breakpoint envelopes per
+  channel, drawn under the take lanes. Playback is a server-side runner on the
+  ~40 Hz metering clock (`AUTO R`); `AUTO W` captures live fader/param moves on
+  armed lanes.
+- **Reference video** — drop an `.mp4` into `projects/<name>/video/`; the
+  `VIDEO` panel keeps a `<video>` synced to the playhead (with an alignment
+  offset) for post / lip-sync work.
+- **Playout playlist** — the `PLAYLIST` panel queues projects (or `.rpp`
+  bundles) and the server plays them back-to-back, advancing on the transport
+  clock with optional inter-segment gaps.
 - **Projects** — a project is the arrangement (clips, markers, track layout),
   kept separate from a scene (a mixer snapshot). Scratch autosave lives in
   `projects/default/`; **SAVE PROJECT** consolidates the take media into a
@@ -222,32 +245,17 @@ regenerate with `npm run showcase` in [`test/browser/`](test/browser/).</sub>
 
 ## Planned / not yet implemented
 
-Timeline roadmap: [`plan/daw-timeline-roadmap.md`](plan/daw-timeline-roadmap.md).
+Timeline roadmap: [`plan/daw-timeline-roadmap.md`](plan/daw-timeline-roadmap.md)
+— **Phases 1–5 are implemented**. Remaining timeline follow-ups:
 
-**Broadcast / live (Phase 3):**
-- Cue-list panel + as-run CSV export (ruler markers are in; the named cue
-  list and export are not).
-- **Loudness logging** — append M/S/I/TP to a CSV over time and export an
-  EBU R128 / ATSC A/85 compliance report for a marked region.
-- **Timecode & sync** — PTP time-of-day transport timecode, an **LTC
-  generator** on a JACK/AES67 output, **MTC** over virtual MIDI, and chasing
-  external LTC on an input.
-- **Punch & pre-roll** — in/out points, auto-punch on armed tracks, pre-roll,
-  loop-record takes into lanes.
-
-**Editing polish (Phase 4):**
-- **Undo / redo** (command stack).
-- **Crossfades** (equal-power overlap).
-- **Take comping** — stacked lanes, swipe-to-select, promote to a comp clip.
-- **Bounce / export** — render a timeline region through the master chain;
-  stem export from the per-track taps.
-- Clip-gain automation, ripple edit, group / lock, nudge keys.
-
-**Later / optional (Phase 5):**
-- Bars + beats grid, tempo map, metronome.
-- Video track / reference-video scrub for post work.
-- Fader / pan / plugin-parameter **automation lanes** tied to the transport.
-- Multi-project playlist for back-to-back playout.
+- **Tempo map** (ramps / mid-project changes) — a single project tempo today.
+- Sample-accurate **engine-side automation** (the runner is ~40 Hz) and `.rpp`
+  envelope export.
+- **Timeline video filmstrip** thumbnails (the synced monitor + offset are in).
+- **Gapless** playlist preloading of the next segment.
+- True overlapping-clip **comp crossfades** (a seam-fade length control is in).
+- Known bug: the first ~2 s of a multitrack take is distorted (suspected in the
+  pre-insert tap; a head-discard workaround was tried and reverted).
 
 **Other:**
 - Hardware control-surface support (MIDI / OSC / Mackie).

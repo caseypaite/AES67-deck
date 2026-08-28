@@ -88,7 +88,7 @@ export function ArrangeSurface() {
         s.region, s.loopEnabled, s.punchEnabled, s.scrollX, s.scrollY, s.zoom,
         s.marquee, s.dragOverTrackId, s.dragOverLane, s.compPreview, s.peaks,
         s.snapToGrid, s.gridSize, s.fps, s.recordingClips, s.livePeaks,
-        s.tempo, s.timeSig, s.gridMode,
+        s.tempo, s.timeSig, s.gridMode, s.automation, s.autoExpand,
       ];
     };
     let prevSig = sceneSig();
@@ -154,6 +154,26 @@ export function ArrangeSurface() {
           (ev) => { movedM = true; daw.getState().updateMarker(id, { time: snap(Math.max(0, model.xToTime(ev.clientX - rect.left))) }); },
           () => { if (!movedM) { const m = daw.getState().markers[id]; if (m) s.locate(m.time); } },
         );
+        return;
+      }
+
+      // Automation: drag a breakpoint (Shift = value only), or click an empty
+      // spot to add one. Alt-click a point deletes it.
+      if (hit.kind === 'auto-point' && hit.laneId && hit.pointIdx != null) {
+        const { laneId, pointIdx } = hit;
+        if (e.altKey) { daw.getState().removeAutoPoint(laneId, pointIdx); return; }
+        const valueOnly = e.shiftKey;
+        drag((ev) => {
+          const v = model.autoLaneValueAt(laneId, ev.clientY - rect.top);
+          const t = snap(Math.max(0, model.xToTime(ev.clientX - rect.left)));
+          if (v == null) return;
+          daw.getState().updateAutoPoint(laneId, pointIdx, valueOnly ? { v } : { t, v });
+        });
+        return;
+      }
+      if (hit.kind === 'auto-lane' && hit.laneId) {
+        const v = model.autoLaneValueAt(hit.laneId, py);
+        if (v != null) daw.getState().addAutoPoint(hit.laneId, snap(hit.time), v);
         return;
       }
 

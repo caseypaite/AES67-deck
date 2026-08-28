@@ -36,6 +36,28 @@ export interface DawMarker {
   color?: string;
 }
 
+// Phase 5 — automation lanes. One lane = one target parameter with a breakpoint
+// envelope. Playback is a server-side runner on the metering clock (no engine
+// change); `enabled` = READ active, `armed` = capture live moves while in WRITE.
+export interface AutoPoint { t: number; v: number; }   // t seconds, v in the target's own units
+export interface AutoTarget {
+  kind: 'fader' | 'pan' | 'plugin';
+  channelId: number;
+  label: string;
+  pluginId?: string;        // UI uuid (plugin lanes)
+  pluginIndex?: number;     // resolved chain position, refreshed on send
+  paramSymbol?: string;     // key `set_plugin_param` expects
+}
+export interface AutoLane {
+  id: string;
+  target: AutoTarget;
+  min: number;              // envelope draw range (fader 0..1, pan -1..1, plugin port range)
+  max: number;
+  points: AutoPoint[];      // sorted by t
+  enabled: boolean;
+  armed: boolean;
+}
+
 export interface PeaksData {
   version: number;
   sampleRate: number;
@@ -127,9 +149,46 @@ interface DawState {
   beatDiv: number;                // 1 = beat, 2 = 1/8, 4 = 1/16 (in 4/4 terms)
   metronomeOn: boolean;           // engine click while rolling (session state)
   metroDest: 'monitor' | 'master' | 'both';
+  countInBars: number;            // 0 = off; N bars of metronome before record/roll
+  countInActive: number;          // frames of count-in still to run (engine echo)
+  compCrossfadeSec: number;       // seam fade length applied by compPick / take stacking
 
-  fps: number;                    // timecode frame rate (25 | 30)
+  // Phase 5 — automation
+  automation: Record<string, AutoLane>;
+  autoExpand: Record<number, boolean>;      // per channelId — automation lanes shown
+  automationMode: 'off' | 'read' | 'write';
+
+  // Phase 5 — reference video (post / sync). Files live in projects/<name>/video/.
+  video: { file: string; offsetSec: number } | null;
+  projectVideos: Array<{ file: string; sizeBytes: number }>;
+  videoOpen: boolean;
+
+  // Phase 5 — playout playlist
+  playlists: string[];
+  playlist: { name: string; segments: Array<{ project: string; recProject?: boolean; gapSec?: number }> } | null;
+  playlistStatus: { name: string | null; index: number; running: boolean; count: number };
+  playlistOpen: boolean;
+
+  fps: number;                    // timecode frame rate (24 | 25 | 30)
   timecode: string;               // hh:mm:ss:ff derived from the playhead — toolbar readout
+
+  // Phase 3d — timecode & sync. Server-owned (timecode_config.json), mirrored
+  // here from `timecode_config_loaded`; setters round-trip via
+  // `set_timecode_config`. Not localStorage-persisted — the server is the
+  // source of truth (matches the loudness config).
+  tcSource: 'project' | 'tod';
+  dropFrame: boolean;             // 29.97 drop-frame (fps 30 only)
+  tcOffsetFrames: number;         // project-zero -> TC start, in TC frames
+  ltcGenOn: boolean;
+  ltcGenLevel: number;            // 0..1
+  mtcGenOn: boolean;
+  ltcChaseOn: boolean;
+  tcTod: number | null;           // engine seconds-past-midnight (UTC), for the ToD readout
+  ltcChaseLocked: boolean;
+  ltcChaseFlywheel: boolean;      // anchored + free-running on the JACK clock
+  ltcChaseErrMs: number;          // smoothed transport-vs-LTC error, ms
+  ltcIncoming: string | null;     // decoded incoming SMPTE while chasing
+  ltcInPeak: number;              // peak |ltc_in| — signal-present hint while chasing
 
   lastOverrun: boolean;           // last committed take reported a disk overrun
   playbackUnderrun: boolean;      // the timeline reader couldn't keep playback fed
@@ -146,6 +205,12 @@ interface DawState {
   setGridSize: (size: number) => void;
   setFps: (fps: number) => void;
 
+  // Phase 3d — timecode & sync
+  setTimecodeConfig: (patch: Partial<Pick<DawState,
+    'tcSource' | 'fps' | 'dropFrame' | 'tcOffsetFrames' | 'ltcGenOn' | 'ltcGenLevel' | 'mtcGenOn' | 'ltcChaseOn'>>) => void;
+  applyTimecodeConfig: (cfg: Record<string, unknown>) => void;
+  applyTcTelemetry: (tc: Record<string, unknown> | undefined) => void;
+
   // Phase 5 — bars/beats + metronome.
   setTempo: (bpm: number) => void;
   setTimeSig: (num: number, den: number) => void;
@@ -153,6 +218,39 @@ interface DawState {
   setBeatDiv: (div: number) => void;
   setMetronomeOn: (on: boolean) => void;
   setMetroDest: (dest: 'monitor' | 'master' | 'both') => void;
+  setCountInBars: (bars: number) => void;
+  setCompCrossfadeSec: (sec: number) => void;
+  countInFrames: () => number;          // count-in length in engine frames (0 if off)
+
+  // Phase 5 — automation
+  addAutoLane: (target: AutoTarget, min: number, max: number) => void;
+  removeAutoLane: (id: string) => void;
+  addAutoPoint: (id: string, t: number, v: number) => void;
+  updateAutoPoint: (id: string, idx: number, patch: Partial<AutoPoint>) => void;
+  removeAutoPoint: (id: string, idx: number) => void;
+  setAutoLaneEnabled: (id: string, on: boolean) => void;
+  setAutoLaneArmed: (id: string, on: boolean) => void;
+  toggleAutoExpand: (channelId: number) => void;
+  setAutomationMode: (mode: 'off' | 'read' | 'write') => void;
+  applyAutoLaneUpdate: (lane: AutoLane) => void;   // server → UI after a write-capture pass
+
+  // Phase 5 — reference video
+  setVideo: (file: string | null) => void;
+  setVideoOffset: (sec: number) => void;
+  setProjectVideos: (v: Array<{ file: string; sizeBytes: number }>) => void;
+  setVideoOpen: (open: boolean) => void;
+  videoUrl: () => string | null;
+
+  // Phase 5 — playout playlist
+  setPlaylists: (list: string[]) => void;
+  applyPlaylistData: (pl: DawState['playlist']) => void;
+  applyPlaylistStatus: (st: DawState['playlistStatus']) => void;
+  setPlaylistOpen: (open: boolean) => void;
+  openPlaylist: (name: string) => void;
+  newPlaylist: (name: string) => void;
+  savePlaylist: (segments: NonNullable<DawState['playlist']>['segments']) => void;
+  startPlaylist: (fromIndex: number) => void;
+  stopPlaylist: () => void;
   snapTime: (sec: number) => number;   // musical or time snap, per gridMode/snapToGrid
 
   applyTransport: (frame: number, state: number, sr: number) => void;
@@ -234,7 +332,7 @@ interface DawState {
   // Server sync
   loadProjectData: (name: string, project: unknown) => void;
   setProjectList: (list: string[], active?: string) => void;
-  addCommittedClips: (clips: DawClip[], overrun: boolean) => void;
+  addCommittedClips: (clips: DawClip[], overrun: boolean, opts?: { loopPass?: boolean; passIndex?: number }) => void;
   newProject: (name: string) => void;
   openProject: (name: string) => void;
 
@@ -280,18 +378,64 @@ function pushMetronome(s: { metronomeOn: boolean; tempo: number; timeSig: { num:
   wsSend({ type: 'set_metronome', enabled: s.metronomeOn, bpm: s.tempo, sigNum: s.timeSig.num, sigDen: s.timeSig.den, dest: s.metroDest });
 }
 
-// The transport readout string — timecode or bars/beats, per gridMode.
-function fmtPlayhead(s: { gridMode: 'time' | 'bars'; tempo: number; timeSig: { num: number }; fps: number }, sec: number): string {
-  return s.gridMode === 'bars' ? formatBBT(sec, s.tempo, s.timeSig.num) : formatTimecode(sec, s.fps);
+// Phase 5 — hand the runner its current lanes + mode. Cheap + frequent (every
+// lane / point / mode edit) so the server never waits for a full project save.
+function pushAutomation(s: { automation: Record<string, AutoLane>; automationMode: string }) {
+  wsSend({ type: 'set_automation_state', mode: s.automationMode, lanes: Object.values(s.automation) });
 }
 
-export function formatTimecode(sec: number, fps: number): string {
+function pushTimecode(s: {
+  tcSource: 'project' | 'tod'; fps: number; dropFrame: boolean; tcOffsetFrames: number;
+  ltcGenOn: boolean; ltcGenLevel: number; mtcGenOn: boolean; ltcChaseOn: boolean;
+}) {
+  wsSend({
+    type: 'set_timecode_config',
+    source: s.tcSource, fps: s.fps, df: s.dropFrame, offsetFrames: s.tcOffsetFrames,
+    ltcGen: s.ltcGenOn, ltcLevel: s.ltcGenLevel, mtcGen: s.mtcGenOn, ltcChase: s.ltcChaseOn,
+  });
+}
+
+// The transport readout string — timecode or bars/beats, per gridMode. In
+// time-of-day timecode mode the readout follows the engine wall clock (`tod`,
+// seconds past midnight) rather than the transport position.
+function fmtPlayhead(
+  s: { gridMode: 'time' | 'bars'; tempo: number; timeSig: { num: number }; fps: number;
+       dropFrame?: boolean; tcSource?: 'project' | 'tod'; tcTod?: number | null },
+  sec: number,
+): string {
+  if (s.gridMode === 'bars') return formatBBT(sec, s.tempo, s.timeSig.num);
+  if (s.tcSource === 'tod' && s.tcTod != null) return formatTimecode(s.tcTod, s.fps, !!s.dropFrame);
+  return formatTimecode(sec, s.fps, !!s.dropFrame);
+}
+
+// SMPTE string for a wall/elapsed time in seconds. `df` gives NTSC drop-frame
+// numbering (fps 30 only) — the seconds then track real time and `;` separates
+// the frame field.
+export function formatTimecode(sec: number, fps: number, df = false): string {
   const s = Math.max(0, sec);
+  if (df && fps === 30) {
+    let frame = Math.round(s * 30000 / 1001);
+    const d = Math.floor(frame / 17982);
+    let mo = frame % 17982;
+    if (mo < 2) mo += 2;
+    frame += 18 * d + 2 * Math.floor((mo - 2) / 1798);
+    const ff = frame % 30, sc = Math.floor(frame / 30) % 60;
+    const mn = Math.floor(frame / 1800) % 60, hr = Math.floor(frame / 108000) % 24;
+    const p = (n: number) => n.toString().padStart(2, '0');
+    return `${p(hr)}:${p(mn)}:${p(sc)};${p(ff)}`;
+  }
   const hh = Math.floor(s / 3600).toString().padStart(2, '0');
   const mm = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
   const ss = Math.floor(s % 60).toString().padStart(2, '0');
   const ff = Math.floor((s % 1) * fps).toString().padStart(2, '0');
   return `${hh}:${mm}:${ss}:${ff}`;
+}
+
+// SMPTE string for a raw timecode frame count (used for the incoming-LTC readout).
+export function formatTcFrames(frame: number, fps: number, df = false): string {
+  if (frame < 0) return '––:––:––:––';
+  const spf = df && fps === 30 ? 1001 / 30000 : 1 / fps;
+  return formatTimecode(frame * spf, fps, df);
 }
 
 function serializeProject(s: DawState) {
@@ -303,6 +447,15 @@ function serializeProject(s: DawState) {
     loop: s.region
       ? { start: s.region.inSec, end: s.region.outSec, loop: s.loopEnabled, punch: s.punchEnabled, preRoll: s.preRollSec }
       : null,
+    automation: Object.values(s.automation),
+    video: s.video,
+    // Phase 5 — musical settings live in the project now, not just localStorage.
+    tempo: s.tempo,
+    timeSig: s.timeSig,
+    beatDiv: s.beatDiv,
+    countInBars: s.countInBars,
+    compCrossfadeSec: s.compCrossfadeSec,
+    metroDest: s.metroDest,
   };
 }
 
@@ -332,6 +485,7 @@ type HistSnap = {
   clips: Record<string, DawClip>;
   markers: Record<string, DawMarker>;
   trackHeights: Record<number, number>;
+  automation: Record<string, AutoLane>;
 };
 const HIST_CAP = 60;
 const HIST_COALESCE_MS = 250;
@@ -341,7 +495,7 @@ let lastSnapMs = 0;
 let txnDepth = 0;
 
 function histSnap(s: DawState): HistSnap {
-  return { clips: s.clips, markers: s.markers, trackHeights: s.trackHeights };
+  return { clips: s.clips, markers: s.markers, trackHeights: s.trackHeights, automation: s.automation };
 }
 function clearHistory() {
   undoStack = [];
@@ -446,8 +600,35 @@ export const useDawStore = create<DawState>()(
       beatDiv: 1,
       metronomeOn: false,
       metroDest: 'monitor',
+      countInBars: 0,
+      countInActive: 0,
+      compCrossfadeSec: 0.008,
+      automation: {},
+      autoExpand: {},
+      automationMode: 'off',
+      video: null,
+      projectVideos: [],
+      videoOpen: false,
+      playlists: [],
+      playlist: null,
+      playlistStatus: { name: null, index: 0, running: false, count: 0 },
+      playlistOpen: false,
       fps: 30,
       timecode: '00:00:00:00',
+
+      tcSource: 'project',
+      dropFrame: false,
+      tcOffsetFrames: 0,
+      ltcGenOn: false,
+      ltcGenLevel: 0.35,
+      mtcGenOn: false,
+      ltcChaseOn: false,
+      tcTod: null,
+      ltcChaseLocked: false,
+      ltcChaseFlywheel: false,
+      ltcChaseErrMs: 0,
+      ltcIncoming: null,
+      ltcInPeak: 0,
 
       lastOverrun: false,
       playbackUnderrun: false,
@@ -682,12 +863,24 @@ export const useDawStore = create<DawState>()(
         set({ gridMode, timecode: fmtPlayhead({ ...get(), gridMode }, get().playheadPosition) });
         scheduleSave();
       },
-      setBeatDiv: (div) => set({ beatDiv: [1, 2, 4].includes(div) ? div : 1 }),
+      setBeatDiv: (div) => { set({ beatDiv: [1, 2, 4].includes(div) ? div : 1 }); scheduleSave(); },
       setMetronomeOn: (on) => { set({ metronomeOn: !!on }); pushMetronome({ ...get(), metronomeOn: !!on }); },
       setMetroDest: (dest) => {
         const d = dest === 'master' || dest === 'both' ? dest : 'monitor';
         set({ metroDest: d });
         pushMetronome({ ...get(), metroDest: d });
+      },
+      setCountInBars: (bars) => { set({ countInBars: Math.max(0, Math.min(4, Math.round(bars) || 0)) }); scheduleSave(); },
+      setCompCrossfadeSec: (sec) => {
+        set({ compCrossfadeSec: Math.max(0, Math.min(0.1, sec || 0)) });
+        scheduleSave();
+      },
+      // Count-in length in engine frames: countInBars * beats-per-bar * frames-per-beat.
+      countInFrames: () => {
+        const s = get();
+        if (s.countInBars <= 0) return 0;
+        const sr = s.sampleRate > 0 ? s.sampleRate : 48000;
+        return Math.round(s.countInBars * Math.max(1, s.timeSig.num) * beatSec(s.tempo) * sr);
       },
       snapTime: (sec) => {
         const s = get();
@@ -695,13 +888,89 @@ export const useDawStore = create<DawState>()(
         const step = s.gridMode === 'bars' ? beatSec(s.tempo) / Math.max(1, s.beatDiv) : s.gridSize;
         return step > 0 ? Math.round(sec / step) * step : sec;
       },
-      setFps: (fps) => set({ fps, timecode: fmtPlayhead({ ...get(), fps }, get().playheadPosition) }),
+      setFps: (fps) => get().setTimecodeConfig({ fps }),
+
+      // --- Phase 3d: timecode & sync ---
+      setTimecodeConfig: (patch) => {
+        const cur = get();
+        const next = {
+          tcSource: patch.tcSource ?? cur.tcSource,
+          fps: [24, 25, 30].includes(Number(patch.fps)) ? Number(patch.fps) : cur.fps,
+          dropFrame: patch.dropFrame ?? cur.dropFrame,
+          tcOffsetFrames: patch.tcOffsetFrames ?? cur.tcOffsetFrames,
+          ltcGenOn: patch.ltcGenOn ?? cur.ltcGenOn,
+          ltcGenLevel: patch.ltcGenLevel ?? cur.ltcGenLevel,
+          mtcGenOn: patch.mtcGenOn ?? cur.mtcGenOn,
+          ltcChaseOn: patch.ltcChaseOn ?? cur.ltcChaseOn,
+        };
+        if (next.fps !== 30) next.dropFrame = false;
+        set({ ...next, timecode: fmtPlayhead({ ...cur, ...next }, cur.playheadPosition) });
+        pushTimecode(next);
+      },
+      applyTimecodeConfig: (cfg) => {
+        const fps = [24, 25, 30].includes(Number(cfg.fps)) ? Number(cfg.fps) : get().fps;
+        const next = {
+          tcSource: cfg.source === 'tod' ? 'tod' as const : 'project' as const,
+          fps,
+          dropFrame: fps === 30 && cfg.df === true,
+          tcOffsetFrames: Number.isFinite(Number(cfg.offsetFrames)) ? Math.round(Number(cfg.offsetFrames)) : 0,
+          ltcGenOn: cfg.ltcGen === true,
+          ltcGenLevel: Number.isFinite(Number(cfg.ltcLevel)) ? Number(cfg.ltcLevel) : get().ltcGenLevel,
+          mtcGenOn: cfg.mtcGen === true,
+          ltcChaseOn: cfg.ltcChase === true,
+        };
+        set({ ...next, timecode: fmtPlayhead({ ...get(), ...next }, get().playheadPosition) });
+      },
+      applyTcTelemetry: (tc) => {
+        if (!tc) return;
+        // Only touch fields the frame actually carries — the engine's minimal
+        // count-in frame sends just `countin`.
+        const s = get();
+        const patch: Partial<DawState> = {};
+        if ('tod' in tc && typeof tc.tod === 'number') {
+          if (tc.tod !== s.tcTod) patch.tcTod = tc.tod as number;
+          if (s.tcSource === 'tod' && s.gridMode === 'time') {
+            patch.timecode = formatTimecode(tc.tod as number, s.fps, s.dropFrame);
+          }
+        }
+        if ('lock' in tc) {
+          const locked = tc.lock === 1 || tc.lock === true;
+          if (locked !== s.ltcChaseLocked) patch.ltcChaseLocked = locked;
+        }
+        if ('fly' in tc) {
+          const fly = tc.fly === 1 || tc.fly === true;
+          if (fly !== s.ltcChaseFlywheel) patch.ltcChaseFlywheel = fly;
+        }
+        if ('err' in tc && typeof tc.err === 'number' && Math.abs((tc.err as number) - s.ltcChaseErrMs) > 0.3) {
+          patch.ltcChaseErrMs = Math.round((tc.err as number) * 10) / 10;
+        }
+        if ('in' in tc) {
+          const inFrame = typeof tc.in === 'number' ? (tc.in as number) : -1;
+          const incoming = s.ltcChaseOn && inFrame >= 0 ? formatTcFrames(inFrame, s.fps, s.dropFrame) : null;
+          if (incoming !== s.ltcIncoming) patch.ltcIncoming = incoming;
+        }
+        if ('inpk' in tc && typeof tc.inpk === 'number' && Math.abs((tc.inpk as number) - s.ltcInPeak) > 0.02) {
+          patch.ltcInPeak = tc.inpk as number;
+        }
+        if ('countin' in tc) {
+          const countin = typeof tc.countin === 'number' ? (tc.countin as number) : 0;
+          if (countin !== s.countInActive) patch.countInActive = countin;
+        }
+        if (Object.keys(patch).length) set(patch);
+      },
 
       applyTransport: (frame, state, sr) => {
         const s = get();
         const sampleRate = sr > 0 ? sr : s.sampleRate;
         const sec = frame / sampleRate;
         const st = (state === 2 ? 2 : state === 1 ? 1 : 0) as 0 | 1 | 2;
+        // Count-in: the engine reports state 1/2 but freezes the transport frame.
+        // Keep the playhead parked and don't touch take origins until it ends.
+        if (s.countInActive > 0) {
+          set({ engineFrame: frame, engineState: st, sampleRate,
+                _engineSec: sec, _engineWall: performance.now() });
+          return;
+        }
         let recordOriginSec = s.recordOriginSec;
         let takeStartedAtMs = s._takeStartedAtMs;
         let takeOriginSec = s._takeOriginSec;
@@ -1048,7 +1317,7 @@ export const useDawStore = create<DawState>()(
         if (b - a < 0.02 || !lane) return;
         pushHistory();
         set((state) => {
-          const SEAM = 0.008; // click-guard fade at the seams
+          const SEAM = Math.max(0.001, state.compCrossfadeSec || 0.008); // seam fade at comp joins
           const next: Record<string, DawClip> = { ...state.clips };
           const onTrack = Object.values(state.clips).filter((c) => c.trackId === trackId && !c.recording);
 
@@ -1097,15 +1366,131 @@ export const useDawStore = create<DawState>()(
         scheduleSave();
       },
 
+      // --- Phase 5: automation lanes ---
+      addAutoLane: (target, min, max) => {
+        pushHistory();
+        const id = uuid();
+        set((s) => ({
+          automation: { ...s.automation, [id]: { id, target, min, max, points: [], enabled: true, armed: false } },
+          autoExpand: { ...s.autoExpand, [target.channelId]: true },
+        }));
+        scheduleSave(); pushAutomation(get());
+      },
+      removeAutoLane: (id) => {
+        pushHistory();
+        set((s) => { const a = { ...s.automation }; delete a[id]; return { automation: a }; });
+        scheduleSave(); pushAutomation(get());
+      },
+      addAutoPoint: (id, t, v) => {
+        pushHistory();
+        set((s) => {
+          const lane = s.automation[id]; if (!lane) return s;
+          const tt = Math.max(0, t);
+          const pts = lane.points.filter((p) => Math.abs(p.t - tt) > 1e-4);
+          pts.push({ t: tt, v: Math.max(lane.min, Math.min(lane.max, v)) });
+          pts.sort((a, b) => a.t - b.t);
+          return { automation: { ...s.automation, [id]: { ...lane, points: pts } } };
+        });
+        scheduleSave(); pushAutomation(get());
+      },
+      updateAutoPoint: (id, idx, patch) => {
+        pushHistory();
+        set((s) => {
+          const lane = s.automation[id]; if (!lane || !lane.points[idx]) return s;
+          const pts = lane.points.map((p, i) => i === idx ? {
+            t: patch.t != null ? Math.max(0, patch.t) : p.t,
+            v: patch.v != null ? Math.max(lane.min, Math.min(lane.max, patch.v)) : p.v,
+          } : p);
+          pts.sort((a, b) => a.t - b.t);
+          return { automation: { ...s.automation, [id]: { ...lane, points: pts } } };
+        });
+        scheduleSave(); pushAutomation(get());
+      },
+      removeAutoPoint: (id, idx) => {
+        pushHistory();
+        set((s) => {
+          const lane = s.automation[id]; if (!lane) return s;
+          return { automation: { ...s.automation, [id]: { ...lane, points: lane.points.filter((_, i) => i !== idx) } } };
+        });
+        scheduleSave(); pushAutomation(get());
+      },
+      setAutoLaneEnabled: (id, on) => {
+        set((s) => s.automation[id] ? { automation: { ...s.automation, [id]: { ...s.automation[id], enabled: !!on } } } : s);
+        scheduleSave(); pushAutomation(get());
+      },
+      setAutoLaneArmed: (id, on) => {
+        set((s) => s.automation[id] ? { automation: { ...s.automation, [id]: { ...s.automation[id], armed: !!on } } } : s);
+        pushAutomation(get());
+      },
+      toggleAutoExpand: (channelId) =>
+        set((s) => ({ autoExpand: { ...s.autoExpand, [channelId]: !s.autoExpand[channelId] } })),
+      setAutomationMode: (mode) => {
+        const m = mode === 'read' || mode === 'write' ? mode : 'off';
+        set({ automationMode: m });
+        pushAutomation(get());
+      },
+      applyAutoLaneUpdate: (lane) => {
+        if (!lane || !lane.id) return;
+        applyingRemote = true;
+        set((s) => s.automation[lane.id]
+          ? { automation: { ...s.automation, [lane.id]: { ...s.automation[lane.id], points: lane.points } } }
+          : s);
+        applyingRemote = false;
+      },
+
+      // --- Phase 5: reference video ---
+      setVideo: (file) => { set({ video: file ? { file, offsetSec: get().video?.offsetSec ?? 0 } : null }); scheduleSave(); },
+      setVideoOffset: (sec) => { const v = get().video; if (v) { set({ video: { ...v, offsetSec: sec } }); scheduleSave(); } },
+      setProjectVideos: (v) => set({ projectVideos: Array.isArray(v) ? v : [] }),
+      setVideoOpen: (open) => set({ videoOpen: !!open }),
+
+      // --- Phase 5: playout playlist ---
+      setPlaylists: (list) => set({ playlists: Array.isArray(list) ? list : [] }),
+      applyPlaylistData: (pl) => set({ playlist: pl && pl.name ? { name: pl.name, segments: pl.segments || [] } : pl }),
+      applyPlaylistStatus: (st) => set({ playlistStatus: st || { name: null, index: 0, running: false, count: 0 } }),
+      setPlaylistOpen: (open) => set({ playlistOpen: !!open }),
+      openPlaylist: (name) => wsSend({ type: 'load_playlist', name }),
+      newPlaylist: (name) => wsSend({ type: 'new_playlist', name }),
+      savePlaylist: (segments) => {
+        const pl = get().playlist;
+        if (!pl) return;
+        set({ playlist: { ...pl, segments } });
+        wsSend({ type: 'save_playlist', name: pl.name, segments });
+      },
+      startPlaylist: (fromIndex) => {
+        const pl = get().playlist;
+        if (pl) wsSend({ type: 'playlist_transport', action: 'start', name: pl.name, fromIndex });
+      },
+      stopPlaylist: () => wsSend({ type: 'playlist_transport', action: 'stop' }),
+      videoUrl: () => {
+        const s = get();
+        if (!s.video) return null;
+        const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+        return `http://${host}:8081/video/${encodeURIComponent(s.projectName || 'default')}/${encodeURIComponent(s.video.file)}`;
+      },
+
       loadProjectData: (name, project) => {
         const p = (project || {}) as {
           clips?: unknown; markers?: unknown; trackHeights?: unknown;
           loop?: { start?: number; end?: number; loop?: boolean; punch?: boolean; preRoll?: number } | null;
+          tempo?: unknown; timeSig?: { num?: unknown; den?: unknown };
+          beatDiv?: unknown; countInBars?: unknown; compCrossfadeSec?: unknown; metroDest?: unknown;
+          automation?: unknown; video?: { file?: unknown; offsetSec?: unknown } | null;
         };
         applyingRemote = true;
         const lp = p.loop && typeof p.loop === 'object' ? p.loop : null;
         const region = lp && typeof lp.start === 'number' && typeof lp.end === 'number' && lp.end > lp.start
           ? { inSec: lp.start, outSec: lp.end } : null;
+        const cur = get();
+        const tempo = Number.isFinite(Number(p.tempo)) && Number(p.tempo) >= 20 && Number(p.tempo) <= 300
+          ? Number(p.tempo) : cur.tempo;
+        const tsNum = p.timeSig && Number.isFinite(Number(p.timeSig.num)) ? Math.max(1, Math.min(16, Math.round(Number(p.timeSig.num)))) : cur.timeSig.num;
+        const tsDen = p.timeSig && [1, 2, 4, 8, 16].includes(Number(p.timeSig.den)) ? Number(p.timeSig.den) : cur.timeSig.den;
+        const timeSig = { num: tsNum, den: tsDen };
+        const beatDiv = [1, 2, 4].includes(Number(p.beatDiv)) ? Number(p.beatDiv) : cur.beatDiv;
+        const countInBars = Number.isFinite(Number(p.countInBars)) ? Math.max(0, Math.min(4, Math.round(Number(p.countInBars)))) : cur.countInBars;
+        const compCrossfadeSec = Number.isFinite(Number(p.compCrossfadeSec)) ? Math.max(0, Math.min(0.1, Number(p.compCrossfadeSec))) : cur.compCrossfadeSec;
+        const metroDest = p.metroDest === 'master' || p.metroDest === 'both' ? p.metroDest : (p.metroDest === 'monitor' ? 'monitor' : cur.metroDest);
         set({
           projectName: name || 'default',
           clips: toRecord<DawClip>(p.clips),
@@ -1120,10 +1505,22 @@ export const useDawStore = create<DawState>()(
           loopEnabled: !!(lp && lp.loop) && !!region,
           punchEnabled: !!(lp && lp.punch) && !!region,
           preRollSec: lp && typeof lp.preRoll === 'number' ? Math.max(0, Math.min(30, lp.preRoll)) : 0,
+          tempo, timeSig, beatDiv, countInBars, compCrossfadeSec, metroDest,
+          automation: Array.isArray(p.automation)
+            ? Object.fromEntries((p.automation as AutoLane[])
+                .filter((l) => l && l.id && l.target)
+                .map((l) => [l.id, { ...l, points: Array.isArray(l.points) ? l.points : [] }]))
+            : {},
+          autoExpand: {},
+          video: p.video && typeof p.video.file === 'string'
+            ? { file: p.video.file, offsetSec: Number(p.video.offsetSec) || 0 } : null,
         });
+        set({ timecode: fmtPlayhead(get(), get().playheadPosition) });
         applyingRemote = false;
         clearHistory();
         syncRegionToEngine(get());
+        pushMetronome(get());   // engine click follows the loaded tempo / sig / dest
+        pushAutomation(get());  // hand the runner the loaded lanes
       },
 
       setProjectList: (list, active) =>
@@ -1132,12 +1529,14 @@ export const useDawStore = create<DawState>()(
           ...(active ? { projectName: active } : {}),
         }),
 
-      addCommittedClips: (clips, overrun) => {
+      addCommittedClips: (clips, overrun, opts) => {
         pushHistory(true); // a finished recording is one undoable step
         set((state) => {
           const next = { ...state.clips };
           // A new take that lands on top of existing audio on its track stacks
           // onto a fresh take lane rather than overlapping it (Phase 4 comping).
+          // Loop-record passes always stack — pass N on take lane N, never the
+          // comp lane — so the operator comps them afterwards.
           const laneExpand = { ...state.laneExpand };
           for (const c of clips) {
             if (!c || !c.id) continue;
@@ -1150,7 +1549,12 @@ export const useDawStore = create<DawState>()(
               if ((ex.lane || 0) > maxLane) maxLane = ex.lane || 0;
               if (ce > ex.start && cs < ex.start + ex.length) clash = true;
             }
-            if (clash && lane === 0) { lane = maxLane + 1; laneExpand[c.trackId] = true; }
+            if (opts?.loopPass && lane === 0) {
+              lane = Math.max(maxLane + 1, (opts.passIndex || 0) + 1);
+              laneExpand[c.trackId] = true;
+            } else if (clash && lane === 0) {
+              lane = maxLane + 1; laneExpand[c.trackId] = true;
+            }
             next[c.id] = lane ? { ...c, lane } : c;
           }
           return { clips: next, laneExpand, lastOverrun: overrun };
@@ -1191,6 +1595,12 @@ export const useDawStore = create<DawState>()(
         gridMode: s.gridMode,
         beatDiv: s.beatDiv,
         metroDest: s.metroDest,
+        countInBars: s.countInBars,
+        compCrossfadeSec: s.compCrossfadeSec,
+        autoExpand: s.autoExpand,
+        automationMode: s.automationMode,
+        videoOpen: s.videoOpen,
+        playlistOpen: s.playlistOpen,
         fps: s.fps,
         cuesOpen: s.cuesOpen,
         loudnessOpen: s.loudnessOpen,

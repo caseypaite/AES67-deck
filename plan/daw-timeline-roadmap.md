@@ -261,17 +261,49 @@ The engine already computes BS.1770 M/S/I + true-peak on the master
   derived from the 1 Hz samples — noted in the report, not a sample-accurate
   re-measure (that needs the Phase 4 bounce path).
 
-### 3d. Timecode & sync
+### 3d. Timecode & sync — DONE 2026-08-28
 
-They run `ptp4l` / `phc2sys` already (`deploy/linuxptp/`, `deploy/systemd/
-ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
+The box runs `ptp4l` as an AES67 **grandmaster** + `phc2sys -O 0` disciplining
+`CLOCK_REALTIME` off the media PHC (`deploy/systemd/phc2sys-crystal.service`),
+so the system wall clock *is* the network reference.
 
-- **PTP time-of-day timecode** option: transport timecode = PTP wall clock, so
-  recordings are stamped to the same grandmaster as the audio network.
-- **LTC generator** on a dedicated JACK output (and thus an AES67 stream) —
-  chase other gear off the deck.
-- **MTC** over a virtual MIDI port for DAWs/lighting.
-- **Chase external LTC** on an input (decode → drive `transport_locate`).
+- [x] **PTP time-of-day timecode** — engine samples `CLOCK_REALTIME` per audio
+  block (`g_tod_sec`, echoed on the metering `tc` key). A `SOURCE: PROJECT ⇄
+  TIME-OF-DAY` selector (+ `HH:MM:SS:FF` start offset in project mode) in the
+  timeline `TC` panel; the transport readout and both generators follow it.
+- [x] **LTC generator** — hand-rolled SMPTE encoder (`engine/src/timecode/
+  Timecode.cpp`, 24/25/30/29.97-DF, biphase-mark, fractional sample accumulator)
+  on a dedicated `ltc_out` JACK audio port (patchbay-routable to any AES67 sink
+  channel). Free-runs while parked so a downstream device can be jammed.
+- [x] **MTC** — quarter-frame + full-frame SysEx on a `mtc_out` JACK MIDI port
+  (`MtcEncoder`).
+- [x] **Chase external LTC** — hand-rolled `LtcDecoder` (zero-cross bit-clock
+  recovery + 80-bit sync detect + flywheel) on a dedicated `ltc_in` port;
+  drives `transport_locate` + play while locked, stops on ~250 ms signal loss.
+  `LOCKED / SIGNAL, NO LOCK / NO SIGNAL` lamp + incoming-TC readout in the panel;
+  a `CHASE` badge on the taskbar.
+- Server: `timecode_config.json` (persist + replay to engine on reconnect, like
+  the metronome); `take.json` gains `ptpWallClock` + `startTimecode`.
+- Verified real-engine end to end (`scratchpad/tc-test.mjs`, 18/18 — two engine
+  instances, `TC_A:ltc_out → TC_B:ltc_in`; LTC round-trip at all rates incl. DF,
+  chase drift ≤ 0.2 TC frames, ToD decode = wall clock, MTC cadence + SysEx) and
+  offline unit test (`scratchpad/tc_unit.cpp`).
+- [x] **Flywheel chase — DONE 2026-08-28.** Replaced the repeated-locate model:
+  one jam-sync on the first clean decode, a ~2 s fast-converge window, then a
+  bounded ±6 samples/block servo (`ltc_corr`) rides the JACK clock (the same PTP
+  media clock the LTC carries on this box). Gross re-cue only on `>0.5 s` error
+  with a 5-decode vote; dropouts are ridden through — the transport never stops.
+  `err` (ms) + `fly` echoed on `tc`; `FLYWHEEL` lamp in the panel. Verified
+  `scratchpad/tc-test.mjs` 23/23 (2 s feed-cut → transport keeps rolling within
+  0.7 TC frames, re-syncs cleanly).
+- [x] **Transport lock-out — DONE.** Console play/stop/record are disabled with
+  a `CHASE` badge while `ltcChaseLocked`.
+- [x] **`ltc_out` AES67 stream — DONE (needs a deploy step).** `TX_SOURCE_PLAN`
+  gains a mono `ltc` group (`map:[20]`, `enginePorts:['ltc_out']`); everything
+  downstream is already channel-count-generic. **Deploy**: widen `AES67_Sink`
+  20→21 ch in `deploy/pipewire/20-aes67-ravenna-bridge.conf` (done in-repo) and
+  reload PipeWire/RAVENNA, then enable "Deck LTC" in NetworkPanel. Disabled by
+  default — no daemon calls until both are done.
 
 ### 3e. Punch & pre-roll — DONE 2026-08-28
 
@@ -291,8 +323,11 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
 - [x] **Pre-roll** — `toggleTransport` locates `preRollSec` before the
   in-point and rolls; the take still opens only at the in-point.
 - [x] **Loop-record** — a loop wrap while a take is open → `maybePunch`
-  triggers the existing VSC split, one take per pass. Comping lanes to stack
-  them are Phase 4.
+  triggers the existing VSC split, one take per pass.
+- [x] **Loop-record → one lane per pass — DONE.** The server tags each loop
+  pass (`loopPass` + `passIndex` on `take_committed`, tracked via
+  `loopRecordPass` / `pendingLoopPassIndex`); `addCommittedClips` stacks every
+  pass on its own take lane, never the comp lane, ready to comp.
 
 ---
 
@@ -349,7 +384,12 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
   menu, 2+ selected) — grouped clips select and move together;
   `expandGroups` folds the group into every selection. Verified end to end
   (`scratchpad/edit-test.mjs`, 12/12).
-- **Clip fx / clip gain automation** — deferred to a later pass.
+- **Comp crossfade-length control — DONE 2026-08-28.** `compPick`'s hard-coded
+  8 ms seam is now a project field `compCrossfadeSec` (taskbar `XF ms` input,
+  0–100 ms, persisted). True overlapping-clip comp crossfades (the engine
+  already renders track overlaps equal-power) = noted follow-up.
+- **Clip fx** — deferred. Clip-gain automation is covered by the automation
+  lanes below.
 - **Render virtualisation — DONE 2026-08-28.** The arrange surface is already
   one viewport-sized `<canvas>` with off-screen tracks/clips culled in `draw()`.
   Split into two stacked canvases: the **scene** (grid / tracks / clips /
@@ -376,14 +416,57 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
   reconnect; UI re-sends on ws open. Taskbar: `TIME/BARS`, `♩` tempo, time-sig,
   `METRO`, dest toggle. Verified end to end with the real engine
   (`scratchpad/metro-test.mjs`, 8/8 — bounced click track: 8 beats/4 s at
-  120 bpm, correct downbeat pitch). **Still to do**: tempo *map* (ramps /
-  changes), count-in, `beatDiv` UI (state exists), musical-snap for nudge keys,
-  persist tempo in the project (currently localStorage).
-- Video track / reference video scrub for post work.
-- Automation lanes for fader/pan/plugin params tied to transport (turns the
-  console into a mixing-with-automation surface, big scope).
+  120 bpm, correct downbeat pitch).
+- **Bars/beats tails — DONE 2026-08-28.**
+  - [x] `beatDiv` UI — taskbar `1/x` button (1/4·1/8·1/16), already fed `snapTime`.
+  - [x] Musical-snap for the arrow-key nudge — `fine` uses `beatSec/beatDiv` in
+    bars mode.
+  - [x] Musical settings persisted in `project.json` + the `.rpp` `TEMPO` line
+    (tempo, timeSig, beatDiv, countInBars, compCrossfadeSec, metroDest) —
+    `DawProject` + `musicalFields()` + `serializeProject`/`loadProjectData`,
+    `timelineToRpp`/`parseRpp` carry tempo + time-sig.
+  - [x] **Count-in** — engine `g_countin_frames`: N frames of metronome-only
+    with the transport frozen + recorder tap gated, before the roll. Rides the
+    `transport_play` / `start_multitrack_record` payload (`countinFrames`),
+    echoed on the metering `tc.countin` key, `CI n` taskbar button + a
+    `COUNT-IN` overlay. Verified `scratchpad/countin-test.mjs` 5/5.
+  - **Still deferred**: tempo *map* (ramps / mid-project changes).
+- **Automation lanes — DONE 2026-08-28.** Fader / pan / plugin-param breakpoint
+  envelopes per channel. `AutoLane` in `useDawStore` (`automation`, `autoExpand`,
+  `automationMode`), drawn as `AUTO_LANE_H` bands under the take lanes
+  (`SurfaceModel.autoBands` / `drawAutomationLane`, `auto-point` / `auto-lane`
+  hit kinds, `ArrangeSurface` point drag/add/delete), `TrackPanel` `+`/`⌁`
+  toggles + `AutoLanePicker` (ranges from `availablePlugins.controlPorts`).
+  **Playback = a server-side runner** (`maybeRunAutomation` on the metering
+  clock, next to `maybePunch`) that emits `set_fader`/`set_pan`/
+  `set_plugin_param` (+ broadcast so UI faders move) — no engine change.
+  **WRITE mode** captures armed-lane moves in the mixer-intercept branch,
+  thins + pushes back (`auto_lane_updated`) on stop. `DawProject.automation`
+  persisted; `set_automation_state` feeds the runner; taskbar `AUTO R/W`.
+  Verified `scratchpad/auto-test.mjs` 5/5 (live stack: fader ramps 0.1→0.9,
+  write-capture round-trips). **Follow-up**: sample-accurate engine-side
+  automation ring if 40 Hz proves steppy; `.rpp` `<TRACK>` envelope export.
+- **Video reference track — DONE 2026-08-28.** Operator copies an `.mp4` /
+  `.webm` into `projects/<name>/video/`; the server grows a Range-aware HTTP
+  endpoint (`GET /video/<project>/<file>`, sharing the WS port via
+  `http.createServer` + `{ server }`). `useDawStore.video` (`{file, offsetSec}`,
+  persisted in the project) + `VideoPanel` — a bottom strip with the `<video>`
+  kept in sync with the transport (plays while rolling, scrubs while stopped,
+  drift-corrected), a source dropdown, an offset nudge (`±1f` / `±1s`) and
+  "align start → playhead". Taskbar `VIDEO` button. **Follow-up**: a thumbnail
+  filmstrip lane on the timeline (offscreen seeking is heavy — deferred).
 - MIDI — out of character for this box; skip unless a real need appears.
-- Multi-project / playlist for playout (back-to-back segments).
+- **Multi-project playlist — DONE 2026-08-28.** `playlists/<name>.json`
+  (`{name, segments:[{project, recProject?, gapSec?}]}`). Server sequencer
+  (`maybeAdvancePlaylist` on the metering clock, `startPlaylist` /
+  `loadSegmentAndPlay` / `stopPlaylist`): loads a segment's project (fan-out
+  `project_data` → the timeline follows), locates 0, plays; advances at the
+  clip-end frame (`projectEndSec`), with an `armed` guard so a lagging metering
+  frame can't skip a segment, optional per-segment `gapSec`. WS
+  `list/load/save/new_playlist` + `playlist_transport`; `PlaylistPanel` (right
+  rail) + a `PLAYLIST` taskbar button + `playlist_status` badge. Verified
+  `scratchpad/playlist-test.mjs` 5/5 (2-segment run, boundary at the 2 s clip
+  end). **Follow-up**: gapless preloading of the next segment.
 
 ---
 

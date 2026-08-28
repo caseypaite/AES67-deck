@@ -2,13 +2,14 @@
 // clip geometry, hit-tests in canvas space, and paints grid / lanes / clips /
 // waveforms / playhead. Reads the stores directly; owns no React state.
 
-import { useDawStore, type DawClip, type PeaksData, clipPeakKey, musicalGrid, secToBBT } from '../stores/useDawStore';
+import { useDawStore, type DawClip, type PeaksData, type AutoLane, clipPeakKey, musicalGrid, secToBBT } from '../stores/useDawStore';
 import { useMixerStore, type Channel } from '../stores/useMixerStore';
 
 export const RULER_H = 26;
 export const DEFAULT_TRACK_H = 96;
 const MIN_TRACK_H = 48;
 export const LANE_H = 60;   // height of one take lane on an expanded track
+export const AUTO_LANE_H = 46;   // height of one automation lane
 
 // Track-row backgrounds — shared by the canvas and the TrackPanel so the two
 // stay aligned. Kept a clear step apart for legible alternation.
@@ -27,10 +28,13 @@ export interface HitResult {
     | 'clip-fade-in' | 'clip-fade-out' | 'clip-gain'
     | 'lane' | 'ruler' | 'marker' | 'empty'
     | 'take-lane'
+    | 'auto-point' | 'auto-lane'
     | 'region-in' | 'region-out' | 'region-body';
   clipId?: string;
   trackId?: number;
   lane?: number;         // which lane within the track the hit landed in (0 = comp)
+  laneId?: string;       // automation lane id (auto-* hits)
+  pointIdx?: number;     // automation breakpoint index (auto-point)
   markerId?: string;
   time: number;
   cursor: string;
@@ -41,6 +45,8 @@ interface Track {
   expanded: boolean;     // take lanes shown
   lanes: number;         // number of take lanes (highest lane index in use)
   compH: number;         // height of the comp band (row 0); take lanes are LANE_H each
+  autoExpanded: boolean;
+  autoLaneIds: string[]; // automation lane ids on this track, in order
 }
 
 const CLIP_FILL: Record<string, string> = {
@@ -97,10 +103,16 @@ export class SurfaceModel {
       const L = c.lane || 0;
       if (L > (laneCounts[c.trackId] || 0)) laneCounts[c.trackId] = L;
     }
+    // Automation lane ids per track (channel).
+    const autoByTrack: Record<number, string[]> = {};
+    for (const lane of Object.values(daw.automation)) {
+      (autoByTrack[lane.target.channelId] ||= []).push(lane.id);
+    }
 
     // Cheap memo — rebuild only when the geometry inputs change.
     const key = ids.join(',') + '|' + JSON.stringify(heights) + '|' + daw.scrollY
-      + '|' + JSON.stringify(daw.laneExpand) + '|' + JSON.stringify(laneCounts);
+      + '|' + JSON.stringify(daw.laneExpand) + '|' + JSON.stringify(laneCounts)
+      + '|' + JSON.stringify(daw.autoExpand) + '|' + JSON.stringify(autoByTrack);
     if (this._tracksCache && this._tracksCache.key === key) return this._tracksCache.tracks;
 
     const byId = chans as Record<number, Channel>;
@@ -109,8 +121,11 @@ export class SurfaceModel {
       const compH = Math.max(MIN_TRACK_H, heights[id] || DEFAULT_TRACK_H);
       const lanes = laneCounts[id] || 0;
       const expanded = !!daw.laneExpand[id] && lanes > 0;
-      const height = compH + (expanded ? LANE_H * lanes : 0);
-      const t = { id, name: byId[id]?.name ?? `IN ${id}`, height, y, expanded, lanes, compH };
+      const autoLaneIds = autoByTrack[id] || [];
+      const autoExpanded = !!daw.autoExpand[id] && autoLaneIds.length > 0;
+      const height = compH + (expanded ? LANE_H * lanes : 0)
+        + (autoExpanded ? AUTO_LANE_H * autoLaneIds.length : 0);
+      const t = { id, name: byId[id]?.name ?? `IN ${id}`, height, y, expanded, lanes, compH, autoExpanded, autoLaneIds };
       y += height;
       return t;
     });
@@ -132,6 +147,28 @@ export class SurfaceModel {
     const rects = this.laneRects(t);
     for (const r of rects) if (py >= r.y && py < r.y + r.h) return r;
     return rects[0];
+  }
+
+  // y-bands for a track's automation lanes (below the take lanes).
+  autoBands(t: Track): Array<{ laneId: string; y: number; h: number }> {
+    if (!t.autoExpanded) return [];
+    const top = t.y + t.compH + (t.expanded ? LANE_H * t.lanes : 0);
+    return t.autoLaneIds.map((laneId, k) => ({ laneId, y: top + AUTO_LANE_H * k, h: AUTO_LANE_H }));
+  }
+
+  // Screen py → a value in `laneId`'s domain (clamped), or null if it's not shown.
+  autoLaneValueAt(laneId: string, py: number): number | null {
+    const lane = useDawStore.getState().automation[laneId];
+    if (!lane) return null;
+    for (const t of this.tracks()) {
+      for (const ab of this.autoBands(t)) {
+        if (ab.laneId !== laneId) continue;
+        const pad = 4, top = ab.y + pad, span = ab.h - 2 * pad;
+        const f = 1 - (py - top) / Math.max(1e-9, span);
+        return Math.max(lane.min, Math.min(lane.max, lane.min + f * (lane.max - lane.min)));
+      }
+    }
+    return null;
   }
 
   contentHeight(): number {
@@ -231,6 +268,22 @@ export class SurfaceModel {
 
     const track = this.trackAtY(py);
     if (!track) return { kind: 'empty', time, cursor: 'default' };
+
+    // Automation lanes (below the take lanes).
+    for (const ab of this.autoBands(track)) {
+      if (py < ab.y || py >= ab.y + ab.h) continue;
+      const lane = useDawStore.getState().automation[ab.laneId];
+      if (!lane) return { kind: 'auto-lane', trackId: track.id, laneId: ab.laneId, time, cursor: 'crosshair' };
+      const pad = 4;
+      for (let i = 0; i < lane.points.length; i++) {
+        const p = lane.points[i];
+        const px2 = this.timeToX(p.t);
+        const py2 = ab.y + pad + (ab.h - 2 * pad) * (1 - (p.v - lane.min) / Math.max(1e-9, lane.max - lane.min));
+        if (Math.abs(px - px2) <= 6 && Math.abs(py - py2) <= 6)
+          return { kind: 'auto-point', trackId: track.id, laneId: ab.laneId, pointIdx: i, time, cursor: 'move' };
+      }
+      return { kind: 'auto-lane', trackId: track.id, laneId: ab.laneId, time, cursor: 'crosshair' };
+    }
 
     const band = this.laneAtY(track, py);
     const clips = Object.values(useDawStore.getState().clips)
@@ -428,6 +481,12 @@ export class SurfaceModel {
         }
       }
 
+      // Automation lanes (below the take lanes).
+      for (const ab of this.autoBands(tr)) {
+        const lane = daw.automation[ab.laneId];
+        if (lane) this.drawAutomationLane(ctx, lane, ab.y, ab.h, daw.playheadPosition);
+      }
+
       // Comp swipe preview: highlight the span on the source lane + comp lane.
       const cp = daw.compPreview;
       if (cp && cp.trackId === tr.id && cp.toSec > cp.fromSec) {
@@ -601,6 +660,73 @@ export class SurfaceModel {
     ctx.moveTo(xa, y + h - 0.5); ctx.lineTo(xb, y + 0.5);
     ctx.moveTo(xa, y + 0.5); ctx.lineTo(xb, y + h - 0.5);
     ctx.stroke();
+    ctx.restore();
+  }
+
+  private drawAutomationLane(
+    ctx: CanvasRenderingContext2D, lane: AutoLane, y: number, h: number, playhead: number,
+  ) {
+    const pad = 4;
+    const top = y + pad, span = h - 2 * pad;
+    const vy = (v: number) => top + span * (1 - (v - lane.min) / Math.max(1e-9, lane.max - lane.min));
+    const active = lane.enabled;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.34)';
+    ctx.fillRect(0, y, this.width, h);
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(this.width, y + 0.5); ctx.stroke();
+    // midline
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.beginPath(); ctx.moveTo(0, top + span / 2); ctx.lineTo(this.width, top + span / 2); ctx.stroke();
+
+    // label
+    ctx.fillStyle = active ? 'rgba(150,200,255,0.9)' : 'rgba(255,255,255,0.35)';
+    ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`⌁ ${lane.target.label}${active ? '' : '  (off)'}`, 4, y + 3);
+    ctx.textBaseline = 'alphabetic';
+
+    const col = active ? '#7cc4ff' : 'rgba(150,170,200,0.5)';
+    const pts = lane.points;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    if (pts.length === 0) {
+      // flat — nothing to draw
+    } else {
+      let started = false;
+      const first = vy(pts[0].v);
+      ctx.moveTo(-2, first); ctx.lineTo(this.timeToX(pts[0].t), first); started = true;
+      for (const p of pts) ctx.lineTo(this.timeToX(p.t), vy(p.v));
+      const last = pts[pts.length - 1];
+      ctx.lineTo(this.width + 2, vy(last.v));
+      if (started) ctx.stroke();
+    }
+    // points
+    ctx.fillStyle = col;
+    for (const p of pts) {
+      const px = this.timeToX(p.t);
+      if (px < -4 || px > this.width + 4) continue;
+      ctx.fillRect(px - 2.5, vy(p.v) - 2.5, 5, 5);
+    }
+    // current value dot at the playhead
+    if (pts.length) {
+      const phx = this.timeToX(playhead);
+      if (phx >= 0 && phx <= this.width) {
+        let v = pts[0].v;
+        for (let i = 0; i < pts.length; i++) {
+          if (pts[i].t <= playhead) v = pts[i].v;
+          if (pts[i].t > playhead && i > 0) {
+            const a = pts[i - 1], b = pts[i];
+            v = a.v + (b.v - a.v) * (playhead - a.t) / Math.max(1e-9, b.t - a.t);
+            break;
+          }
+        }
+        ctx.fillStyle = active ? '#ffffff' : 'rgba(255,255,255,0.5)';
+        ctx.beginPath(); ctx.arc(phx, vy(v), 3, 0, Math.PI * 2); ctx.fill();
+      }
+    }
     ctx.restore();
   }
 
