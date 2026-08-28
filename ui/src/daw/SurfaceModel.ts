@@ -236,6 +236,17 @@ export class SurfaceModel {
         if (x1 < 0 || x0 > w) continue;
         this.drawClip(ctx, c, x0, x1, tr.y + 3, tr.height - 6, selected.has(c.id), daw.peaks);
       }
+
+      // Crossfades: adjacent clips that overlap in time get an equal-power
+      // crossfade (the engine mixes them); draw the X over the overlap span.
+      const sorted = clips.filter((c) => !c.recording).sort((a, b) => a.start - b.start);
+      for (let i = 1; i < sorted.length; i++) {
+        const a = sorted[i - 1], b = sorted[i];
+        const ovStart = b.start;
+        const ovEnd = Math.min(a.start + a.length, b.start + b.length);
+        if (ovEnd <= ovStart) continue;
+        this.drawCrossfade(ctx, this.timeToX(ovStart), this.timeToX(ovEnd), tr.y + 3, tr.height - 6);
+      }
     }
 
     // marquee selection rectangle
@@ -361,6 +372,27 @@ export class SurfaceModel {
       ctx.restore();
       ctx.textBaseline = 'alphabetic';
     }
+  }
+
+  // Equal-power crossfade marker over a clip overlap: a dark wash plus the
+  // classic crossing X (rising = incoming clip, falling = outgoing).
+  private drawCrossfade(
+    ctx: CanvasRenderingContext2D,
+    x0: number, x1: number, y: number, h: number,
+  ) {
+    const xa = Math.max(x0, -2);
+    const xb = Math.min(x1, this.width + 2);
+    if (xb - xa < 1) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.30)';
+    ctx.fillRect(xa, y, xb - xa, h);
+    ctx.strokeStyle = 'rgba(255,210,120,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(xa, y + h - 0.5); ctx.lineTo(xb, y + 0.5);
+    ctx.moveTo(xa, y + 0.5); ctx.lineTo(xb, y + h - 0.5);
+    ctx.stroke();
+    ctx.restore();
   }
 
   private drawFades(

@@ -15,7 +15,8 @@ public:
     DiskWriter();
     ~DiskWriter();
 
-    bool start_recording(const std::string& filepath, int channels, int sample_rate);
+    // `bits`: 16 or 24 → PCM WAV, anything else → 32-bit float WAV.
+    bool start_recording(const std::string& filepath, int channels, int sample_rate, int bits = 32);
     void stop_recording();
 
     // Set true (and latched until the next start_recording) if the RT thread

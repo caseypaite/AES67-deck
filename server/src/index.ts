@@ -69,6 +69,11 @@ const LOGS_DIR = process.env.AES67_LOGS_DIR
   : path.join(process.cwd(), '..', 'logs');
 try { fs.mkdirSync(LOGS_DIR, { recursive: true }); } catch { /* ignore */ }
 
+// Rendered bounces (plan Phase 4). Live under records/ so they ride the same
+// backup / file-share path as the recordings.
+const BOUNCES_DIR = path.join(RECORDS_DIR, 'bounces');
+try { fs.mkdirSync(BOUNCES_DIR, { recursive: true }); } catch { /* ignore */ }
+
 // Name of the recording project currently open, or null for the scratch
 // session. When set, its media lives in records/<name>/ (flat) and autosave
 // rewrites records/<name>/<name>.rpp.
@@ -950,6 +955,7 @@ let punchDoneThisRoll = false;
 
 function maybePunch(t: any): void {
   if (!t || typeof t.frame !== 'number') return;
+  if (bounce.active) return;   // a server-driven bounce roll must not auto-punch
   const frame = t.frame as number;
   const prev = lastPunchFrame;
   lastPunchFrame = frame;
@@ -993,6 +999,70 @@ function maybePunch(t: any): void {
   }
 }
 
+// --- Phase 4: realtime master bounce -----------------------------------
+// Server picks the file path + times the run; the engine opens/closes the
+// writer (bounce_start / bounce_abort) and echoes bounceState on the metering
+// frame. Same server-timed pattern as auto-punch.
+const bounce: { active: boolean; path: string; name: string; inSec: number; outSec: number; bits: number } =
+  { active: false, path: '', name: '', inSec: 0, outSec: 0, bits: 24 };
+
+function startBounce(inSec: number, outSec: number, name: string, bits: number): string | null {
+  if (!engineSocket) return 'engine not connected';
+  if (bounce.active) return 'a bounce is already running';
+  if (activeTakeDir) return 'stop recording first';
+  if (!(outSec > inSec)) return 'invalid region';
+  const safe = String(name || 'bounce').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 48) || 'bounce';
+  const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const file = `${safe}-${ts}.wav`;
+  const b = bits === 16 || bits === 24 ? bits : 24;
+  Object.assign(bounce, { active: true, path: path.join(BOUNCES_DIR, file), name: file, inSec, outSec, bits: b });
+  const sr = 48000;
+  engineSocket.write(JSON.stringify({ type: 'transport_locate', frame: Math.round(inSec * sr) }) + '\n');
+  engineSocket.write(JSON.stringify({ type: 'bounce_start', path: path.resolve(bounce.path), bits: b, endFrame: Math.round(outSec * sr) }) + '\n');
+  engineSocket.write(JSON.stringify({ type: 'transport_play' }) + '\n');
+  broadcastToClients(JSON.stringify({ type: 'bounce_status', state: 'running', name: file, inSec, outSec }));
+  return null;
+}
+
+function cancelBounce(): void {
+  if (!bounce.active) return;
+  bounce.active = false;
+  if (engineSocket) engineSocket.write(JSON.stringify({ type: 'bounce_abort' }) + '\n');
+  try { if (fs.existsSync(bounce.path)) fs.rmSync(bounce.path); } catch { /* ignore */ }
+  broadcastToClients(JSON.stringify({ type: 'bounce_status', state: 'cancelled', name: bounce.name }));
+}
+
+// Called on the metering frame: the engine flips bounceState to 2 when the
+// clock reaches the out-point. Give the disk thread a beat to finalise, then
+// report the file.
+function maybeFinishBounce(t: any): void {
+  if (!bounce.active || !t || t.bounceState !== 2) return;
+  const b = { ...bounce };
+  bounce.active = false;
+  setTimeout(() => {
+    let bytes = 0;
+    try { bytes = fs.statSync(b.path).size; } catch { /* ignore */ }
+    broadcastToClients(JSON.stringify({
+      type: 'bounce_done',
+      name: b.name,
+      path: path.relative(RECORDS_DIR, b.path),
+      bytes,
+      durationSec: Math.round((b.outSec - b.inSec) * 100) / 100,
+      overrun: !!t.bounceOverrun,
+    }));
+    broadcastToClients(JSON.stringify({ type: 'bounces_list', bounces: listBounces() }));
+  }, 300);
+}
+
+function listBounces(): Array<{ name: string; bytes: number; mtime: number }> {
+  try {
+    return fs.readdirSync(BOUNCES_DIR)
+      .filter((f) => f.toLowerCase().endsWith('.wav'))
+      .map((f) => { const s = fs.statSync(path.join(BOUNCES_DIR, f)); return { name: f, bytes: s.size, mtime: s.mtimeMs }; })
+      .sort((a, b) => b.mtime - a.mtime);
+  } catch { return []; }
+}
+
 // Set up WebSocket server
 const wss = new WebSocketServer({ port: WSS_PORT });
 console.log(`WebSocket Server listening on ws://localhost:${WSS_PORT}`);
@@ -1015,6 +1085,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
   ws.send(JSON.stringify({ type: 'vsc_config_loaded', config: getVscConfig() }));
   ws.send(JSON.stringify({ type: 'loudness_config_loaded', config: getLoudnessConfig() }));
+  ws.send(JSON.stringify({ type: 'bounces_list', bounces: listBounces() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
   ws.send(JSON.stringify(daemonStateMessage()));
   ws.send(JSON.stringify({ type: 'mic_devices_loaded', devices: lastMicDevices }));
@@ -1451,6 +1522,13 @@ wss.on('connection', (ws) => {
           const { csv, summary } = buildLoudnessReport(startSec, endSec, data.name, target);
           ws.send(JSON.stringify({ type: 'loudness_report', name: summary.file, csv, summary }));
         }
+      } else if (data.type === 'bounce') {
+        const err = startBounce(Number(data.inSec) || 0, Number(data.outSec) || 0, String(data.name || ''), Number(data.bits) || 24);
+        if (err) ws.send(JSON.stringify({ type: 'bounce_status', state: 'failed', error: err }));
+      } else if (data.type === 'bounce_cancel') {
+        cancelBounce();
+      } else if (data.type === 'list_bounces') {
+        ws.send(JSON.stringify({ type: 'bounces_list', bounces: listBounces() }));
       } else if (data.type === 'get_clip_peaks') {
         // Lazy waveform data: compute (and cache) min/max peaks for one take
         // file on first request, then serve from disk.
@@ -1767,8 +1845,14 @@ const ipcServer = net.createServer((socket) => {
             lastPluginCatalog = parsed.plugins;
           } else if (parsed.type === 'metering') {
             // `handled` stays false so the frame still forwards to every UI.
-            maybeLogLoudness(parsed);          // Phase 3c: 1 Hz loudness CSV + ring
-            maybePunch(parsed.transport);      // Phase 3e: auto drop-in/out + loop-record split
+            maybeLogLoudness(parsed);              // Phase 3c: 1 Hz loudness CSV + ring
+            maybePunch(parsed.transport);         // Phase 3e: auto drop-in/out + loop-record split
+            maybeFinishBounce(parsed.transport);  // Phase 4: bounce done → report the file
+          } else if (parsed.type === 'bounce_failed') {
+            if (bounce.active) {
+              bounce.active = false;
+              broadcastToClients(JSON.stringify({ type: 'bounce_status', state: 'failed', name: bounce.name }));
+            }
           } else if (parsed.type === 'take_started') {
             handled = handleTakeStarted(parsed);
           } else if (parsed.type === 'take_finished') {

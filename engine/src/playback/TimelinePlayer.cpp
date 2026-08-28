@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 
@@ -112,10 +113,12 @@ uint32_t TimelinePlayer::TrackReader::read_stereo(float* out, uint32_t frames) {
 TimelinePlayer::TimelinePlayer(int sample_rate)
     : sample_rate_(sample_rate > 0 ? sample_rate : 48000) {
     read_scratch_.resize(FILL_CHUNK * 2);
+    read_scratch_b_.resize(FILL_CHUNK * 2);
     rt_scratch_.resize(8192 * 2);
     for (int t = 1; t <= MAX_CH; ++t) {
         tracks_[t] = std::make_unique<TrackReader>();
         tracks_[t]->ring = jack_ringbuffer_create(RING_BYTES);
+        tracks_b_[t] = std::make_unique<TrackReader>();   // no ring — crossfade only
     }
     reader_ = std::thread(&TimelinePlayer::reader_loop, this);
 }
@@ -153,26 +156,56 @@ void TimelinePlayer::render(int track_id, float* L, float* R, uint32_t nframes) 
 }
 
 // Fill `interleaved_dst` (n stereo frames) with track_id's timeline audio at
-// timeline position `pos`, walking clip boundaries. Reader thread only.
+// timeline position `pos`, walking clip boundaries. Two overlapping clips on
+// the track are mixed with an equal-power (cos/sin) crossfade across the
+// overlap span. Reader thread only.
 void TimelinePlayer::produce_track(int track_id, uint64_t pos, uint32_t n, float* dst) {
+    constexpr float HALF_PI = 1.5707963267948966f;
+
+    // Read `frames` interleaved-stereo frames of clip `c` at timeline position
+    // `at` into `out` via reader `tr`, zero-filling a short read.
+    auto read_clip = [](TrackReader& tr, const ClipSpec& c,
+                        uint64_t at, uint32_t frames, float* out) {
+        const int64_t file_off = static_cast<int64_t>(c.fileStart + (at - c.timelineStart));
+        if (tr.open_path != c.path) tr.open(c.path);
+        uint32_t got = 0;
+        const int nch = tr.channels();
+        if ((tr.sf || tr.wv) && (nch == 1 || nch == 2)) {
+            if (tr.cursor != file_off) { tr.seek(file_off); tr.cursor = file_off; }
+            got = tr.read_stereo(out, frames);
+            tr.cursor += got;
+        }
+        if (got < frames)
+            std::memset(out + got * 2, 0, sizeof(float) * 2 * (frames - got));
+    };
+
     uint32_t produced = 0;
     while (produced < n) {
         const uint64_t here = pos + produced;
 
-        // Find the clip covering `here`, and the start of the next clip after
-        // it (to bound the silent gap).
-        const ClipSpec* cur = nullptr;
+        // Clips covering `here` on this track (0, 1, or — during a crossfade —
+        // 2), plus the start of the next clip to bound a silent gap.
+        const ClipSpec* c0 = nullptr;   // earlier start (outgoing)
+        const ClipSpec* c1 = nullptr;   // later start (incoming)
         uint64_t next_start = UINT64_MAX;
         for (const auto& c : schedule_) {
             if (c.trackId != track_id || c.length == 0) continue;
             if (here >= c.timelineStart && here < c.timelineStart + c.length) {
-                cur = &c;
-                break;
+                if (!c0) { c0 = &c; }
+                else if (!c1) { c1 = &c; }
+                else {
+                    // 3+ deep (pathological): keep the two latest-starting.
+                    const ClipSpec** lo =
+                        c0->timelineStart <= c1->timelineStart ? &c0 : &c1;
+                    if (c.timelineStart > (*lo)->timelineStart) *lo = &c;
+                }
+            } else if (c.timelineStart > here && c.timelineStart < next_start) {
+                next_start = c.timelineStart;
             }
-            if (c.timelineStart > here && c.timelineStart < next_start) next_start = c.timelineStart;
         }
+        if (c0 && c1 && c1->timelineStart < c0->timelineStart) std::swap(c0, c1);
 
-        if (!cur) {
+        if (!c0) {
             uint64_t gap = n - produced;
             if (next_start != UINT64_MAX && next_start - here < gap) gap = next_start - here;
             std::memset(dst + produced * 2, 0, sizeof(float) * 2 * gap);
@@ -180,44 +213,51 @@ void TimelinePlayer::produce_track(int track_id, uint64_t pos, uint32_t n, float
             continue;
         }
 
-        const uint64_t avail = cur->timelineStart + cur->length - here;
-        const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(n - produced, avail));
-        const int64_t file_off = static_cast<int64_t>(cur->fileStart + (here - cur->timelineStart));
+        // Run until the next boundary: c0's end, c1's end/start, or the next
+        // clip's start.
+        uint64_t bound = c0->timelineStart + c0->length - here;
+        if (c1) bound = std::min(bound, c1->timelineStart + c1->length - here);
+        else if (next_start != UINT64_MAX) bound = std::min(bound, next_start - here);
+        const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(n - produced, bound));
+        float* out = dst + produced * 2;
 
-        TrackReader& tr = *tracks_[track_id];
-        if (tr.open_path != cur->path) {
-            tr.open(cur->path);
-        }
+        read_clip(*tracks_[track_id], *c0, here, take, out);
 
-        uint32_t got = 0;
-        const int nch = tr.channels();
-        if ((tr.sf || tr.wv) && (nch == 1 || nch == 2)) {
-            if (tr.cursor != file_off) {
-                tr.seek(file_off);
-                tr.cursor = file_off;
+        if (!c1) {
+            // Single clip: constant gain × linear fade-in/out ramps.
+            const uint64_t clip_off = here - c0->timelineStart;
+            const bool has_fade = c0->fadeIn > 0 || c0->fadeOut > 0;
+            if (c0->gain != 1.0f || has_fade) {
+                for (uint32_t f = 0; f < take; ++f) {
+                    float e = c0->gain;
+                    const uint64_t p = clip_off + f;
+                    if (c0->fadeIn > 0 && p < c0->fadeIn)
+                        e *= static_cast<float>(p) / static_cast<float>(c0->fadeIn);
+                    if (c0->fadeOut > 0 && c0->length > p &&
+                        c0->length - p <= c0->fadeOut)
+                        e *= static_cast<float>(c0->length - p) / static_cast<float>(c0->fadeOut);
+                    out[f * 2] *= e;
+                    out[f * 2 + 1] *= e;
+                }
             }
-            got = tr.read_stereo(dst + produced * 2, take);
-            tr.cursor += got;
-        }
+        } else {
+            // Overlap → equal-power crossfade from c0 to c1 across
+            // [c1.start, c0.end]. Each clip's own linear fades are ignored
+            // inside the overlap; the xfade is the authority.
+            if (read_scratch_b_.size() < static_cast<size_t>(take) * 2)
+                read_scratch_b_.resize(static_cast<size_t>(take) * 2);
+            read_clip(*tracks_b_[track_id], *c1, here, take, read_scratch_b_.data());
 
-        if (got < take) {
-            std::memset(dst + (produced + got) * 2, 0, sizeof(float) * 2 * (take - got));
-        }
-
-        // Per-frame envelope: constant clip gain × linear fade-in/out ramps.
-        const uint64_t clip_off = here - cur->timelineStart;   // frames into the clip
-        const bool has_fade = cur->fadeIn > 0 || cur->fadeOut > 0;
-        if (cur->gain != 1.0f || has_fade) {
+            const double xf_start = static_cast<double>(c1->timelineStart);
+            const double xf_end = static_cast<double>(c0->timelineStart + c0->length);
+            const double xf_len = std::max(1.0, xf_end - xf_start);
             for (uint32_t f = 0; f < take; ++f) {
-                float e = cur->gain;
-                const uint64_t p = clip_off + f;
-                if (cur->fadeIn > 0 && p < cur->fadeIn)
-                    e *= static_cast<float>(p) / static_cast<float>(cur->fadeIn);
-                if (cur->fadeOut > 0 && cur->length > p &&
-                    cur->length - p <= cur->fadeOut)
-                    e *= static_cast<float>(cur->length - p) / static_cast<float>(cur->fadeOut);
-                dst[(produced + f) * 2] *= e;
-                dst[(produced + f) * 2 + 1] *= e;
+                double t = (static_cast<double>(here + f) - xf_start) / xf_len;
+                t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+                const float ga = c0->gain * std::cos(static_cast<float>(t) * HALF_PI);
+                const float gb = c1->gain * std::sin(static_cast<float>(t) * HALF_PI);
+                out[f * 2]     = out[f * 2]     * ga + read_scratch_b_[f * 2]     * gb;
+                out[f * 2 + 1] = out[f * 2 + 1] * ga + read_scratch_b_[f * 2 + 1] * gb;
             }
         }
         produced += take;
@@ -234,7 +274,10 @@ void TimelinePlayer::reader_loop() {
             pending_.clear();
             pending_ready_.store(false, std::memory_order_relaxed);
             // Force a re-seek so a schedule edit takes effect at the playhead.
-            for (int t = 1; t <= MAX_CH; ++t) tracks_[t]->cursor = -1;
+            for (int t = 1; t <= MAX_CH; ++t) {
+                tracks_[t]->cursor = -1;
+                tracks_b_[t]->cursor = -1;
+            }
         }
 
         const int state = transport_state_.load(std::memory_order_relaxed);
@@ -254,6 +297,7 @@ void TimelinePlayer::reader_loop() {
             for (int t = 1; t <= MAX_CH; ++t) {
                 jack_ringbuffer_reset(tracks_[t]->ring);
                 tracks_[t]->cursor = -1;
+                tracks_b_[t]->cursor = -1;
             }
             fill_pos_ = frame;
             was_playing_ = true;

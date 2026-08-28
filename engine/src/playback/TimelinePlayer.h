@@ -106,13 +106,18 @@ private:
     std::vector<ClipSpec> pending_;        // set_schedule drop box
     std::atomic<bool> pending_ready_{false};
 
+    // Two file readers per track: `tracks_` streams the clip playing now,
+    // `tracks_b_` the overlapping neighbour during a clip-to-clip crossfade.
+    // Only `tracks_` owns the per-track output ring.
     std::unique_ptr<TrackReader> tracks_[MAX_CH + 1];
+    std::unique_ptr<TrackReader> tracks_b_[MAX_CH + 1];
 
     uint64_t fill_pos_ = 0;
     bool was_playing_ = false;
     std::atomic<bool> priming_{false}; // reader flushed, ring not yet refilled
 
     std::vector<float> read_scratch_;      // reader thread
+    std::vector<float> read_scratch_b_;    // reader thread — crossfade neighbour
     std::vector<float> rt_scratch_;        // audio thread (render)
 
     std::atomic<bool> underrun_{false};

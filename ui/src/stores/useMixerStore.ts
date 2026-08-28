@@ -620,6 +620,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       ws.send(JSON.stringify({ type: 'list_rack_presets' }));
       ws.send(JSON.stringify({ type: 'get_loudness_config' }));
       ws.send(JSON.stringify({ type: 'get_loudness_history' }));
+      ws.send(JSON.stringify({ type: 'list_bounces' }));
       const mask = get().monitorInputMask;
       if (mask !== 0) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask }));
     };
@@ -998,6 +999,12 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           console.warn('multitrack take failed:', data.reason || 'unknown');
           useDawStore.getState().endRecordingClips();
           set({ transportState: 'stopped' });
+        } else if (data.type === 'bounce_status') {
+          useDawStore.getState().applyBounceStatus(data);
+        } else if (data.type === 'bounce_done') {
+          useDawStore.getState().applyBounceDone(data);
+        } else if (data.type === 'bounces_list') {
+          useDawStore.getState().setBounces(data.bounces || []);
         } else if (data.type === 'loudness_config_loaded') {
           useLoudnessStore.getState().applyConfig(data.config || {});
         } else if (data.type === 'loudness_history') {

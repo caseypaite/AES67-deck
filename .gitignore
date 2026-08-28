@@ -4,6 +4,7 @@ node_modules/
 # Build output
 engine/build/
 ui/dist/
+server/dist/
 
 # Runtime state written by the running server (not source config)
 server/patchbay_config.json

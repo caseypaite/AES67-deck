@@ -304,8 +304,19 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
   `undo` / `redo` / `historyBegin` / `historyEnd`, `canUndo` / `canRedo` for
   the toolbar, `Ctrl/⌘+Z` · `Ctrl+Shift+Z` · `Ctrl+Y`. Cleared on project
   load. Region / transport modes are excluded by design.
-- **Crossfades** — overlap two clips → equal-power crossfade region, rendered by
-  the playback voice envelope (2a).
+- **Clip gain + fades — DONE.** Per-clip linear `gain` / `fadeIn` / `fadeOut`
+  (`ClipSpec`, `DawClip`): engine per-frame envelope in `produce_track`, server
+  persists + forwards on `set_timeline`, `SurfaceModel` draws ramps + a gain
+  line with drag grips (`clip-fade-in` / `clip-fade-out` / `clip-gain` hit
+  kinds), context-menu reset/clear.
+- **Crossfades — DONE 2026-08-28.** Two clips overlapping on a track →
+  equal-power (cos/sin) crossfade across the overlap span. `TimelinePlayer`
+  gained a second file reader per track (`tracks_b_`); `produce_track` gathers
+  up to two covering clips, reads both, mixes with `cos/sin` gains over
+  `[c1.start, c0.end]` (each clip's own linear fades ignored inside the
+  overlap). Server unchanged — overlap is pure geometry. `SurfaceModel`
+  `drawCrossfade` paints the X. Containment (one clip fully inside another) is
+  not a supported crossfade shape. **Not yet run end-to-end.**
 - **Take comping** — stacked lanes per track, swipe-to-select the active take,
   promote to a comp clip.
 - **Bounce / export** — render a timeline region through the master chain to a
