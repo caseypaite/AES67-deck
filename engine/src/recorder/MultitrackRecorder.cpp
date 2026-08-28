@@ -17,8 +17,14 @@ bool MultitrackRecorder::start(const std::string& dir, const std::vector<int>& a
 
     dir_ = dir;
     armed_.clear();
-    origin_frame_ = origin_frame;
     sample_rate_ = sample_rate > 0 ? sample_rate : 48000;
+
+    // Discard the first PREROLL_DISCARD_SEC of every take (startup transient
+    // workaround) and advance the take's project-time zero to match, so clips
+    // still land where the audio really is on the timeline.
+    const int64_t skip = static_cast<int64_t>(PREROLL_DISCARD_SEC) * sample_rate_;
+    origin_frame_ = origin_frame + static_cast<uint64_t>(skip);
+    skip_remaining_.fill(0);
 
     // Trailing slash tolerated either way.
     std::string base = dir_;
@@ -38,6 +44,7 @@ bool MultitrackRecorder::start(const std::string& dir, const std::vector<int>& a
         }
         writers_[ch_id] = std::move(w);
         armed_.push_back(ch_id);
+        skip_remaining_[ch_id] = skip;
         opened++;
     }
 

@@ -38,12 +38,29 @@ public:
     int sample_rate() const { return sample_rate_; }
     const std::vector<int>& armed() const { return armed_; }
 
+    // Seconds of audio discarded at the head of every take — a temporary
+    // workaround for a startup transient that distorts the first ~2 s of the
+    // capture. origin_frame_ is advanced by the same amount in start() so the
+    // take stays time-aligned with the transport.
+    static constexpr int PREROLL_DISCARD_SEC = 2;
+
     // RT thread. No-op for channels not armed in the current take.
     void write(int ch_id, const float* l, const float* r, int nframes) {
         if (!recording_.load(std::memory_order_acquire)) return;
         if (ch_id < 1 || ch_id > MAX_CH) return;
         WavpackWriter* w = writers_[ch_id].get();
         if (!w) return;
+
+        // Drop the pre-roll: skip whole blocks until the per-channel budget is
+        // spent, then trim the straddling block and write its tail.
+        int64_t& skip = skip_remaining_[ch_id];
+        if (skip > 0) {
+            if (skip >= nframes) { skip -= nframes; return; }
+            const int drop = static_cast<int>(skip);
+            l += drop; r += drop; nframes -= drop;
+            skip = 0;
+        }
+
         const float* chans[2] = { l, r };
         w->write_audio(chans, 2, nframes);
         frames_tapped_.fetch_add(nframes, std::memory_order_relaxed);
@@ -106,6 +123,10 @@ private:
     std::array<std::unique_ptr<WavpackWriter>, MAX_CH + 1> writers_{}; // index by ch id
     std::atomic<bool> recording_{false};
     std::atomic<uint64_t> frames_tapped_{0};
+
+    // Per-channel pre-roll frames still to discard (set in start(), spent in
+    // write()). Audio thread only.
+    std::array<int64_t, MAX_CH + 1> skip_remaining_{};
 
     // Live-waveform peak envelope: one min/max pair per PEAK_BUCKET frames
     // (~5 ms @ 48k), per channel. Single-thread (process) ring; the metering

@@ -541,8 +541,11 @@ int main(int argc, char** argv) {
                 return;
             }
             g_transport.state.store(2, std::memory_order_relaxed);
+            // Report the recorder's origin (transport frame + the discarded
+            // pre-roll), so the live take placeholder and the committed clip
+            // land at the same place on the timeline.
             nlohmann::json started{{"type", "take_started"}, {"dir", mtr.dir()},
-                                   {"originFrame", origin}, {"sampleRate", sr_i},
+                                   {"originFrame", mtr.origin_frame()}, {"sampleRate", sr_i},
                                    {"armed", mtr.armed()}, {"ext", mtr.file_ext()}};
             ipc.send_json(started.dump());
 
