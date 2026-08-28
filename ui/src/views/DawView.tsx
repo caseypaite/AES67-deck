@@ -122,8 +122,10 @@ export const DawView = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [deleteSelected, copySelected, pasteClipboard, sliceSelectedAtPlayhead]);
 
+  // Taskbar buttons: legible on the dark bar even in the off / disabled state.
+  const OFF = 'bg-[#363c47] text-gray-200 hover:bg-[#434a57] hover:text-white';
   const tBtn = (active: boolean, activeCls = 'bg-blue-600 text-white') =>
-    `px-2.5 py-1 text-xs font-bold rounded transition-colors ${active ? activeCls : 'bg-[#222] text-gray-500 hover:text-gray-300'}`;
+    `px-2.5 py-1 text-xs font-bold rounded transition-colors ${active ? activeCls : OFF}`;
 
   return (
     <div className="w-full h-full flex flex-col bg-[#16181d] select-none outline-none" tabIndex={0}>
@@ -148,35 +150,35 @@ export const DawView = () => {
       )}
 
       {/* Bottom taskbar — track area scrolls between the app header and this bar */}
-      <div className="shrink-0 h-10 flex items-center gap-1 px-2 bg-[#111] border-t border-[#333] overflow-x-auto">
+      <div className="shrink-0 h-10 flex items-center gap-1 px-2 bg-[#0c0e12] border-t border-[#3a3f48] overflow-x-auto">
         <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
-          className="w-7 h-7 shrink-0 flex items-center justify-center text-sm rounded bg-[#222] text-gray-400 enabled:hover:text-white disabled:opacity-30">⤺</button>
+          className={`w-7 h-7 shrink-0 flex items-center justify-center text-sm rounded transition-colors ${OFF} disabled:opacity-45`}>⤺</button>
         <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)"
-          className="w-7 h-7 shrink-0 flex items-center justify-center text-sm rounded bg-[#222] text-gray-400 enabled:hover:text-white disabled:opacity-30">⤻</button>
-        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
+          className={`w-7 h-7 shrink-0 flex items-center justify-center text-sm rounded transition-colors ${OFF} disabled:opacity-45`}>⤻</button>
+        <div className="w-px h-6 bg-[#3a3f48] mx-1 shrink-0" />
 
         <button onClick={setRegionFromContext} title="Set loop/punch region from selection (or playhead)"
-          className={`shrink-0 ${tBtn(!!region, 'bg-[#2a2f3a] text-gray-200')}`}>REGION</button>
+          className={`shrink-0 ${tBtn(!!region, 'bg-blue-600 text-white')}`}>REGION</button>
         {region && (
           <button onClick={clearRegion} title="Clear region"
-            className="w-6 h-7 shrink-0 flex items-center justify-center text-xs rounded bg-[#222] text-gray-500 hover:text-red-400">✕</button>
+            className={`w-6 h-7 shrink-0 flex items-center justify-center text-xs rounded ${OFF} hover:!text-red-400`}>✕</button>
         )}
         <button onClick={() => setLoopEnabled(!loopEnabled)} disabled={!region} title="Loop the region (L)"
-          className={`shrink-0 disabled:opacity-30 ${tBtn(loopEnabled, 'bg-cyan-600 text-white')}`}>LOOP</button>
+          className={`shrink-0 disabled:opacity-45 ${tBtn(loopEnabled, 'bg-cyan-600 text-white')}`}>LOOP</button>
         <button onClick={() => setPunchEnabled(!punchEnabled)} disabled={!region} title="Auto-punch armed tracks on the region"
-          className={`shrink-0 disabled:opacity-30 ${tBtn(punchEnabled, 'bg-red-600 text-white')}`}>PUNCH</button>
-        <label className="flex items-center gap-1 text-[10px] font-bold text-gray-500 pl-1 shrink-0" title="Pre-roll seconds before the punch in-point">
+          className={`shrink-0 disabled:opacity-45 ${tBtn(punchEnabled, 'bg-red-600 text-white')}`}>PUNCH</button>
+        <label className="flex items-center gap-1 text-[10px] font-bold text-gray-300 pl-1 shrink-0" title="Pre-roll seconds before the punch in-point">
           PRE
           <input type="number" min={0} max={30} step={1} value={preRollSec}
             onChange={(e) => setPreRoll(Number(e.target.value))}
-            className="w-9 bg-[#0d0f13] border border-[#333] rounded px-1 py-0.5 text-right text-gray-300 outline-none" />
+            className="w-9 bg-[#1a1d23] border border-[#3a3f48] rounded px-1 py-0.5 text-right text-gray-100 outline-none" />
         </label>
-        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
+        <div className="w-px h-6 bg-[#3a3f48] mx-1 shrink-0" />
         <button onClick={() => setRippleEdit(!rippleEdit)} title="Ripple edit — delete/paste close/open the gap after"
           className={`shrink-0 ${tBtn(rippleEdit, 'bg-amber-600 text-white')}`}>RIPPLE</button>
         {region && (
           <button onClick={rippleDelete} title="Cut the region out of every track and close the gap"
-            className="px-2 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:bg-red-700 hover:text-white transition-colors">✂ CUT</button>
+            className={`px-2 py-1 shrink-0 text-xs font-bold rounded transition-colors ${OFF} hover:!bg-red-700 hover:!text-white`}>✂ CUT</button>
         )}
 
         <div className="flex-1 min-w-[8px]" />
@@ -187,7 +189,7 @@ export const DawView = () => {
           className={`shrink-0 ${tBtn(loudnessOpen)}`}>LUFS</button>
         <button onClick={() => setBounceOpen(true)} title="Bounce a region (or the whole project) through the master chain to a WAV"
           className={`shrink-0 ${tBtn(bounceState === 'running')} ${bounceState === 'running' ? 'animate-pulse' : ''}`}>BOUNCE</button>
-        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
+        <div className="w-px h-6 bg-[#3a3f48] mx-1 shrink-0" />
         <button onClick={() => setSnapToGrid(!snapToGrid)} title="Snap to grid" className={`shrink-0 ${tBtn(snapToGrid)}`}>SNAP</button>
         <button
           onClick={() => setGridMode(gridMode === 'bars' ? 'time' : 'bars')}
@@ -196,16 +198,16 @@ export const DawView = () => {
         >{gridMode === 'bars' ? 'BARS' : 'TIME'}</button>
         {gridMode === 'bars' ? (
           <>
-            <label className="flex items-center gap-1 text-[10px] font-bold text-gray-500 pl-1 shrink-0" title="Tempo (BPM)">
+            <label className="flex items-center gap-1 text-[10px] font-bold text-gray-300 pl-1 shrink-0" title="Tempo (BPM)">
               ♩
               <input type="number" min={20} max={300} step={1} value={tempo}
                 onChange={(e) => setTempo(Number(e.target.value))}
-                className="w-11 bg-[#0d0f13] border border-[#333] rounded px-1 py-0.5 text-right text-gray-300 outline-none" />
+                className="w-11 bg-[#1a1d23] border border-[#3a3f48] rounded px-1 py-0.5 text-right text-gray-100 outline-none" />
             </label>
             <button
               onClick={() => setTimeSig(timeSig.num === 4 ? 3 : timeSig.num === 3 ? 6 : 4, timeSig.den)}
               title="Time signature (beats per bar)"
-              className="px-1.5 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white font-mono"
+              className={`px-1.5 py-1 shrink-0 text-xs font-bold rounded font-mono transition-colors ${OFF}`}
             >{timeSig.num}/{timeSig.den}</button>
             <button
               onClick={() => setMetronomeOn(!metronomeOn)}
@@ -215,16 +217,16 @@ export const DawView = () => {
             <button
               onClick={() => setMetroDest(metroDest === 'monitor' ? 'master' : metroDest === 'master' ? 'both' : 'monitor')}
               title="Metronome routing: monitor bus, master, or both"
-              className="px-1.5 py-1 shrink-0 text-[10px] font-bold rounded bg-[#222] text-gray-400 hover:text-white font-mono"
+              className={`px-1.5 py-1 shrink-0 text-[10px] font-bold rounded font-mono transition-colors ${OFF}`}
             >{metroDest === 'monitor' ? 'MON' : metroDest === 'master' ? 'MST' : 'M+M'}</button>
           </>
         ) : (
           <button onClick={() => setFps(fps === 30 ? 25 : 30)} title="Timecode frame rate"
-            className="px-2 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white">{fps} fps</button>
+            className={`px-2 py-1 shrink-0 text-xs font-bold rounded transition-colors ${OFF}`}>{fps} fps</button>
         )}
-        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
-        <button className="w-7 h-7 shrink-0 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom / 1.3)}>−</button>
-        <button className="w-7 h-7 shrink-0 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom * 1.3)}>+</button>
+        <div className="w-px h-6 bg-[#3a3f48] mx-1 shrink-0" />
+        <button className={`w-7 h-7 shrink-0 flex items-center justify-center rounded transition-colors ${OFF}`} onClick={() => setZoom(zoom / 1.3)}>−</button>
+        <button className={`w-7 h-7 shrink-0 flex items-center justify-center rounded transition-colors ${OFF}`} onClick={() => setZoom(zoom * 1.3)}>+</button>
       </div>
     </div>
   );
