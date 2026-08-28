@@ -193,6 +193,16 @@ as DOM-per-clip. In short:
 
 ---
 
+## Known issues (unresolved)
+
+- **Record startup distortion** — the first ~2 s of every multitrack take
+  (`MultitrackRecorder`) is distorted/noisy. A recorder-side 2 s head-discard
+  workaround was tried and reverted (commit a6c2cb7) — it did *not* clear the
+  distortion, so the bad audio is coming from the tap itself, not just a
+  transient in the written file. Investigate the pre-insert JACK input buffers
+  right after `start_multitrack_record`, WavpackWriter/DiskWriter ring priming,
+  and whether the single-file master recorder shows the same head glitch.
+
 ## Phase 3 — Broadcast / live features (the reason this box exists)
 
 ### 3a. Virtual soundcheck  ★ headline feature — DONE 2026-08-28
