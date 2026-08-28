@@ -66,9 +66,12 @@ Three processes talk over local sockets:
 
 ### Mixing console (Mixer view)
 
-![Mixer panel walkthrough: channel strips, insert FX racks, analog plug-in editors, aux sends, the mastering suite and scenes](docs/media/mixer-showcase.gif)
+<video src="https://github.com/caseypaite/AES67-deck/raw/master/docs/media/mixer-showcase.mp4" controls muted loop playsinline width="900"></video>
 
-<sub>Scripted headless capture — regenerate with `npm run showcase` in [`test/browser/`](test/browser/).</sub>
+<sub>Mixer walkthrough — channel strips, insert FX racks, the LED-ring analog
+knob, plug-in editors, aux sends, the mastering suite and scenes. Scripted
+1280×720 headless capture ([`docs/media/mixer-showcase.mp4`](docs/media/mixer-showcase.mp4));
+regenerate with `npm run showcase` in [`test/browser/`](test/browser/).</sub>
 
 - 32 input channels in banks of 16, plus the 8 aux buses, Monitor and Master
   as fixed right-hand groups.

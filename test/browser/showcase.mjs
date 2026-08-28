@@ -1,11 +1,10 @@
 import puppeteer from 'puppeteer';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import jpeg from 'jpeg-js';
-import gifencMod from 'gifenc';
-
-const { GIFEncoder, quantize, applyPalette } = gifencMod;
+import ffmpegPath from 'ffmpeg-static';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORK = process.env.WORK_DIR || path.join(HERE, '.work');
@@ -133,7 +132,7 @@ try {
   await selectStrip('CH1');
   await sleep(500);
 
-  await client.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: VW, maxHeight: VH, everyNthFrame: 2 });
+  await client.send('Page.startScreencast', { format: 'jpeg', quality: 80, maxWidth: VW, maxHeight: VH, everyNthFrame: 1 });
   castOn = true;
   await sleep(1000);
 
@@ -261,56 +260,45 @@ try {
 
 fs.writeFileSync(path.join(OUT, 'shots.json'), JSON.stringify(shots, null, 2));
 
-// ---- encode the GIF ----------------------------------------------------
-let gifOk = false;
+// ---- encode the 720p screen capture (H.264 MP4 via ffmpeg-static) -----
+let reelOk = false;
 if (frames.length > 4) {
   try {
-    const FPS = 4, MAXW = 600, MAX_FRAMES = 96;
+    const FPS = 15;
     const t0 = frames[0].ts;
-    let picked = [];
-    let nextT = 0;
-    for (const f of frames) if (f.ts - t0 >= nextT) { picked.push(f); nextT += 1000 / FPS; }
-    if (picked.length > MAX_FRAMES) {
-      const step = picked.length / MAX_FRAMES;
-      picked = Array.from({ length: MAX_FRAMES }, (_, i) => picked[Math.floor(i * step)]);
+    const endT = frames[frames.length - 1].ts - t0;
+    // Resample to a constant frame rate while keeping the tour's real pacing.
+    const picked = [];
+    let idx = 0;
+    for (let t = 0; t <= endT; t += 1000 / FPS) {
+      while (idx + 1 < frames.length && frames[idx + 1].ts - t0 <= t) idx += 1;
+      picked.push(frames[idx]);
     }
-    log(`gif: ${frames.length} raw → ${picked.length} frames @ ~${FPS}fps`);
+    log(`reel: ${frames.length} raw → ${picked.length} frames @ ${FPS}fps`);
 
-    const enc = GIFEncoder();
-    let W = 0, H = 0;
-    for (let i = 0; i < picked.length; i++) {
-      const { width, height, data } = jpeg.decode(picked[i].data, { useTArray: true, formatAsRGBA: true });
-      const scale = Math.min(1, MAXW / width);
-      const w = Math.round(width * scale), h = Math.round(height * scale);
-      W = w; H = h;
-      const out = new Uint8Array(w * h * 4);
-      for (let y = 0; y < h; y++) {
-        const sy = Math.min(height - 1, (y / scale) | 0);
-        for (let x = 0; x < w; x++) {
-          const sx = Math.min(width - 1, (x / scale) | 0);
-          const si = (sy * width + sx) * 4, di = (y * w + x) * 4;
-          out[di] = data[si]; out[di + 1] = data[si + 1]; out[di + 2] = data[si + 2]; out[di + 3] = 255;
-        }
-      }
-      const palette = quantize(out, 128, { format: 'rgb565' });
-      const index = applyPalette(out, palette, 'rgb565');
-      const delay = i + 1 < picked.length ? Math.max(80, Math.min(500, picked[i + 1].ts - picked[i].ts)) : 900;
-      enc.writeFrame(index, w, h, { palette, delay });
-    }
-    enc.finish();
-    fs.writeFileSync(path.join(OUT, 'mixer-showcase.gif'), Buffer.from(enc.bytes()));
-    const kb = (fs.statSync(path.join(OUT, 'mixer-showcase.gif')).size / 1024) | 0;
-    gifOk = true;
-    log(`gif: mixer-showcase.gif ${W}x${H} ${kb} KB`);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'showcase-'));
+    picked.forEach((f, i) => fs.writeFileSync(path.join(tmp, `f${String(i).padStart(5, '0')}.jpg`), f.data));
+    const mp4 = path.join(OUT, 'mixer-showcase.mp4');
+    execFileSync(ffmpegPath, [
+      '-y', '-framerate', String(FPS),
+      '-i', path.join(tmp, 'f%05d.jpg'),
+      '-vf', 'scale=1280:720:flags=lanczos',
+      '-c:v', 'libx264', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+      '-crf', '20', '-preset', 'slow', '-movflags', '+faststart',
+      mp4,
+    ], { stdio: 'ignore' });
+    fs.rmSync(tmp, { recursive: true, force: true });
+
+    const mb = (fs.statSync(mp4).size / 1e6).toFixed(1);
+    reelOk = true;
+    log(`reel: mixer-showcase.mp4 1280x720 @ ${FPS}fps ${mb} MB`);
     // Refresh the committed copy the README embeds.
-    try {
-      const committed = path.join(HERE, '..', '..', 'docs', 'media', 'mixer-showcase.gif');
-      fs.mkdirSync(path.dirname(committed), { recursive: true });
-      fs.copyFileSync(path.join(OUT, 'mixer-showcase.gif'), committed);
-      log(`gif: copied to docs/media/mixer-showcase.gif`);
-    } catch (e) { log(`gif: could not update docs/media (${e.message})`); }
+    const committed = path.join(HERE, '..', '..', 'docs', 'media', 'mixer-showcase.mp4');
+    fs.mkdirSync(path.dirname(committed), { recursive: true });
+    fs.copyFileSync(mp4, committed);
+    log('reel: copied to docs/media/mixer-showcase.mp4');
   } catch (e) {
-    log(`gif failed: ${e.message}`);
+    log(`reel failed: ${e.message}`);
   }
 }
 
@@ -324,10 +312,10 @@ try {
         <img loading="lazy" alt="${esc(s.caption)}" src="data:image/jpeg;base64,${b64(s.jpg)}">
         <figcaption>${esc(s.caption)}</figcaption>
       </figure>`).join('\n');
-  const gifBlock = gifOk ? `
+  const reelBlock = reelOk ? `
     <figure class="reel">
-      <div class="reel__frame"><img alt="Full scripted walkthrough of the mixer panel" src="data:image/gif;base64,${b64('mixer-showcase.gif')}"></div>
-      <figcaption><span class="rec"></span> The full run — every step below, in sequence</figcaption>
+      <div class="reel__frame"><video src="data:video/mp4;base64,${b64('mixer-showcase.mp4')}" autoplay muted loop playsinline controls></video></div>
+      <figcaption><span class="rec"></span> The full run — every step below, in sequence · 1280 &times; 720</figcaption>
     </figure>` : '';
 
   const html = `<title>The Console, Strip by Strip</title>
@@ -389,8 +377,8 @@ try {
     background:var(--frame);border:1px solid var(--rule);border-radius:6px;
     padding:10px;box-shadow:var(--shadow);
   }
-  .reel img,.step img{width:100%;display:block;border-radius:3px}
-  .reel img{border:1px solid rgba(255,255,255,.06)}
+  .reel video,.reel img,.step img{width:100%;display:block;border-radius:3px}
+  .reel video{border:1px solid rgba(255,255,255,.06);background:#000}
   figcaption{margin-top:14px;color:var(--dim);font-size:14.5px;max-width:64ch}
   .rec{
     display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--hot);
@@ -426,12 +414,12 @@ try {
     <li>${shots.length} steps</li>
     <li>headless capture</li>
     <li>live React UI</li>
-    <li>1920 &times; 1080</li>
+    <li>720p &middot; mp4 + stills</li>
   </ul>
 </div></header>
 
 <main class="wrap">
-  ${gifBlock}
+  ${reelBlock}
   <div class="steps">
 ${steps}
   </div>
@@ -445,4 +433,4 @@ ${steps}
   log(`page build failed: ${e.message}`);
 }
 
-console.log(`\n${shots.length} screenshots${gifOk ? ' + GIF' : ''} + page → ${OUT}`);
+console.log(`\n${shots.length} screenshots${reelOk ? ' + 720p mp4' : ''} + page → ${OUT}`);

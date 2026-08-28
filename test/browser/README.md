@@ -47,7 +47,7 @@ The one production hook this needs: the server honours
 
 ## Mixer showcase
 
-`npm run showcase` drives the **MIXER** view through a scripted 12-step tour
+`npm run showcase` drives the **MIXER** view through a scripted 13-step tour
 and captures the result. Same isolated-stack pattern, but with
 `showcase-engine.mjs` — a fake engine that animates every channel/bus meter,
 the master analyser (spectrum / goniometer / correlation), BS.1770 loudness,
@@ -58,14 +58,15 @@ Output in `.work/showcase/`:
 | file | what |
 |------|------|
 | `NN-*.png` / `.jpg` | one screenshot per step (PNG full quality, JPG for embedding) |
-| `mixer-showcase.gif` | the whole run, ~4 fps, 560px (pure-JS encode via `gifenc` + `jpeg-js`) |
-| `index.html` | self-contained captioned showcase page (data-URI images) |
+| `mixer-showcase.mp4` | the whole run, 1280×720 H.264 @ 15 fps (`ffmpeg-static`, no system install) |
+| `index.html` | self-contained captioned showcase page (data-URI stills + `<video>`) |
 | `shots.json` | step manifest |
 
-The GIF is also copied to `docs/media/mixer-showcase.gif` (committed — the main
+The MP4 is also copied to `docs/media/mixer-showcase.mp4` (committed — the main
 README embeds it); re-running `npm run showcase` refreshes it.
 
 The tour: console overview → tape-label rename + faders → S/M/REC/ø states →
 select a strip (FX rack + aux sends) → insert Calf Compressor + 8-Band EQ →
-the analog EQ and compressor editors → the built-in FX chain library →
-Master mastering suite → apply a Streaming −14 chain → input bank 2 → scene save.
+the analog EQ and compressor editors → knob close-up (LED ring sweep) → the
+built-in FX chain library → Master mastering suite → apply a Streaming −14
+chain → input bank 2 → scene save.
