@@ -22,6 +22,9 @@ export interface DawClip {
   fadeIn?: number;       // seconds — fade-in ramp at the clip head
   fadeOut?: number;      // seconds — fade-out ramp at the clip tail
   recording?: boolean;   // transient placeholder growing during a live take
+  // Phase 4 take comping. 0 / undefined = the comp lane (this is what plays and
+  // persists to the engine); >= 1 = alternate take lanes stacked below, parked.
+  lane?: number;
 }
 
 export interface DawMarker {
@@ -55,6 +58,7 @@ interface DawState {
   clips: Record<string, DawClip>;
   markers: Record<string, DawMarker>;
   trackHeights: Record<number, number>;
+  laneExpand: Record<number, boolean>;   // trackId -> take lanes shown (view state)
 
   playheadPosition: number;       // seconds — interpolated from the engine clock
   recordStartTime: number | null; // legacy field, unused by the engine-driven flow
@@ -100,6 +104,7 @@ interface DawState {
   // Transient interaction state (not persisted, not serialised to the project).
   dragOverTrackId: number | null;         // lane highlighted as a vertical-move target
   marquee: { x0: number; y0: number; x1: number; y1: number } | null;
+  compPreview: { trackId: number; lane: number; fromSec: number; toSec: number } | null;
 
   // Live recording: placeholder clips that grow with the transport, plus the
   // coarse min/max envelope streamed on the metering frame. Cleared on commit.
@@ -183,10 +188,17 @@ interface DawState {
   setClipGain: (id: string, gain: number) => void;
   setDragOverTrack: (trackId: number | null) => void;
   setMarquee: (m: { x0: number; y0: number; x1: number; y1: number } | null) => void;
+  setCompPreview: (p: { trackId: number; lane: number; fromSec: number; toSec: number } | null) => void;
   copySelected: () => void;
   pasteClipboard: () => void;
 
   setTrackHeight: (trackId: number, height: number) => void;
+
+  // Phase 4 — take comping.
+  laneCountFor: (trackId: number) => number;       // highest take-lane index in use (0 = none)
+  toggleLaneExpand: (trackId: number) => void;
+  moveClipToLane: (clipId: string, lane: number) => void;
+  compPick: (trackId: number, fromSec: number, toSec: number, lane: number) => void;
 
   // Server sync
   loadProjectData: (name: string, project: unknown) => void;
@@ -313,6 +325,7 @@ export const useDawStore = create<DawState>()(
       clips: {},
       markers: {},
       trackHeights: {},
+      laneExpand: {},
 
       playheadPosition: 0,
       recordStartTime: null,
@@ -347,6 +360,7 @@ export const useDawStore = create<DawState>()(
 
       dragOverTrackId: null,
       marquee: null,
+      compPreview: null,
       recordingClips: {},
       livePeaks: {},
 
@@ -717,6 +731,7 @@ export const useDawStore = create<DawState>()(
 
       setDragOverTrack: (trackId) => set((s) => (s.dragOverTrackId === trackId ? s : { dragOverTrackId: trackId })),
       setMarquee: (m) => set({ marquee: m }),
+      setCompPreview: (p) => set({ compPreview: p }),
 
       copySelected: () =>
         set((state) => ({
@@ -749,6 +764,88 @@ export const useDawStore = create<DawState>()(
         scheduleSave();
       },
 
+      // --- Phase 4: take comping ---
+      laneCountFor: (trackId) => {
+        let m = 0;
+        for (const c of Object.values(get().clips))
+          if (c.trackId === trackId && !c.recording && (c.lane || 0) > m) m = c.lane || 0;
+        return m;
+      },
+
+      toggleLaneExpand: (trackId) =>
+        set((s) => ({ laneExpand: { ...s.laneExpand, [trackId]: !s.laneExpand[trackId] } })),
+
+      moveClipToLane: (clipId, lane) => {
+        pushHistory();
+        set((state) => {
+          const c = state.clips[clipId];
+          if (!c) return state;
+          const L = Math.max(0, Math.round(lane));
+          if ((c.lane || 0) === L) return state;
+          return { clips: { ...state.clips, [clipId]: { ...c, lane: L || undefined } } };
+        });
+        scheduleSave();
+      },
+
+      // Swipe-to-comp: make `lane`'s take audio the active take over [fromSec,
+      // toSec] on `trackId` — clear the comp lane there and splice in trimmed
+      // copies of the source-lane clips. The comp lane stays a flat, playable
+      // clip row.
+      compPick: (trackId, fromSec, toSec, lane) => {
+        const a = Math.max(0, Math.min(fromSec, toSec));
+        const b = Math.max(fromSec, toSec);
+        if (b - a < 0.02 || !lane) return;
+        pushHistory();
+        set((state) => {
+          const SEAM = 0.008; // click-guard fade at the seams
+          const next: Record<string, DawClip> = { ...state.clips };
+          const onTrack = Object.values(state.clips).filter((c) => c.trackId === trackId && !c.recording);
+
+          // 1. carve [a,b] out of the comp lane
+          for (const c of onTrack) {
+            if ((c.lane || 0) !== 0) continue;
+            const cs = c.start, ce = c.start + c.length;
+            if (ce <= a || cs >= b) continue;             // untouched
+            delete next[c.id];
+            if (cs < a) {                                  // keep the left offcut
+              const id = uuid();
+              next[id] = {
+                ...c, id, length: a - cs,
+                fadeOut: Math.min(c.fadeOut || SEAM, a - cs, SEAM * 4),
+              };
+            }
+            if (ce > b) {                                  // keep the right offcut
+              const id = uuid();
+              next[id] = {
+                ...c, id, start: b, length: ce - b,
+                sourceOffset: (c.sourceOffset || 0) + (b - cs),
+                fadeIn: Math.min(c.fadeIn || SEAM, ce - b, SEAM * 4),
+              };
+            }
+          }
+
+          // 2. splice the source lane's audio into [a,b] on the comp lane
+          const picked: string[] = [];
+          for (const c of onTrack) {
+            if ((c.lane || 0) !== lane) continue;
+            const cs = c.start, ce = c.start + c.length;
+            const s = Math.max(a, cs), e = Math.min(b, ce);
+            if (e - s < 0.005) continue;
+            const id = uuid();
+            next[id] = {
+              ...c, id, lane: undefined,
+              start: s, length: e - s,
+              sourceOffset: (c.sourceOffset || 0) + (s - cs),
+              fadeIn: s > cs ? SEAM : (c.fadeIn || 0),
+              fadeOut: e < ce ? SEAM : (c.fadeOut || 0),
+            };
+            picked.push(id);
+          }
+          return { clips: next, selectedClipIds: picked };
+        });
+        scheduleSave();
+      },
+
       loadProjectData: (name, project) => {
         const p = (project || {}) as {
           clips?: unknown; markers?: unknown; trackHeights?: unknown;
@@ -767,6 +864,7 @@ export const useDawStore = create<DawState>()(
               ? (p.trackHeights as Record<number, number>)
               : {},
           selectedClipIds: [],
+          laneExpand: {},
           region,
           loopEnabled: !!(lp && lp.loop) && !!region,
           punchEnabled: !!(lp && lp.punch) && !!region,
@@ -787,8 +885,24 @@ export const useDawStore = create<DawState>()(
         pushHistory(true); // a finished recording is one undoable step
         set((state) => {
           const next = { ...state.clips };
-          for (const c of clips) if (c && c.id) next[c.id] = c;
-          return { clips: next, lastOverrun: overrun };
+          // A new take that lands on top of existing audio on its track stacks
+          // onto a fresh take lane rather than overlapping it (Phase 4 comping).
+          const laneExpand = { ...state.laneExpand };
+          for (const c of clips) {
+            if (!c || !c.id) continue;
+            let lane = c.lane || 0;
+            const cs = c.start, ce = c.start + (c.length || 0);
+            let maxLane = 0;
+            let clash = false;
+            for (const ex of Object.values(next)) {
+              if (ex.trackId !== c.trackId || ex.recording) continue;
+              if ((ex.lane || 0) > maxLane) maxLane = ex.lane || 0;
+              if (ce > ex.start && cs < ex.start + ex.length) clash = true;
+            }
+            if (clash && lane === 0) { lane = maxLane + 1; laneExpand[c.trackId] = true; }
+            next[c.id] = lane ? { ...c, lane } : c;
+          }
+          return { clips: next, laneExpand, lastOverrun: overrun };
         });
         scheduleSave();
       },
@@ -816,6 +930,7 @@ export const useDawStore = create<DawState>()(
         clips: Object.fromEntries(Object.entries(s.clips).filter(([, c]) => !c.recording)),
         markers: s.markers,
         trackHeights: s.trackHeights,
+        laneExpand: s.laneExpand,
         zoom: s.zoom,
         snapToGrid: s.snapToGrid,
         gridSize: s.gridSize,

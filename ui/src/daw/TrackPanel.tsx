@@ -1,6 +1,6 @@
 import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore, type Channel } from '../stores/useMixerStore';
-import { RULER_H, DEFAULT_TRACK_H } from './SurfaceModel';
+import { RULER_H, DEFAULT_TRACK_H, LANE_H } from './SurfaceModel';
 
 // Left column of track headers. Height-adaptive: a tall track shows the full
 // control set, a short one collapses to name + arm. Scrolls in lockstep with
@@ -14,8 +14,18 @@ export function TrackPanel({ width }: { width: number }) {
   const scrollY = useDawStore((s) => s.scrollY);
   const heights = useDawStore((s) => s.trackHeights);
   const setTrackHeight = useDawStore((s) => s.setTrackHeight);
+  const clips = useDawStore((s) => s.clips);
+  const laneExpand = useDawStore((s) => s.laneExpand);
+  const toggleLaneExpand = useDawStore((s) => s.toggleLaneExpand);
 
   const tracks = Object.values(channels).filter((c: Channel) => c.type === 'input').sort((a, b) => a.id - b.id);
+
+  const laneCounts: Record<number, number> = {};
+  for (const c of Object.values(clips)) {
+    if (c.recording) continue;
+    const L = c.lane || 0;
+    if (L > (laneCounts[c.trackId] || 0)) laneCounts[c.trackId] = L;
+  }
 
   return (
     <div className="shrink-0 bg-[#14161a] border-r border-black/60 relative overflow-hidden" style={{ width }}>
@@ -24,8 +34,11 @@ export function TrackPanel({ width }: { width: number }) {
           TRACKS
         </div>
         {tracks.map((t) => {
-          const h = heights[t.id] || DEFAULT_TRACK_H;
-          const compact = h < 74;
+          const compH = heights[t.id] || DEFAULT_TRACK_H;
+          const lanes = laneCounts[t.id] || 0;
+          const expanded = !!laneExpand[t.id] && lanes > 0;
+          const h = compH + (expanded ? LANE_H * lanes : 0);
+          const compact = compH < 74;
           return (
             <div
               key={t.id}
@@ -33,11 +46,23 @@ export function TrackPanel({ width }: { width: number }) {
               style={{ height: h }}
             >
               <div className="flex items-center justify-between pt-1.5">
+                {lanes > 0 && (
+                  <button
+                    onClick={() => toggleLaneExpand(t.id)}
+                    title={expanded ? 'Hide take lanes' : `Show ${lanes} take lane${lanes > 1 ? 's' : ''}`}
+                    className="mr-1 w-4 h-4 shrink-0 flex items-center justify-center text-[9px] text-gray-400 bg-[#2a2c33] hover:bg-[#333] rounded"
+                  >
+                    {expanded ? '▾' : '▸'}
+                  </button>
+                )}
                 <input
                   value={t.name}
                   onChange={(e) => renameChannel(t.id, e.target.value)}
                   className="bg-transparent text-gray-200 text-xs font-semibold w-full mr-1 outline-none focus:bg-black/30 rounded px-1"
                 />
+                {lanes > 0 && (
+                  <span className="text-[8px] text-gray-500 bg-black/40 px-1 rounded shrink-0 mr-1" title="take lanes">⧉{lanes}</span>
+                )}
                 <span className="text-[9px] text-gray-600 bg-black/40 px-1 rounded shrink-0">{t.id}</span>
               </div>
               <div className="flex gap-1 mt-1">
@@ -73,11 +98,21 @@ export function TrackPanel({ width }: { width: number }) {
                   <div className="h-px bg-green-500" style={{ width: `${Math.max(0, (t.meterR + 60) / 60 * 100)}%` }} />
                 </div>
               )}
+              {expanded && Array.from({ length: lanes }, (_, k) => (
+                <div
+                  key={k}
+                  className="absolute left-0 right-0 border-t border-white/[0.07] text-[8px] text-gray-600 pl-1"
+                  style={{ top: compH + LANE_H * k, height: LANE_H }}
+                >
+                  take {k + 1}
+                </div>
+              ))}
               <div
-                className="absolute bottom-0 left-0 right-0 h-1.5 cursor-ns-resize hover:bg-white/10"
+                className="absolute left-0 right-0 h-1.5 cursor-ns-resize hover:bg-white/10"
+                style={{ top: compH - 6 }}
                 onMouseDown={(e) => {
                   const y0 = e.clientY;
-                  const h0 = h;
+                  const h0 = compH;
                   const mv = (ev: MouseEvent) => setTrackHeight(t.id, h0 + (ev.clientY - y0));
                   const up = () => { window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up); };
                   window.addEventListener('mousemove', mv);

@@ -317,8 +317,20 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
   overlap). Server unchanged — overlap is pure geometry. `SurfaceModel`
   `drawCrossfade` paints the X. Containment (one clip fully inside another) is
   not a supported crossfade shape. **Not yet run end-to-end.**
-- **Take comping** — stacked lanes per track, swipe-to-select the active take,
-  promote to a comp clip.
+- **Take comping — first cut DONE 2026-08-28.** `DawClip.lane` (0/undefined =
+  the comp lane that plays + persists to the engine; ≥1 = alternates stacked
+  below). A new take that lands on existing audio auto-stacks onto a fresh lane
+  (`addCommittedClips`). Track expands to show take lanes (`laneExpand`,
+  chevron + `⧉N` badge in `TrackPanel`, lane bands in `SurfaceModel` with
+  matched panel/canvas heights). Swipe horizontally across a take lane →
+  `compPick` splices that take's audio into the comp lane over the swiped span
+  (splitting the comp clips around it, short seam fades), with a live green
+  preview (`compPreview`). Context menu: promote lane / move to comp / send to
+  new take lane. Server sends comp-lane-only to the engine + `.rpp`.
+  Verified end-to-end in a headless browser (`scratchpad/comp-test.mjs`).
+  **Still to do**: per-segment comp visualisation on the lanes, drag a take
+  clip between lanes, comp crossfade length control, loop-record stacking each
+  pass onto its own lane (currently only `addCommittedClips` auto-stacks).
 - **Bounce / export** — render a timeline region through the master chain to a
   file. Realtime (route master to a `DiskWriter`, run transport over the region)
   first; offline/faster-than-realtime later. Stem export = the per-track taps.

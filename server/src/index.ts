@@ -113,6 +113,7 @@ function timelineToRpp(
   const byTrack = new Map<number, any[]>();
   for (const c of clips) {
     if (!c || !c.file) continue;
+    if (c.lane) continue;               // comp-lane only in the .rpp bundle
     const t = Number(c.trackId) || 1;
     if (!byTrack.has(t)) byTrack.set(t, []);
     byTrack.get(t)!.push(c);
@@ -1778,6 +1779,7 @@ function pushTimelineToEngine(name: string, project?: DawProject, extraClips: an
   const specs: any[] = [];
   for (const c of allClips) {
     if (!c || !c.file) continue;
+    if (c.lane) continue;                 // take-comping alternates don't play
     if (!isRec && !c.takeDir) continue;
     const sr = Number(c.sampleRate) > 0 ? Number(c.sampleRate) : 48000;
     const start = Number(c.start) || 0;
