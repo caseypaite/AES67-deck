@@ -939,6 +939,60 @@ function buildLoudnessReport(startSec: number, endSec: number, name: unknown, ta
   };
 }
 
+// --- Phase 3e: server-timed auto-punch + loop-record split --------------
+// The engine echoes the punch/loop region on every metering `transport` frame
+// (`punchOn/In/Out`, `loopOn/In/Out`). The server does the drop-in / drop-out
+// and the per-pass split here: opening take files has to be off the audio
+// thread, and metering-rate timing (~±25 ms) is fine for broadcast with
+// pre-roll. Reuses startTake / stopTake / the VSC split machinery.
+let lastPunchFrame = 0;
+let punchDoneThisRoll = false;
+
+function maybePunch(t: any): void {
+  if (!t || typeof t.frame !== 'number') return;
+  const frame = t.frame as number;
+  const prev = lastPunchFrame;
+  lastPunchFrame = frame;
+  const rolling = t.state === 1 || t.state === 2;
+  if (!rolling) { punchDoneThisRoll = false; return; }
+
+  const punchIn = Number(t.punchIn) || 0;
+  const punchOut = Number(t.punchOut) || 0;
+  const sr = Number(t.sr) || 48000;
+
+  // Rewound to before the region ⇒ re-arm the drop-in for this pass.
+  if (frame < punchIn) punchDoneThisRoll = false;
+
+  // Loop-record: the frame wrapped backwards while a take is still open
+  // (recording the whole loop region, no punch) ⇒ close + reopen contiguously,
+  // one take per pass. handleTakeFinished's reopenForSplit does the rest.
+  if (activeTakeDir && !pendingSplitArmed && t.loopOn && Number(t.loopOut) > Number(t.loopIn)
+      && frame < prev - sr * 0.05) {
+    pendingSplitArmed = lastArmed.length ? lastArmed : armedChannels();
+    stopTake();
+    return;
+  }
+
+  if (!t.punchOn || punchOut <= punchIn) return;
+
+  // Drop-in: inside the punch window, armed, nothing recording, not yet done.
+  if (!activeTakeDir && !pendingSplitArmed && !punchDoneThisRoll
+      && frame >= punchIn && frame < punchOut) {
+    const armed = armedChannels();
+    if (armed.length > 0) {
+      const err = startTake(armed);
+      if (!err) punchDoneThisRoll = true;
+      broadcastToClients(JSON.stringify(err
+        ? { type: 'vsc_status', autoRecordError: err }
+        : { type: 'vsc_status', punchIn: true, armed }));
+    }
+  // Drop-out: crossed the out-point with a take open.
+  } else if (activeTakeDir && !pendingSplitArmed && frame >= punchOut) {
+    stopTake();
+    broadcastToClients(JSON.stringify({ type: 'vsc_status', punchOut: true }));
+  }
+}
+
 // Set up WebSocket server
 const wss = new WebSocketServer({ port: WSS_PORT });
 console.log(`WebSocket Server listening on ws://localhost:${WSS_PORT}`);
@@ -1023,6 +1077,8 @@ wss.on('connection', (ws) => {
         // to other clients (start/stop_multitrack_record are handled
         // explicitly below because the server injects the take directory).
         'transport_play', 'transport_stop', 'transport_locate', 'transport_set_loop',
+        // Phase 3e punch region — engine stores + echoes it; server auto-punches.
+        'transport_set_punch',
         // Virtual soundcheck: per-channel live/timeline monitor override mask
         // (engine reads it every block); plain forward + fan-out.
         'set_monitor_input_mask'
@@ -1710,9 +1766,9 @@ const ipcServer = net.createServer((socket) => {
           if (parsed.type === 'plugin_list' && Array.isArray(parsed.plugins)) {
             lastPluginCatalog = parsed.plugins;
           } else if (parsed.type === 'metering') {
-            // Phase 3c: 1 Hz loudness CSV + history ring. `handled` stays false
-            // so the frame still forwards to every UI unchanged.
-            maybeLogLoudness(parsed);
+            // `handled` stays false so the frame still forwards to every UI.
+            maybeLogLoudness(parsed);          // Phase 3c: 1 Hz loudness CSV + ring
+            maybePunch(parsed.transport);      // Phase 3e: auto drop-in/out + loop-record split
           } else if (parsed.type === 'take_started') {
             handled = handleTakeStarted(parsed);
           } else if (parsed.type === 'take_finished') {

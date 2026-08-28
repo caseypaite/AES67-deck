@@ -173,6 +173,89 @@ try {
   await page.screenshot({ path: path.join(SHOTS, 'loudness-strip.png') });
   await page.screenshot({ path: path.join(SHOTS, 'timeline-full.png') });
 
+  // --- Phase 3e: region / loop / punch --------------------------------
+  // Park the playhead at 0 (scrub the far-left of the ruler) so REGION spans
+  // a known [0, gridSize*8] window.
+  const surf = await page.evaluate(() => {
+    const c = document.querySelector('canvas');
+    const r = c.getBoundingClientRect();
+    return { x: r.x, y: r.y };
+  });
+  await page.mouse.click(surf.x + 3, surf.y + 8);
+  await sleep(200);
+  await clickByText('REGION');
+  await sleep(250);
+  const loopReady = await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'LOOP');
+    return b ? !b.disabled : null;
+  });
+  check('REGION creates a region and enables LOOP', loopReady === true, String(loopReady));
+
+  await clickByText('LOOP');
+  await sleep(200);
+  await clickTransport(1);           // roll well past the ~8 s region
+  await sleep(11000);
+  const tcWhileLooping = await page.evaluate(() =>
+    [...document.querySelectorAll('.text-green-500.tracking-widest')][0]?.textContent || '');
+  await clickTransport(0);
+  const secs = Number((tcWhileLooping.match(/00:00:(\d\d):/) || [])[1]);
+  check('LOOP wraps the transport inside the region', Number.isFinite(secs) && secs < 8, tcWhileLooping);
+
+  await clickByText('PUNCH');
+  await sleep(200);
+  const punchOn = await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'PUNCH');
+    return b ? b.className.includes('bg-red-600') : null;
+  });
+  check('PUNCH toggles on', punchOn === true, String(punchOn));
+  await page.screenshot({ path: path.join(SHOTS, 'region-loop-punch.png') });
+
+  // --- Phase 3e: server-timed auto-punch ----------------------------
+  await clickByText('LOOP');  // disable loop so the take isn't split each pass
+  await sleep(150);
+  await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button')].filter((x) => x.textContent.trim() === 'A' && x.className.includes('w-5'));
+    b[0]?.click();            // arm track 1
+  });
+  await sleep(300);
+  const recBtnClass = () => page.evaluate(() => {
+    const cluster = [...document.querySelectorAll('div')].find(
+      (d) => d.querySelector('.text-green-500.tracking-widest') && d.querySelectorAll(':scope > button').length === 3);
+    return cluster?.querySelectorAll(':scope > button')[2]?.className || '';
+  });
+  await page.mouse.click(surf.x + 3, surf.y + 8);   // playhead → 0
+  await sleep(150);
+  await clickTransport(1);
+  await sleep(3000);
+  const recInside = (await recBtnClass()).includes('bg-red-600');
+  await sleep(7000);                                 // past the 8 s out-point
+  const recAfter = (await recBtnClass()).includes('bg-red-600');
+  await clickTransport(0);
+  check('auto-punch drops IN over the region', recInside, String(recInside));
+  check('auto-punch drops OUT after the region', !recAfter, String(recAfter));
+
+  // --- Phase 4: undo / redo ------------------------------------------
+  await page.evaluate(() => document.querySelector('div[tabindex="0"]')?.focus());
+  const cueCount = () => page.evaluate(() => {
+    const p = [...document.querySelectorAll('div')].find((d) => d.textContent.startsWith('CUE LIST'));
+    return p ? p.querySelectorAll('input').length : -1;
+  });
+  const n0 = await cueCount();
+  await page.keyboard.press('KeyM'); await sleep(450);   // spaced so each is its own history step
+  await page.keyboard.press('KeyM'); await sleep(450);
+  const nAdd = await cueCount();
+  await page.keyboard.down('Control'); await page.keyboard.press('KeyZ'); await page.keyboard.up('Control');
+  await sleep(250);
+  const nUndo = await cueCount();
+  await page.keyboard.down('Control'); await page.keyboard.down('Shift');
+  await page.keyboard.press('KeyZ');
+  await page.keyboard.up('Shift'); await page.keyboard.up('Control');
+  await sleep(250);
+  const nRedo = await cueCount();
+  check('two markers added', nAdd === n0 + 2, `${n0} -> ${nAdd}`);
+  check('Ctrl+Z undoes the last marker', nUndo === nAdd - 1, `${nAdd} -> ${nUndo}`);
+  check('Ctrl+Shift+Z redoes it', nRedo === nAdd, `${nUndo} -> ${nRedo}`);
+
   console.log('\n--- cue CSV ---\n' + csvText);
   console.log('--- report head ---\n' + repText.split('\n').slice(0, 12).join('\n'));
 } finally {

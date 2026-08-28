@@ -549,6 +549,20 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     const send = (m: unknown) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); };
     const cur = s.transportState;
 
+    // Phase 3e — pre-roll: when arming a punch, roll from N seconds before the
+    // in-point so the operator hears the lead-in. The server auto-punches the
+    // take exactly at the in-point, so the pre-roll audio isn't recorded.
+    const preRollLocate = () => {
+      const daw = useDawStore.getState();
+      if ((action === 'play' && cur !== 'playing') || action === 'record') {
+        if (daw.punchEnabled && daw.region && daw.preRollSec > 0) {
+          const sr = daw.sampleRate > 0 ? daw.sampleRate : 48000;
+          send({ type: 'transport_locate', frame: Math.max(0, Math.round((daw.region.inSec - daw.preRollSec) * sr)) });
+        }
+      }
+    };
+    preRollLocate();
+
     // The engine owns the transport clock and reports the authoritative state
     // back on every metering frame (see the `metering` handler). We set an
     // optimistic transportState here so the buttons feel instant; the engine
@@ -571,8 +585,15 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           console.warn('record: no armed tracks — arm a track in the Timeline first');
           return;
         }
-        send({ type: 'start_multitrack_record', armed });
-        set({ transportState: 'recording' });
+        // Phase 3e — with punch armed, just roll: the server drops the take in
+        // at the in-point and out at the out-point (and re-drops each loop pass).
+        if (useDawStore.getState().punchEnabled && useDawStore.getState().region) {
+          send({ type: 'transport_play' });
+          set({ transportState: 'playing' });
+        } else {
+          send({ type: 'start_multitrack_record', armed });
+          set({ transportState: 'recording' });
+        }
       }
     }
   },
@@ -941,6 +962,11 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             const want = get().monitorInputMask;
             if (want !== 0 && typeof t.monInMask === 'number' && (t.monInMask >>> 0) !== want) {
               get().ws?.send(JSON.stringify({ type: 'set_monitor_input_mask', mask: want }));
+            }
+            // Phase 3e: same self-heal for the loop/punch region (not part of
+            // the server's timeline replay on engine reconnect).
+            if (typeof t.loopOn === 'number' && typeof t.punchOn === 'number') {
+              useDawStore.getState().reassertRegionToEngine(!!t.loopOn, !!t.punchOn);
             }
           }
         } else if (data.type === 'aes67_discovery') {
