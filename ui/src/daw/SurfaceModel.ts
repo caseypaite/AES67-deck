@@ -265,7 +265,7 @@ export class SurfaceModel {
       if (tr.y + tr.height < RULER_H || tr.y > h) continue;
       ctx.fillStyle = (tr.id % 2) ? '#1a1d23' : '#181b20';
       ctx.fillRect(0, tr.y, w, tr.height);
-      if (dropTrack === tr.id) {
+      if (dropTrack === tr.id && daw.dragOverLane == null) {
         ctx.fillStyle = 'rgba(90,140,255,0.10)';
         ctx.fillRect(0, tr.y, w, tr.height);
       }
@@ -273,6 +273,24 @@ export class SurfaceModel {
       ctx.beginPath(); ctx.moveTo(0, tr.y + tr.height - 0.5); ctx.lineTo(w, tr.y + tr.height - 0.5); ctx.stroke();
 
       const trackClips = Object.values(daw.clips).filter((c) => c.trackId === tr.id);
+
+      // Which spans of each take lane are currently the active comp — a comp-lane
+      // clip that references the same source with a matching source offset.
+      const compSrc = trackClips.filter((c) => (c.lane || 0) === 0 && c.takeDir && c.file);
+      const activeByLane: Record<number, Array<[number, number]>> = {};
+      for (const tc of trackClips) {
+        const L = tc.lane || 0;
+        if (L === 0) continue;
+        for (const cc of compSrc) {
+          if (cc.takeDir !== tc.takeDir || cc.file !== tc.file) continue;
+          const expected = (tc.sourceOffset || 0) + (cc.start - tc.start);
+          if (Math.abs((cc.sourceOffset || 0) - expected) > 0.01) continue;
+          const from = Math.max(cc.start, tc.start);
+          const to = Math.min(cc.start + cc.length, tc.start + tc.length);
+          if (to > from) (activeByLane[L] ||= []).push([from, to]);
+        }
+      }
+
       for (const band of this.laneRects(tr)) {
         const laneClips = trackClips.filter((c) => (c.lane || 0) === band.lane);
 
@@ -289,11 +307,31 @@ export class SurfaceModel {
           ctx.textBaseline = 'alphabetic';
         }
 
+        // vertical-move drop target (lane-aware)
+        if (dropTrack === tr.id && daw.dragOverLane === band.lane) {
+          ctx.fillStyle = 'rgba(90,140,255,0.16)';
+          ctx.fillRect(0, band.y, w, band.h);
+          ctx.strokeStyle = 'rgba(120,170,255,0.7)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(0.5, band.y + 0.5, w - 1, band.h - 1);
+        }
+
         for (const c of laneClips) {
           const x0 = this.timeToX(c.start);
           const x1 = this.timeToX(c.start + c.length);
           if (x1 < 0 || x0 > w) continue;
           this.drawClip(ctx, c, x0, x1, band.y + 3, band.h - 6, selected.has(c.id), daw.peaks);
+        }
+
+        // "this take is the active comp here" — green wash + top accent
+        for (const [from, to] of activeByLane[band.lane] || []) {
+          const gx = this.timeToX(from);
+          const gw = this.timeToX(to) - gx;
+          if (gw <= 0) continue;
+          ctx.fillStyle = 'rgba(110,210,130,0.16)';
+          ctx.fillRect(gx, band.y, gw, band.h);
+          ctx.fillStyle = 'rgba(140,235,160,0.95)';
+          ctx.fillRect(gx, band.y, gw, 2);
         }
 
         // Crossfades: adjacent overlapping clips in this lane get the X marker.

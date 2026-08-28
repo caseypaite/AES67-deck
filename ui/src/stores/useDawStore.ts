@@ -102,7 +102,8 @@ interface DawState {
   clipboard: DawClip[];
 
   // Transient interaction state (not persisted, not serialised to the project).
-  dragOverTrackId: number | null;         // lane highlighted as a vertical-move target
+  dragOverTrackId: number | null;         // track highlighted as a vertical-move target
+  dragOverLane: number | null;            // lane within that track (take-comping vertical move)
   marquee: { x0: number; y0: number; x1: number; y1: number } | null;
   compPreview: { trackId: number; lane: number; fromSec: number; toSec: number } | null;
 
@@ -186,7 +187,7 @@ interface DawState {
   renameClip: (id: string, name: string) => void;
   setClipFade: (id: string, edge: 'in' | 'out', seconds: number) => void;
   setClipGain: (id: string, gain: number) => void;
-  setDragOverTrack: (trackId: number | null) => void;
+  setDragOverTrack: (trackId: number | null, lane?: number | null) => void;
   setMarquee: (m: { x0: number; y0: number; x1: number; y1: number } | null) => void;
   setCompPreview: (p: { trackId: number; lane: number; fromSec: number; toSec: number } | null) => void;
   copySelected: () => void;
@@ -359,6 +360,7 @@ export const useDawStore = create<DawState>()(
       clipboard: [],
 
       dragOverTrackId: null,
+      dragOverLane: null,
       marquee: null,
       compPreview: null,
       recordingClips: {},
@@ -729,7 +731,8 @@ export const useDawStore = create<DawState>()(
         scheduleSave();
       },
 
-      setDragOverTrack: (trackId) => set((s) => (s.dragOverTrackId === trackId ? s : { dragOverTrackId: trackId })),
+      setDragOverTrack: (trackId, lane = null) =>
+        set((s) => (s.dragOverTrackId === trackId && s.dragOverLane === lane ? s : { dragOverTrackId: trackId, dragOverLane: lane })),
       setMarquee: (m) => set({ marquee: m }),
       setCompPreview: (p) => set({ compPreview: p }),
 

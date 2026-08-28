@@ -328,8 +328,13 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
   preview (`compPreview`). Context menu: promote lane / move to comp / send to
   new take lane. Server sends comp-lane-only to the engine + `.rpp`.
   Verified end-to-end in a headless browser (`scratchpad/comp-test.mjs`).
-  **Still to do**: per-segment comp visualisation on the lanes, drag a take
-  clip between lanes, comp crossfade length control, loop-record stacking each
+- **Comping polish DONE 2026-08-28.** Drag a take clip between lanes / tracks
+  (gesture picks swipe-vs-move from the first drag direction — horizontal =
+  swipe-to-comp, vertical = move), lane-aware drop highlight (`dragOverLane`),
+  and a per-segment "active comp" marker on each take lane (green wash + top
+  accent where that take currently feeds the comp lane, matched by
+  source-offset). Empty take-lane auto-collapses.
+  **Still to do**: comp crossfade length control, loop-record stacking each
   pass onto its own lane (currently only `addCommittedClips` auto-stacks).
 - **Bounce / export** — render a timeline region through the master chain to a
   file. Realtime (route master to a `DiskWriter`, run transport over the region)
