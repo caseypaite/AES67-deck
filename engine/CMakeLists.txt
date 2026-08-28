@@ -35,6 +35,7 @@ add_executable(aes67_deck_engine
     src/recorder/MultitrackRecorder.cpp
     src/recorder/WavpackWriter.cpp
     src/playback/TimelinePlayer.cpp
+    src/timecode/Timecode.cpp
 )
 
 target_link_libraries(aes67_deck_engine

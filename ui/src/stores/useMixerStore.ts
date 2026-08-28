@@ -567,9 +567,13 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     // back on every metering frame (see the `metering` handler). We set an
     // optimistic transportState here so the buttons feel instant; the engine
     // frame corrects it within ~10 ms.
+    // Phase 5 tail — count-in: N bars of metronome before the transport rolls /
+    // recording opens. Engine freezes the transport + tap until it elapses.
+    const countinFrames = useDawStore.getState().countInFrames();
+
     if (action === 'play') {
       if (cur === 'playing') { send({ type: 'transport_stop' }); set({ transportState: 'stopped' }); }
-      else { send({ type: 'transport_play' }); set({ transportState: 'playing' }); }
+      else { send({ type: 'transport_play', countinFrames }); set({ transportState: 'playing' }); }
     } else if (action === 'stop') {
       send({ type: 'transport_stop' });
       set({ transportState: 'stopped' });
@@ -588,10 +592,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         // Phase 3e — with punch armed, just roll: the server drops the take in
         // at the in-point and out at the out-point (and re-drops each loop pass).
         if (useDawStore.getState().punchEnabled && useDawStore.getState().region) {
-          send({ type: 'transport_play' });
+          send({ type: 'transport_play', countinFrames });
           set({ transportState: 'playing' });
         } else {
-          send({ type: 'start_multitrack_record', armed });
+          send({ type: 'start_multitrack_record', armed, countinFrames });
           set({ transportState: 'recording' });
         }
       }
@@ -623,6 +627,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       ws.send(JSON.stringify({ type: 'list_bounces' }));
       const daw = useDawStore.getState();
       ws.send(JSON.stringify({ type: 'set_metronome', enabled: daw.metronomeOn, bpm: daw.tempo, sigNum: daw.timeSig.num, sigDen: daw.timeSig.den, dest: daw.metroDest }));
+      ws.send(JSON.stringify({ type: 'set_automation_state', mode: daw.automationMode, lanes: Object.values(daw.automation) }));
       const mask = get().monitorInputMask;
       if (mask !== 0) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask }));
     };
@@ -945,6 +950,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             const ms = Math.round((2 * data.transport.buf / data.transport.sr) * 1000 * 10) / 10;
             if (get().audioLatencyMs !== ms) set({ audioLatencyMs: ms });
           }
+          if (data.tc) useDawStore.getState().applyTcTelemetry(data.tc);
           if (data.transport) {
             const t = data.transport;
             // Engine transport is authoritative for both position and state.
@@ -992,7 +998,9 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             (Number(data.originFrame) || 0) / sr, sr);
         } else if (data.type === 'take_committed') {
           useDawStore.getState().endRecordingClips();
-          useDawStore.getState().addCommittedClips(data.clips || [], !!data.overrun);
+          useDawStore.getState().addCommittedClips(data.clips || [], !!data.overrun, {
+            loopPass: !!data.loopPass, passIndex: Number(data.passIndex) || 0,
+          });
         } else if (data.type === 'clip_peaks') {
           if (data.peaks && data.takeDir && data.file) {
             useDawStore.getState().setPeaks(`${data.takeDir}/${data.file}`, data.peaks);
@@ -1009,6 +1017,18 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           useDawStore.getState().setBounces(data.bounces || []);
         } else if (data.type === 'loudness_config_loaded') {
           useLoudnessStore.getState().applyConfig(data.config || {});
+        } else if (data.type === 'timecode_config_loaded') {
+          useDawStore.getState().applyTimecodeConfig(data.config || {});
+        } else if (data.type === 'auto_lane_updated' && data.lane) {
+          useDawStore.getState().applyAutoLaneUpdate(data.lane);
+        } else if (data.type === 'project_videos') {
+          useDawStore.getState().setProjectVideos(data.videos || []);
+        } else if (data.type === 'playlists_list') {
+          useDawStore.getState().setPlaylists(data.playlists || []);
+        } else if (data.type === 'playlist_data') {
+          useDawStore.getState().applyPlaylistData(data.playlist || null);
+        } else if (data.type === 'playlist_status') {
+          useDawStore.getState().applyPlaylistStatus(data);
         } else if (data.type === 'loudness_history') {
           useLoudnessStore.getState().seed(data.points || [], data.target);
         } else if (data.type === 'loudness_report') {

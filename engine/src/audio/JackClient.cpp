@@ -51,6 +51,14 @@ void JackClient::register_output_port(const std::string& port_name) {
     }
 }
 
+void JackClient::register_midi_output_port(const std::string& port_name) {
+    if (!client_) return;
+    jack_port_t* port = jack_port_register(client_, port_name.c_str(), JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
+    if (port) {
+        midi_output_ports_.push_back(port);
+    }
+}
+
 void JackClient::set_process_callback(std::function<void(jack_nframes_t)> callback) {
     process_callback_ = std::move(callback);
 }

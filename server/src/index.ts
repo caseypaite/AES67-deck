@@ -7,6 +7,9 @@ import { execFile } from 'child_process';
 import * as path from 'path';
 import { ensurePeaks } from './wavPeaks';
 import { buildRpp, parseRpp, type RppProject } from './rpp';
+import {
+  TIMECODE_DEFAULTS, timecodeAt, type TimecodeConfig, type TcFps,
+} from './timecode';
 
 const SCENES_DIR = path.join(process.cwd(), '..', 'scenes');
 if (!fs.existsSync(SCENES_DIR)) {
@@ -32,11 +35,68 @@ if (!fs.existsSync(PROJECTS_DIR)) {
 }
 const ACTIVE_PROJECT_PATH = path.join(PROJECTS_DIR, '.active');
 
+// Playout playlists (plan Phase 5) — an ordered list of projects the server
+// plays back-to-back, advancing on the metering clock.
+const PLAYLISTS_DIR = path.join(process.cwd(), '..', 'playlists');
+if (!fs.existsSync(PLAYLISTS_DIR)) fs.mkdirSync(PLAYLISTS_DIR);
+
 interface DawProject {
   clips: any[];
   markers: any[];
   trackHeights: Record<string, number>;
   loop?: { start: number; end: number; enabled: boolean };
+  // Phase 5 — musical settings persisted with the arrangement.
+  tempo?: number;
+  timeSig?: { num: number; den: number };
+  beatDiv?: number;
+  countInBars?: number;
+  compCrossfadeSec?: number;
+  metroDest?: string;
+  automation?: AutoLane[];
+  video?: { file: string; offsetSec: number } | null;
+}
+
+// Phase 5 — automation lanes. Points hold the target's raw value (fader 0..1,
+// pan -1..1, plugin param in its own port range). Playback is a server-side
+// runner on the metering clock; write-capture appends points from live moves.
+interface AutoPoint { t: number; v: number; }
+interface AutoLane {
+  id: string;
+  target: {
+    kind: 'fader' | 'pan' | 'plugin';
+    channelId: number; label?: string;
+    pluginId?: string; pluginIndex?: number; paramSymbol?: string;
+  };
+  min: number; max: number;
+  points: AutoPoint[];
+  enabled: boolean;
+  armed: boolean;
+}
+
+function coerceAutoLanes(raw: unknown): AutoLane[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((l: any) => l && typeof l.id === 'string' && l.target &&
+    ['fader', 'pan', 'plugin'].includes(l.target.kind) && Number.isFinite(Number(l.target.channelId)))
+    .map((l: any) => ({
+      id: l.id,
+      target: {
+        kind: l.target.kind,
+        channelId: Number(l.target.channelId),
+        label: typeof l.target.label === 'string' ? l.target.label : undefined,
+        pluginId: typeof l.target.pluginId === 'string' ? l.target.pluginId : undefined,
+        pluginIndex: Number.isFinite(Number(l.target.pluginIndex)) ? Number(l.target.pluginIndex) : undefined,
+        paramSymbol: typeof l.target.paramSymbol === 'string' ? l.target.paramSymbol : undefined,
+      },
+      min: Number.isFinite(Number(l.min)) ? Number(l.min) : 0,
+      max: Number.isFinite(Number(l.max)) ? Number(l.max) : 1,
+      points: Array.isArray(l.points)
+        ? l.points.filter((p: any) => Number.isFinite(Number(p?.t)) && Number.isFinite(Number(p?.v)))
+            .map((p: any) => ({ t: Math.max(0, Number(p.t)), v: Number(p.v) }))
+            .sort((a: AutoPoint, b: AutoPoint) => a.t - b.t)
+        : [],
+      enabled: l.enabled !== false,
+      armed: l.armed === true,
+    }));
 }
 
 function emptyProject(): DawProject {
@@ -109,6 +169,7 @@ function consolidatedName(takeDir: string, file: string): string {
 function timelineToRpp(
   clips: any[], markers: any[], trackHeights: Record<string, number>,
   sampleRate: number, fileFor: (c: any) => string,
+  music?: { tempo?: number; timeSig?: { num: number; den: number } },
 ): RppProject {
   const byTrack = new Map<number, any[]>();
   for (const c of clips) {
@@ -136,7 +197,8 @@ function timelineToRpp(
   }));
   return {
     sampleRate: sampleRate || 48000,
-    tempo: 120,
+    tempo: Number(music?.tempo) || 120,
+    timeSig: music?.timeSig,
     tracks,
     markers: (markers || []).map((m: any) => ({ position: Number(m.time) || 0, name: String(m.name || 'Marker') })),
   };
@@ -176,7 +238,11 @@ function rppToProject(rpp: RppProject, projName: string): DawProject {
     if (tid && tr.height) trackHeights[String(tid)] = tr.height;
   });
   const markers = rpp.markers.map((m, i) => ({ id: `m${i}_${Math.round(m.position * 1000)}`, time: m.position, name: m.name }));
-  return { clips, markers, trackHeights };
+  return {
+    clips, markers, trackHeights,
+    ...(rpp.tempo ? { tempo: rpp.tempo } : {}),
+    ...(rpp.timeSig ? { timeSig: rpp.timeSig } : {}),
+  };
 }
 
 let rppSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -200,10 +266,22 @@ function broadcastRecordingProjects(): void {
 function ensureProject(name: string): void {
   const dir = projectDir(name);
   fs.mkdirSync(path.join(dir, 'takes'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'video'), { recursive: true });
   const pj = path.join(dir, 'project.json');
   if (!fs.existsSync(pj)) {
     fs.writeFileSync(pj, JSON.stringify(emptyProject(), null, 2));
   }
+}
+
+// Reference videos the operator has copied into projects/<name>/video/.
+function listProjectVideos(name: string): Array<{ file: string; sizeBytes: number }> {
+  try {
+    const dir = path.join(projectDir(name), 'video');
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((f) => /\.(mp4|webm|mov|m4v|mkv)$/i.test(f))
+      .map((f) => ({ file: f, sizeBytes: fs.statSync(path.join(dir, f)).size }));
+  } catch { return []; }
 }
 
 function listScenes(): string[] {
@@ -248,6 +326,27 @@ function projectWithOrphanTakes(name: string, project: DawProject): DawProject {
   return { ...project, clips };
 }
 
+// Coerce the Phase 5 musical settings out of a project blob (from disk or a
+// save_project message) — undefined keys are simply omitted so the UI keeps its
+// current value.
+function musicalFields(raw: any): Partial<DawProject> {
+  const out: Partial<DawProject> = {};
+  if (Number.isFinite(Number(raw?.tempo)) && Number(raw.tempo) >= 20 && Number(raw.tempo) <= 300) out.tempo = Number(raw.tempo);
+  if (raw?.timeSig && Number.isFinite(Number(raw.timeSig.num)) && Number.isFinite(Number(raw.timeSig.den)))
+    out.timeSig = { num: Math.max(1, Math.min(16, Math.round(Number(raw.timeSig.num)))), den: Number(raw.timeSig.den) };
+  if ([1, 2, 4].includes(Number(raw?.beatDiv))) out.beatDiv = Number(raw.beatDiv);
+  if (Number.isFinite(Number(raw?.countInBars))) out.countInBars = Math.max(0, Math.min(4, Math.round(Number(raw.countInBars))));
+  if (Number.isFinite(Number(raw?.compCrossfadeSec))) out.compCrossfadeSec = Math.max(0, Math.min(0.1, Number(raw.compCrossfadeSec)));
+  if (['monitor', 'master', 'both'].includes(String(raw?.metroDest))) out.metroDest = String(raw.metroDest);
+  if (raw?.automation !== undefined) out.automation = coerceAutoLanes(raw.automation);
+  if (raw?.video && typeof raw.video === 'object' && typeof raw.video.file === 'string') {
+    out.video = { file: raw.video.file, offsetSec: Number(raw.video.offsetSec) || 0 };
+  } else if (raw?.video === null) {
+    out.video = null;
+  }
+  return out;
+}
+
 function loadProject(name: string): DawProject {
   const pj = path.join(projectDir(name), 'project.json');
   let project = emptyProject();
@@ -259,6 +358,7 @@ function loadProject(name: string): DawProject {
         markers: Array.isArray(raw.markers) ? raw.markers : [],
         trackHeights: raw.trackHeights && typeof raw.trackHeights === 'object' ? raw.trackHeights : {},
         loop: raw.loop && typeof raw.loop === 'object' ? raw.loop : undefined,
+        ...musicalFields(raw),
       };
     }
   } catch (e) {
@@ -687,14 +787,23 @@ let lastArmed: number[] = [];
 // the current take has closed (handleTakeFinished consumes it).
 let pendingSplitArmed: number[] | null = null;
 
+// Loop-record pass tracking (plan Phase 5 tail): each loop wrap closes one pass
+// and opens the next; the committed takes are tagged loopPass + passIndex so the
+// UI stacks every pass on its own take lane (never the comp lane).
+let loopRecordActive = false;
+let loopRecordPass = 0;
+let pendingLoopPassIndex: number | null = null;
+function resetLoopRecord(): void { loopRecordActive = false; loopRecordPass = 0; pendingLoopPassIndex = null; }
+
 // Open a multitrack take: make the take dir, remember it, tell the engine.
 // Shared by the manual start_multitrack_record path, auto-record, split and
 // the scheduler. Returns an error string, or null on success.
-function startTake(armed: number[]): string | null {
+function startTake(armed: number[], countinFrames = 0, isSplitReopen = false): string | null {
   const valid = armed.filter((n) => Number.isInteger(n) && n >= 1 && n <= NUM_CHANNELS);
   if (valid.length === 0) return 'no armed tracks';
   if (!engineSocket) return 'engine not connected';
   if (activeTakeDir) return 'already recording';
+  if (!isSplitReopen) resetLoopRecord();   // a fresh session, not a loop-wrap reopen
   ensureProject(activeProjectName);
   const ts = new Date().toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
   activeTakeDir = path.join(projectDir(activeProjectName), 'takes', ts);
@@ -702,6 +811,7 @@ function startTake(armed: number[]): string | null {
   lastArmed = valid;
   engineSocket.write(JSON.stringify({
     type: 'start_multitrack_record', dir: path.resolve(activeTakeDir), armed: valid,
+    countinFrames: countinFrames > 0 ? Math.round(countinFrames) : 0,
   }) + '\n');
   startDiskGuard();
   return null;
@@ -976,6 +1086,9 @@ function maybePunch(t: any): void {
   if (activeTakeDir && !pendingSplitArmed && t.loopOn && Number(t.loopOut) > Number(t.loopIn)
       && frame < prev - sr * 0.05) {
     pendingSplitArmed = lastArmed.length ? lastArmed : armedChannels();
+    loopRecordActive = true;
+    pendingLoopPassIndex = loopRecordPass;      // the take closing now is this pass
+    loopRecordPass += 1;
     stopTake();
     return;
   }
@@ -1009,6 +1122,326 @@ const bounce: { active: boolean; path: string; name: string; inSec: number; outS
 
 // Phase 5 — last metronome config the UI set; replayed to the engine on reconnect.
 let lastMetronome: { enabled: boolean; bpm: number; sigNum: number; sigDen: number; dest: string } | null = null;
+
+// --- Timecode & sync (plan/daw-timeline-roadmap.md Phase 3d) ----------------
+// Persisted like loudness_config.json / vsc_config.json; the four engine
+// commands it drives are replayed on engine reconnect (same as the metronome).
+const TIMECODE_CONFIG_PATH = 'timecode_config.json';
+
+function getTimecodeConfig(): TimecodeConfig {
+  try {
+    if (fs.existsSync(TIMECODE_CONFIG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(TIMECODE_CONFIG_PATH, 'utf8'));
+      const fps: TcFps = [24, 25, 30].includes(Number(raw.fps)) ? (Number(raw.fps) as TcFps) : TIMECODE_DEFAULTS.fps;
+      return {
+        source: raw.source === 'tod' ? 'tod' : 'project',
+        fps,
+        df: fps === 30 && raw.df === true,
+        offsetFrames: Number.isFinite(Number(raw.offsetFrames)) ? Math.round(Number(raw.offsetFrames)) : 0,
+        ltcGen: raw.ltcGen === true,
+        ltcLevel: Number.isFinite(Number(raw.ltcLevel)) ? Math.min(1, Math.max(0, Number(raw.ltcLevel))) : TIMECODE_DEFAULTS.ltcLevel,
+        mtcGen: raw.mtcGen === true,
+        ltcChase: raw.ltcChase === true,
+      };
+    }
+  } catch (e) {
+    console.error('Error reading timecode_config.json, using defaults', e);
+  }
+  return { ...TIMECODE_DEFAULTS };
+}
+
+function writeTimecodeConfig(patch: Partial<TimecodeConfig>): TimecodeConfig {
+  // Ignore keys the caller left undefined so a partial message can't wipe a field.
+  const clean = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+  const next = { ...getTimecodeConfig(), ...clean } as TimecodeConfig;
+  if (next.source !== 'tod') next.source = 'project';
+  if (![24, 25, 30].includes(Number(next.fps))) next.fps = TIMECODE_DEFAULTS.fps;
+  next.ltcGen = next.ltcGen === true;
+  next.mtcGen = next.mtcGen === true;
+  next.ltcChase = next.ltcChase === true;
+  next.df = next.fps === 30 && next.df === true;
+  next.offsetFrames = Number.isFinite(Number(next.offsetFrames)) ? Math.round(Number(next.offsetFrames)) : 0;
+  next.ltcLevel = Number.isFinite(Number(next.ltcLevel)) ? Math.min(1, Math.max(0, Number(next.ltcLevel))) : TIMECODE_DEFAULTS.ltcLevel;
+  try {
+    fs.writeFileSync(TIMECODE_CONFIG_PATH, JSON.stringify(next, null, 2));
+  } catch (e) {
+    console.error('Error writing timecode_config.json', e);
+  }
+  return next;
+}
+
+// The engine IPC lines that carry one TimecodeConfig.
+function timecodeEngineCommands(c: TimecodeConfig): string[] {
+  return [
+    JSON.stringify({ type: 'transport_set_timecode', source: c.source, fps: c.fps, df: c.df, offsetFrames: c.offsetFrames }),
+    JSON.stringify({ type: 'ltc_gen', enabled: c.ltcGen, level: c.ltcLevel }),
+    JSON.stringify({ type: 'mtc_gen', enabled: c.mtcGen }),
+    JSON.stringify({ type: 'ltc_chase', enabled: c.ltcChase }),
+  ];
+}
+
+function pushTimecodeToEngine(c: TimecodeConfig): void {
+  if (!engineSocket) return;
+  for (const line of timecodeEngineCommands(c)) engineSocket.write(line + '\n');
+}
+
+// Latest engine `tc` telemetry, for take stamping (seconds past midnight UTC).
+let lastTodSec: number | null = null;
+let lastSampleRate = 48000;
+
+// --- Phase 5: automation runner + write-capture --------------------------
+// The UI sends the full lane set + mode on every edit (set_automation_state).
+// While rolling in READ, `maybeRunAutomation` interpolates each enabled lane on
+// the metering clock and emits set_fader / set_pan / set_plugin_param (also
+// broadcast so UI faders move). In WRITE, incoming armed-lane param moves are
+// appended as points; on stop the touched lanes are thinned + broadcast back.
+let activeAutomation: AutoLane[] = [];
+let automationMode: 'off' | 'read' | 'write' = 'off';
+const autoLastEmit = new Map<string, number>();      // laneId -> last value sent
+const autoWriteTouched = new Set<string>();          // laneIds captured this roll
+let autoLastFrame = 0;
+
+// The UI store's fader position (0..1) -> linear amplitude (mirrors
+// buildEngineRestoreCommands / the UI positionToAmplitude).
+function faderPositionToAmplitude(y: number): number {
+  let db: number;
+  if (y >= 0.75)      db = 0    + ((y - 0.75) / 0.25) * 10;
+  else if (y >= 0.50) db = -10  + ((y - 0.50) / 0.25) * 10;
+  else if (y >= 0.30) db = -20  + ((y - 0.30) / 0.20) * 10;
+  else if (y >= 0.15) db = -40  + ((y - 0.15) / 0.15) * 20;
+  else if (y > 0)     db = -100 + (y  / 0.15)  * 60;
+  else                return 0;
+  return Math.pow(10, db / 20);
+}
+
+function autoValueAt(lane: AutoLane, sec: number): number | null {
+  const p = lane.points;
+  if (p.length === 0) return null;
+  if (sec <= p[0].t) return p[0].v;
+  if (sec >= p[p.length - 1].t) return p[p.length - 1].v;
+  for (let i = 1; i < p.length; i++) {
+    if (p[i].t >= sec) {
+      const a = p[i - 1], b = p[i];
+      return a.v + (b.v - a.v) * (sec - a.t) / Math.max(1e-9, b.t - a.t);
+    }
+  }
+  return p[p.length - 1].v;
+}
+
+function emitAutoValue(lane: AutoLane, v: number): void {
+  const t = lane.target;
+  let msg: any;
+  if (t.kind === 'fader') {
+    msg = { type: 'set_fader', channel: t.channelId, value: faderPositionToAmplitude(v) / 2.0, faderPosition: v };
+  } else if (t.kind === 'pan') {
+    msg = { type: 'set_pan', channel: t.channelId, value: Math.max(-1, Math.min(1, v)) };
+  } else if (t.kind === 'plugin' && typeof t.pluginIndex === 'number' && t.paramSymbol) {
+    msg = { type: 'set_plugin_param', channel: t.channelId, pluginIndex: t.pluginIndex, paramId: t.paramSymbol, value: v };
+  } else {
+    return;
+  }
+  const line = JSON.stringify(msg);
+  if (engineSocket) engineSocket.write(line + '\n');
+  broadcastToClients(line);
+}
+
+function maybeRunAutomation(t: any): void {
+  if (!t || typeof t.frame !== 'number') return;
+  const rolling = t.state === 1 || t.state === 2;
+  autoLastFrame = t.frame;
+  if (!rolling || automationMode !== 'read') { autoLastEmit.clear(); return; }
+  const sr = Number(t.sr) || lastSampleRate || 48000;
+  const sec = t.frame / sr;
+  for (const lane of activeAutomation) {
+    if (!lane.enabled) continue;
+    const v = autoValueAt(lane, sec);
+    if (v == null) continue;
+    const prev = autoLastEmit.get(lane.id);
+    if (prev != null && Math.abs(prev - v) < (lane.max - lane.min) * 1e-4) continue;
+    autoLastEmit.set(lane.id, v);
+    emitAutoValue(lane, v);
+  }
+}
+
+// Called from the mixer-intercept branch for set_fader / set_pan / set_plugin_param.
+function maybeCaptureAutomation(data: any): void {
+  if (automationMode !== 'write') return;
+  const sec = autoLastFrame / (lastSampleRate || 48000);
+  for (const lane of activeAutomation) {
+    if (!lane.armed) continue;
+    const tg = lane.target;
+    let v: number | null = null;
+    if (data.type === 'set_fader' && tg.kind === 'fader' && data.channel === tg.channelId) {
+      v = typeof data.faderPosition === 'number' ? data.faderPosition : null;
+    } else if (data.type === 'set_pan' && tg.kind === 'pan' && data.channel === tg.channelId) {
+      v = Number(data.value);
+    } else if (data.type === 'set_plugin_param' && tg.kind === 'plugin'
+      && data.channel === tg.channelId && data.pluginIndex === tg.pluginIndex && data.paramId === tg.paramSymbol) {
+      v = Number(data.value);
+    }
+    if (v == null || !Number.isFinite(v)) continue;
+    // ~10 Hz decimation.
+    const last = lane.points[lane.points.length - 1];
+    if (last && Math.abs(last.t - sec) < 0.1) { last.v = v; }
+    else { lane.points.push({ t: Math.max(0, sec), v }); lane.points.sort((a, b) => a.t - b.t); }
+    autoWriteTouched.add(lane.id);
+  }
+}
+
+// On transport stop: thin the captured lanes (drop near-collinear points) and
+// push them back to the UI.
+// --- Phase 5: multi-project playlist / playout --------------------------
+interface PlaylistSegment { project: string; recProject?: boolean; gapSec?: number; }
+interface Playlist { name: string; segments: PlaylistSegment[]; }
+
+function playlistPath(name: string): string {
+  return path.join(PLAYLISTS_DIR, sanitizeProjectName(name) + '.json');
+}
+function listPlaylists(): string[] {
+  try {
+    return fs.readdirSync(PLAYLISTS_DIR).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5));
+  } catch { return []; }
+}
+function loadPlaylist(name: string): Playlist {
+  try {
+    const raw = JSON.parse(fs.readFileSync(playlistPath(name), 'utf8'));
+    const segments = Array.isArray(raw.segments) ? raw.segments
+      .filter((s: any) => s && typeof s.project === 'string')
+      .map((s: any) => ({ project: String(s.project), recProject: !!s.recProject, gapSec: Math.max(0, Number(s.gapSec) || 0) }))
+      : [];
+    return { name: sanitizeProjectName(name), segments };
+  } catch { return { name: sanitizeProjectName(name), segments: [] }; }
+}
+function savePlaylist(pl: Playlist): void {
+  fs.writeFileSync(playlistPath(pl.name), JSON.stringify(pl, null, 2));
+}
+
+// End of the arrangement (seconds) = the latest clip end in the project/.rpp.
+function projectEndSec(name: string, recProject: boolean): number {
+  try {
+    const proj = recProject
+      ? rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name)
+      : loadProject(name);
+    let end = 0;
+    for (const c of proj.clips || []) {
+      const e = (Number(c.start) || 0) + (Number(c.length) || 0);
+      if (e > end) end = e;
+    }
+    return end;
+  } catch { return 0; }
+}
+
+const playlistState: {
+  active: Playlist | null; index: number; running: boolean;
+  segEndFrame: number; gapUntil: number; armed: boolean;
+} = { active: null, index: 0, running: false, segEndFrame: 0, gapUntil: 0, armed: false };
+
+function broadcastPlaylistStatus(): void {
+  broadcastToClients(JSON.stringify({
+    type: 'playlist_status',
+    name: playlistState.active?.name ?? null,
+    index: playlistState.index,
+    running: playlistState.running,
+    count: playlistState.active?.segments.length ?? 0,
+  }));
+}
+
+function loadSegmentAndPlay(seg: PlaylistSegment): void {
+  const sr = lastSampleRate || 48000;
+  const name = sanitizeProjectName(seg.project);
+  if (seg.recProject) {
+    try {
+      const proj = rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name);
+      activeRecordingProject = name; activeProjectName = name;
+      broadcastToClients(JSON.stringify({ type: 'project_data', name, project: proj }));
+      pushTimelineToEngine(name, proj);
+    } catch (e) { console.error('playlist: rec segment load failed', e); }
+  } else {
+    setActiveProject(name);
+    activeRecordingProject = null;
+    const proj = loadProject(name);
+    broadcastToClients(JSON.stringify({ type: 'project_data', name, project: proj }));
+    pushTimelineToEngine(name, proj);
+  }
+  playlistState.segEndFrame = Math.max(Math.round(sr * 0.5), Math.round(projectEndSec(name, !!seg.recProject) * sr));
+  playlistState.armed = false;   // wait until the transport has actually reset near 0
+  if (engineSocket) {
+    engineSocket.write(JSON.stringify({ type: 'transport_locate', frame: 0 }) + '\n');
+    engineSocket.write(JSON.stringify({ type: 'transport_play' }) + '\n');
+  }
+}
+
+function startPlaylist(name: string, fromIndex: number): void {
+  const pl = loadPlaylist(name);
+  if (!pl.segments.length) return;
+  playlistState.active = pl;
+  playlistState.index = Math.max(0, Math.min(pl.segments.length - 1, fromIndex));
+  playlistState.running = true;
+  playlistState.gapUntil = 0;
+  loadSegmentAndPlay(pl.segments[playlistState.index]);
+  broadcastPlaylistStatus();
+}
+
+function stopPlaylist(): void {
+  playlistState.running = false;
+  playlistState.active = null;
+  if (engineSocket) engineSocket.write(JSON.stringify({ type: 'transport_stop' }) + '\n');
+  broadcastPlaylistStatus();
+}
+
+function maybeAdvancePlaylist(t: any): void {
+  if (!playlistState.running || !playlistState.active || !t || typeof t.frame !== 'number') return;
+  const now = Date.now();
+  if (playlistState.gapUntil > now) return;
+  const rolling = t.state === 1 || t.state === 2;
+  if (playlistState.gapUntil && playlistState.gapUntil <= now) {
+    // Gap elapsed → roll the segment we pre-loaded.
+    playlistState.gapUntil = 0;
+    loadSegmentAndPlay(playlistState.active.segments[playlistState.index]);
+    broadcastPlaylistStatus();
+    return;
+  }
+  if (!rolling) return;
+  // Don't test the end until we've seen the transport reset for this segment
+  // (the metering frame lags the locate we just sent by a block or two).
+  if (!playlistState.armed) {
+    if (t.frame < playlistState.segEndFrame * 0.5) playlistState.armed = true;
+    return;
+  }
+  if (t.frame < playlistState.segEndFrame) return;
+
+  // Segment finished.
+  const next = playlistState.index + 1;
+  if (next >= playlistState.active.segments.length) { stopPlaylist(); return; }
+  playlistState.index = next;
+  const seg = playlistState.active.segments[next];
+  if (engineSocket) engineSocket.write(JSON.stringify({ type: 'transport_stop' }) + '\n');
+  if (seg.gapSec && seg.gapSec > 0) {
+    playlistState.gapUntil = now + seg.gapSec * 1000;
+    broadcastPlaylistStatus();
+  } else {
+    loadSegmentAndPlay(seg);
+    broadcastPlaylistStatus();
+  }
+}
+
+function finishAutomationWrite(): void {
+  if (!autoWriteTouched.size) return;
+  for (const id of autoWriteTouched) {
+    const lane = activeAutomation.find((l) => l.id === id);
+    if (!lane || lane.points.length < 3) continue;
+    const out: AutoPoint[] = [lane.points[0]];
+    for (let i = 1; i < lane.points.length - 1; i++) {
+      const a = out[out.length - 1], b = lane.points[i], c = lane.points[i + 1];
+      const expected = a.v + (c.v - a.v) * (b.t - a.t) / Math.max(1e-9, c.t - a.t);
+      if (Math.abs(b.v - expected) > (lane.max - lane.min) * 0.01) out.push(b);
+    }
+    out.push(lane.points[lane.points.length - 1]);
+    lane.points = out;
+    broadcastToClients(JSON.stringify({ type: 'auto_lane_updated', lane }));
+  }
+  autoWriteTouched.clear();
+}
 
 // Drop `frames` of audio off the head of a PCM WAV (the bounce preroll) and fix
 // the RIFF / data chunk sizes. No-op if the layout isn't what we wrote.
@@ -1103,9 +1536,43 @@ function listBounces(): Array<{ name: string; bytes: number; mtime: number }> {
   } catch { return []; }
 }
 
-// Set up WebSocket server
-const wss = new WebSocketServer({ port: WSS_PORT });
-console.log(`WebSocket Server listening on ws://localhost:${WSS_PORT}`);
+// HTTP server on the same port as the WS: serves reference-video files for the
+// timeline (plan Phase 5). Read-only, Range-aware, path-sanitised; everything
+// else 404s. The WS upgrade rides the same server.
+const VIDEO_EXT = /\.(mp4|webm|mov|m4v|mkv)$/i;
+function projectVideoDir(name: string): string {
+  return path.join(projectDir(name), 'video');
+}
+const httpServer = http.createServer((req, res) => {
+  const m = req.url && req.method === 'GET' && /^\/video\/([^/]+)\/([^/?#]+)/.exec(req.url);
+  if (!m) { res.writeHead(404).end(); return; }
+  const proj = sanitizeProjectName(decodeURIComponent(m[1]));
+  const file = decodeURIComponent(m[2]).replace(/[^0-9A-Za-z._ -]/g, '');
+  if (!VIDEO_EXT.test(file)) { res.writeHead(404).end(); return; }
+  const full = path.join(projectVideoDir(proj), file);
+  if (!full.startsWith(projectVideoDir(proj)) || !fs.existsSync(full)) { res.writeHead(404).end(); return; }
+  const stat = fs.statSync(full);
+  const type = file.match(/webm$/i) ? 'video/webm' : file.match(/(mkv)$/i) ? 'video/x-matroska' : 'video/mp4';
+  const range = req.headers.range && /bytes=(\d*)-(\d*)/.exec(req.headers.range);
+  if (range) {
+    const start = range[1] ? parseInt(range[1], 10) : 0;
+    const end = range[2] ? parseInt(range[2], 10) : stat.size - 1;
+    if (start >= stat.size || end >= stat.size || start > end) { res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` }).end(); return; }
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, 'Content-Type': type,
+    });
+    fs.createReadStream(full, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, { 'Content-Length': stat.size, 'Accept-Ranges': 'bytes', 'Content-Type': type });
+    fs.createReadStream(full).pipe(res);
+  }
+});
+httpServer.listen(WSS_PORT);
+
+// Set up WebSocket server (shares the HTTP server)
+const wss = new WebSocketServer({ server: httpServer });
+console.log(`WebSocket + HTTP server listening on :${WSS_PORT}`);
 
 let connectedWsClients: WebSocket[] = [];
 wss.on('connection', (ws) => {
@@ -1125,6 +1592,9 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
   ws.send(JSON.stringify({ type: 'vsc_config_loaded', config: getVscConfig() }));
   ws.send(JSON.stringify({ type: 'loudness_config_loaded', config: getLoudnessConfig() }));
+  ws.send(JSON.stringify({ type: 'timecode_config_loaded', config: getTimecodeConfig() }));
+  ws.send(JSON.stringify({ type: 'project_videos', name: activeProjectName, videos: listProjectVideos(activeProjectName) }));
+  ws.send(JSON.stringify({ type: 'playlists_list', playlists: listPlaylists() }));
   ws.send(JSON.stringify({ type: 'bounces_list', bounces: listBounces() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
   ws.send(JSON.stringify(daemonStateMessage()));
@@ -1417,6 +1887,7 @@ wss.on('connection', (ws) => {
           clips: Array.isArray(p.clips) ? p.clips : [],
           markers: Array.isArray(p.markers) ? p.markers : [],
           trackHeights: p.trackHeights && typeof p.trackHeights === 'object' ? p.trackHeights : {},
+          ...musicalFields(p),
         };
         if (!name || name === 'default') {
           ws.send(JSON.stringify({ type: 'recording_project_error', reason: 'pick a project name' }));
@@ -1458,7 +1929,7 @@ wss.on('connection', (ws) => {
               try { fs.rmSync(path.join(projectDir(activeProjectName), 'takes', td), { recursive: true, force: true }); } catch { /* ignore */ }
             }
             fs.writeFileSync(rppPath(name), buildRpp(
-              timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => c.file),
+              timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => c.file, project),
             ));
             activeRecordingProject = name;
             activeProjectName = name;
@@ -1505,13 +1976,14 @@ wss.on('connection', (ws) => {
           markers: Array.isArray(p.markers) ? p.markers : [],
           trackHeights: p.trackHeights && typeof p.trackHeights === 'object' ? p.trackHeights : {},
           loop: p.loop && typeof p.loop === 'object' ? p.loop : undefined,
+          ...musicalFields(p),
         };
         if (activeRecordingProject) {
           // A REAPER project is open: autosave rewrites its .rpp in place
           // (media already consolidated in records/<name>/).
           const sr = Number(project.clips.find((c: any) => c?.sampleRate)?.sampleRate) || 48000;
           writeRppDebounced(activeRecordingProject,
-            timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => path.basename(String(c.file || ''))));
+            timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => path.basename(String(c.file || '')), project));
           pushTimelineToEngine(activeRecordingProject, project);
         } else {
           saveProjectDebounced(name, project);
@@ -1525,7 +1997,7 @@ wss.on('connection', (ws) => {
         });
       } else if (data.type === 'start_multitrack_record') {
         const armed: number[] = Array.isArray(data.armed) ? data.armed : [];
-        const err = startTake(armed);
+        const err = startTake(armed, Number(data.countinFrames) || 0);
         if (err) ws.send(JSON.stringify({ type: 'take_failed', reason: err }));
       } else if (data.type === 'stop_multitrack_record') {
         stopTake();
@@ -1578,6 +2050,45 @@ wss.on('connection', (ws) => {
           dest: data.dest === 'master' || data.dest === 'both' ? data.dest : 'monitor',
         };
         if (engineSocket) engineSocket.write(JSON.stringify({ type: 'set_metronome', ...lastMetronome }) + '\n');
+      } else if (data.type === 'set_automation_state') {
+        activeAutomation = coerceAutoLanes(data.lanes);
+        automationMode = data.mode === 'read' || data.mode === 'write' ? data.mode : 'off';
+        autoLastEmit.clear();
+      } else if (data.type === 'list_project_videos') {
+        ws.send(JSON.stringify({ type: 'project_videos', name: activeProjectName, videos: listProjectVideos(activeProjectName) }));
+      } else if (data.type === 'list_playlists') {
+        ws.send(JSON.stringify({ type: 'playlists_list', playlists: listPlaylists() }));
+      } else if (data.type === 'load_playlist') {
+        ws.send(JSON.stringify({ type: 'playlist_data', playlist: loadPlaylist(String(data.name || '')) }));
+      } else if (data.type === 'new_playlist') {
+        const pl: Playlist = { name: sanitizeProjectName(data.name), segments: [] };
+        savePlaylist(pl);
+        broadcastToClients(JSON.stringify({ type: 'playlists_list', playlists: listPlaylists() }));
+        broadcastToClients(JSON.stringify({ type: 'playlist_data', playlist: pl }));
+      } else if (data.type === 'save_playlist') {
+        const segs = Array.isArray(data.segments) ? data.segments
+          .filter((s: any) => s && typeof s.project === 'string')
+          .map((s: any) => ({ project: String(s.project), recProject: !!s.recProject, gapSec: Math.max(0, Number(s.gapSec) || 0) }))
+          : [];
+        const pl: Playlist = { name: sanitizeProjectName(data.name), segments: segs };
+        savePlaylist(pl);
+        broadcastToClients(JSON.stringify({ type: 'playlist_data', playlist: pl }));
+      } else if (data.type === 'playlist_transport') {
+        if (data.action === 'start') startPlaylist(String(data.name || ''), Number(data.fromIndex) || 0);
+        else stopPlaylist();
+      } else if (data.type === 'get_timecode_config') {
+        ws.send(JSON.stringify({ type: 'timecode_config_loaded', config: getTimecodeConfig() }));
+      } else if (data.type === 'set_timecode_config') {
+        // Phase 3d: persist + forward the four engine commands; replayed on
+        // engine reconnect like the metronome/timeline.
+        const num = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : undefined);
+        const cfg = writeTimecodeConfig({
+          source: data.source, fps: num(data.fps) as TcFps | undefined, df: data.df,
+          offsetFrames: num(data.offsetFrames), ltcGen: data.ltcGen,
+          ltcLevel: num(data.ltcLevel), mtcGen: data.mtcGen, ltcChase: data.ltcChase,
+        });
+        pushTimecodeToEngine(cfg);
+        broadcastToClients(JSON.stringify({ type: 'timecode_config_loaded', config: cfg }));
       } else if (data.type === 'list_bounces') {
         ws.send(JSON.stringify({ type: 'bounces_list', bounces: listBounces() }));
       } else if (data.type === 'get_clip_peaks') {
@@ -1640,6 +2151,11 @@ wss.on('connection', (ws) => {
           saveMixerState();
           console.log('Forwarding set_aux_send to IPC:', payloadStr);
         }
+        // Phase 5 — capture live moves onto armed automation lanes (WRITE).
+        if (data.type === 'set_fader' || data.type === 'set_pan' || data.type === 'set_plugin_param') {
+          maybeCaptureAutomation(data);
+        }
+        if (data.type === 'transport_stop') finishAutomationWrite();
         // Forward to engine
         if (engineSocket) {
           engineSocket.write(payloadStr + '\n');
@@ -1670,13 +2186,22 @@ let engineSocket: net.Socket | null = null;
 function handleTakeStarted(msg: any): boolean {
   if (!activeTakeDir) return false;
   try {
+    const tcCfg = getTimecodeConfig();
+    const sr = Number(msg.sampleRate) || lastSampleRate || 48000;
     fs.writeFileSync(path.join(activeTakeDir, 'take.json'), JSON.stringify({
       originFrame: Number(msg.originFrame) || 0,
-      sampleRate: Number(msg.sampleRate) || 48000,
+      sampleRate: sr,
       armed: Array.isArray(msg.armed) ? msg.armed : [],
       channels: 2,
       project: activeProjectName,
       startedAt: new Date().toISOString(),
+      // Phase 3d — PTP-locked wall clock + SMPTE at the take origin.
+      ptpWallClock: lastTodSec != null
+        ? `${Math.floor(lastTodSec / 3600).toString().padStart(2, '0')}:${Math.floor((lastTodSec % 3600) / 60).toString().padStart(2, '0')}:${(lastTodSec % 60).toFixed(3).padStart(6, '0')} UTC`
+        : null,
+      startTimecode: timecodeAt(tcCfg, sr, Number(msg.originFrame) || 0, lastTodSec),
+      timecodeFps: tcCfg.fps,
+      timecodeDropFrame: tcCfg.df,
     }, null, 2));
   } catch (e) {
     console.error('Could not write take.json', e);
@@ -1695,12 +2220,22 @@ function handleTakeFinished(msg: any): boolean {
   if (!takeDir) return false;
   const takeName = path.basename(takeDir);
 
+  // Loop-record pass tagging. A split closed pass `pendingLoopPassIndex`; the
+  // final pass (loop-record ended by a plain stop) is the current counter.
+  let loopPass = false, passIndex = 0;
+  if (pendingLoopPassIndex !== null) {
+    loopPass = true; passIndex = pendingLoopPassIndex; pendingLoopPassIndex = null;
+  } else if (loopRecordActive) {
+    loopPass = true; passIndex = loopRecordPass;
+  }
+  if (!splitArmed) resetLoopRecord();   // recording session over
+
   // A split: the current take just closed; reopen immediately with the same
   // channels so capture is continuous. The engine kept the transport rolling,
   // so this take's origin frame abuts the one that just finished.
   const reopenForSplit = () => {
     if (!splitArmed) return;
-    const err = startTake(splitArmed);
+    const err = startTake(splitArmed, 0, true);
     broadcastToClients(JSON.stringify(
       err ? { type: 'vsc_status', splitError: err } : { type: 'vsc_status', splitDone: true }));
   };
@@ -1752,9 +2287,10 @@ function handleTakeFinished(msg: any): boolean {
     let merged: DawProject = { clips: [], markers: [], trackHeights: {} };
     try {
       const base = rppToProject(parseRpp(fs.readFileSync(rppPath(recName), 'utf8')), recName);
-      merged = { clips: [...base.clips, ...clips], markers: base.markers, trackHeights: base.trackHeights };
+      merged = { clips: [...base.clips, ...clips], markers: base.markers, trackHeights: base.trackHeights,
+                 tempo: base.tempo, timeSig: base.timeSig };
       fs.writeFileSync(rppPath(recName), buildRpp(
-        timelineToRpp(merged.clips, merged.markers, merged.trackHeights, manifest.sampleRate, (x) => path.basename(String(x.file || ''))),
+        timelineToRpp(merged.clips, merged.markers, merged.trackHeights, manifest.sampleRate, (x) => path.basename(String(x.file || '')), merged),
       ));
     } catch (e) {
       console.error('handleTakeFinished: rpp rewrite failed', e);
@@ -1762,6 +2298,7 @@ function handleTakeFinished(msg: any): boolean {
 
     broadcastToClients(JSON.stringify({
       type: 'take_committed', project: recName, takeDir: recName, overrun: !!msg.overrun, clips,
+      loopPass, passIndex,
     }));
     pushTimelineToEngine(recName, merged);
     reopenForSplit();
@@ -1774,6 +2311,7 @@ function handleTakeFinished(msg: any): boolean {
     takeDir: takeName,
     overrun: !!msg.overrun,
     clips,
+    loopPass, passIndex,
   }));
   // The committed clips aren't in project.json yet (the UI persists them via
   // save_project), so fold them into the engine schedule now.
@@ -1880,6 +2418,7 @@ const ipcServer = net.createServer((socket) => {
     pushTimelineToEngine(activeProjectName);
     if (lastMetronome && engineSocket)
       engineSocket.write(JSON.stringify({ type: 'set_metronome', ...lastMetronome }) + '\n');
+    pushTimecodeToEngine(getTimecodeConfig());   // Phase 3d
     console.log('Routing re-applied after engine (re)connect');
   })();
 
@@ -1902,6 +2441,10 @@ const ipcServer = net.createServer((socket) => {
             maybeLogLoudness(parsed);              // Phase 3c: 1 Hz loudness CSV + ring
             maybePunch(parsed.transport);         // Phase 3e: auto drop-in/out + loop-record split
             maybeFinishBounce(parsed.transport);  // Phase 4: bounce done → report the file
+            maybeRunAutomation(parsed.transport); // Phase 5: play automation envelopes
+            maybeAdvancePlaylist(parsed.transport); // Phase 5: back-to-back playout
+            if (parsed.tc && typeof parsed.tc.tod === 'number') lastTodSec = parsed.tc.tod;
+            if (parsed.transport && typeof parsed.transport.sr === 'number') lastSampleRate = parsed.transport.sr;
           } else if (parsed.type === 'bounce_failed') {
             if (bounce.active) {
               bounce.active = false;
@@ -2084,6 +2627,9 @@ const TX_SOURCE_PLAN: TxSourceGroup[] = [
     map: [4 + i * 2, 5 + i * 2],
     enginePorts: [`bus_${AUX_BASE + i}_L`, `bus_${AUX_BASE + i}_R`],
   })),
+  // Mono SMPTE LTC carrier from the engine's timecode generator (plan Phase 3d
+  // follow-up). AES67_Sink playout channel AUX20 — see the widened bridge conf.
+  { key: 'ltc', defaultName: 'Deck LTC', map: [20], enginePorts: ['ltc_out'] },
 ];
 
 // sourceId: the daemon Source id this group currently owns (null = none). It's

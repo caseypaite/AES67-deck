@@ -14,12 +14,16 @@ server/mixer_state.json
 server/fx_racks.json
 server/vsc_config.json
 server/loudness_config.json
+server/timecode_config.json
 
 # Saved DAW scenes (user session data)
 scenes/*.json
 
 # DAW projects — arrangement JSON + recorded take audio (user session data)
 projects/
+
+# Playout playlists (user session data)
+playlists/
 
 # REAPER-compatible multitrack recording projects (.rpp + consolidated media)
 records/
@@ -29,6 +33,9 @@ logs/
 
 # Browser smoke test: run artifacts (browser lives in node_modules, already ignored)
 test/browser/.work/
+
+# Throwaway test rigs / experiments
+scratchpad/
 
 # Editor / OS
 .DS_Store

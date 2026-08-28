@@ -319,6 +319,7 @@ const FxPanelRow = ({
 export const LiveConsoleView = () => {
   const connectWebSocket = useMixerStore(state => state.connectWebSocket);
   const transportState = useMixerStore(state => state.transportState);
+  const ltcChaseLocked = useDawStore(state => state.ltcChaseLocked);
   const timecode = useDawStore(state => state.timecode);
   const recordingProjects = useDawStore(state => state.recordingProjects);
   const activeRecordingProject = useDawStore(state => state.activeRecordingProject);
@@ -518,13 +519,21 @@ export const LiveConsoleView = () => {
         <div className="flex items-center gap-6 bg-[#050608] px-6 py-1.5 rounded border border-gray-800 shadow-inner">
            <div className="font-mono text-lg text-green-500 tracking-widest">{timecode}</div>
            <div className="w-px h-5 bg-gray-700" />
-           <button onClick={() => toggleTransport('stop')} className="w-7 h-7 flex items-center justify-center bg-gray-800 rounded-sm hover:bg-gray-700 transition-colors">
+           {ltcChaseLocked && (
+             <div className="text-[10px] font-black tracking-widest text-emerald-400 px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-700" title="Chasing external LTC — the engine owns the transport">
+               CHASE
+             </div>
+           )}
+           <button onClick={() => toggleTransport('stop')} disabled={ltcChaseLocked}
+             className={`w-7 h-7 flex items-center justify-center bg-gray-800 rounded-sm transition-colors ${ltcChaseLocked ? 'opacity-40' : 'hover:bg-gray-700'}`}>
              <div className="w-2.5 h-2.5 bg-white" />
            </button>
-           <button onClick={() => toggleTransport('play')} className={`w-7 h-7 flex items-center justify-center rounded-sm transition-colors ${transportState === 'playing' ? 'bg-green-600 shadow-[0_0_10px_rgba(22,163,74,0.5)]' : 'bg-gray-800 hover:bg-gray-700'}`}>
+           <button onClick={() => toggleTransport('play')} disabled={ltcChaseLocked}
+             className={`w-7 h-7 flex items-center justify-center rounded-sm transition-colors ${ltcChaseLocked ? 'opacity-40 bg-gray-800' : transportState === 'playing' ? 'bg-green-600 shadow-[0_0_10px_rgba(22,163,74,0.5)]' : 'bg-gray-800 hover:bg-gray-700'}`}>
              <div className="w-0 h-0 border-t-[6px] border-t-transparent border-l-[10px] border-l-white border-b-[6px] border-b-transparent ml-0.5" />
            </button>
-           <button onClick={() => toggleTransport('record')} className={`w-7 h-7 flex items-center justify-center rounded-sm transition-colors ${transportState === 'recording' ? 'bg-red-600 animate-pulse shadow-[0_0_10px_rgba(220,38,38,0.5)]' : 'bg-gray-800 hover:bg-gray-700'}`}>
+           <button onClick={() => toggleTransport('record')} disabled={ltcChaseLocked}
+             className={`w-7 h-7 flex items-center justify-center rounded-sm transition-colors ${ltcChaseLocked ? 'opacity-40 bg-gray-800' : transportState === 'recording' ? 'bg-red-600 animate-pulse shadow-[0_0_10px_rgba(220,38,38,0.5)]' : 'bg-gray-800 hover:bg-gray-700'}`}>
              <div className="w-3 h-3 rounded-full bg-white" />
            </button>
         </div>
