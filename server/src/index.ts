@@ -1007,6 +1007,9 @@ function maybePunch(t: any): void {
 const bounce: { active: boolean; path: string; name: string; inSec: number; outSec: number; bits: number; prerollFrames: number } =
   { active: false, path: '', name: '', inSec: 0, outSec: 0, bits: 24, prerollFrames: 0 };
 
+// Phase 5 — last metronome config the UI set; replayed to the engine on reconnect.
+let lastMetronome: { enabled: boolean; bpm: number; sigNum: number; sigDen: number; dest: string } | null = null;
+
 // Drop `frames` of audio off the head of a PCM WAV (the bounce preroll) and fix
 // the RIFF / data chunk sizes. No-op if the layout isn't what we wrote.
 function trimWavHead(file: string, frames: number): void {
@@ -1564,6 +1567,17 @@ wss.on('connection', (ws) => {
         if (err) ws.send(JSON.stringify({ type: 'bounce_status', state: 'failed', error: err }));
       } else if (data.type === 'bounce_cancel') {
         cancelBounce();
+      } else if (data.type === 'set_metronome') {
+        // Phase 5: remember the click config + forward to the engine; replayed
+        // on engine reconnect like the timeline.
+        lastMetronome = {
+          enabled: !!data.enabled,
+          bpm: Number(data.bpm) || 120,
+          sigNum: Number(data.sigNum) || 4,
+          sigDen: Number(data.sigDen) || 4,
+          dest: data.dest === 'master' || data.dest === 'both' ? data.dest : 'monitor',
+        };
+        if (engineSocket) engineSocket.write(JSON.stringify({ type: 'set_metronome', ...lastMetronome }) + '\n');
       } else if (data.type === 'list_bounces') {
         ws.send(JSON.stringify({ type: 'bounces_list', bounces: listBounces() }));
       } else if (data.type === 'get_clip_peaks') {
@@ -1864,6 +1878,8 @@ const ipcServer = net.createServer((socket) => {
     // Replay the active project's timeline so playback works after an engine
     // restart, same self-heal contract as routing.
     pushTimelineToEngine(activeProjectName);
+    if (lastMetronome && engineSocket)
+      engineSocket.write(JSON.stringify({ type: 'set_metronome', ...lastMetronome }) + '\n');
     console.log('Routing re-applied after engine (re)connect');
   })();
 

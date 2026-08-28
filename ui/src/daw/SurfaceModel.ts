@@ -2,7 +2,7 @@
 // clip geometry, hit-tests in canvas space, and paints grid / lanes / clips /
 // waveforms / playhead. Reads the stores directly; owns no React state.
 
-import { useDawStore, type DawClip, type PeaksData, clipPeakKey } from '../stores/useDawStore';
+import { useDawStore, type DawClip, type PeaksData, clipPeakKey, musicalGrid, secToBBT } from '../stores/useDawStore';
 import { useMixerStore, type Channel } from '../stores/useMixerStore';
 
 export const RULER_H = 26;
@@ -312,11 +312,17 @@ export class SurfaceModel {
     const tStart = this.xToTime(0);
     const tEnd = this.xToTime(w);
 
-    // grid: minor at gridSize, major every 10
-    const gs = daw.gridSize;
-    let major = gs * 10;
-    while (major * pps < 60) major *= 2;      // keep majors readable when zoomed out
-    const minor = major / 10;
+    // grid — seconds (minor at gridSize, major every 10) or bars/beats
+    let minor: number, major: number;
+    if (daw.gridMode === 'bars') {
+      const { beat, bar } = musicalGrid(daw.tempo, daw.timeSig.num);
+      minor = beat; major = bar;
+      while (minor * pps < 7 && minor < major) minor *= 2;   // thin out beats when zoomed out
+    } else {
+      major = daw.gridSize * 10;
+      while (major * pps < 60) major *= 2;
+      minor = major / 10;
+    }
     ctx.lineWidth = 1;
     for (let t = Math.floor(tStart / minor) * minor; t < tEnd; t += minor) {
       const x = Math.round(this.timeToX(t)) + 0.5;
@@ -732,13 +738,17 @@ export class SurfaceModel {
     ctx.strokeStyle = 'rgba(0,0,0,0.6)';
     ctx.beginPath(); ctx.moveTo(0, RULER_H - 0.5); ctx.lineTo(w, RULER_H - 0.5); ctx.stroke();
 
+    const daw = useDawStore.getState();
+    const bars = daw.gridMode === 'bars';
+    const label = (t: number) => bars ? `${secToBBT(t, daw.tempo, daw.timeSig.num).bar}` : fmtRuler(t);
+
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.font = '10px ui-monospace, monospace';
     for (let t = Math.floor(tStart / major) * major; t < tEnd; t += major) {
       const x = this.timeToX(t);
       ctx.strokeStyle = 'rgba(255,255,255,0.25)';
       ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H - 8); ctx.lineTo(x + 0.5, RULER_H); ctx.stroke();
-      ctx.fillText(fmtRuler(t), x + 3, 11);
+      ctx.fillText(label(t), x + 3, 11);
     }
     ctx.strokeStyle = 'rgba(255,255,255,0.12)';
     for (let t = Math.floor(tStart / minor) * minor; t < tEnd; t += minor) {

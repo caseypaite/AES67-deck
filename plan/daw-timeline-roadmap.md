@@ -366,7 +366,19 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
 
 ## Phase 5 — Optional / later
 
-- Bars+beats grid + tempo map + metronome (D3). Musical snap alongside timecode.
+- **Bars+beats + metronome — first cut DONE 2026-08-28.** A single project
+  `tempo` + `timeSig` (full tempo map deferred). `gridMode` toggles the ruler +
+  grid + snap between seconds and musical time (`snapTime`, `musicalGrid`,
+  `secToBBT`/`formatBBT`); the transport readout follows. Engine metronome:
+  `set_metronome` IPC → a cos-burst click on each beat while rolling (downbeat
+  1760 Hz / off-beat 1245 Hz), summed post-fader onto the monitor bus, master,
+  or both (`metroDest`). Server remembers the config + replays on engine
+  reconnect; UI re-sends on ws open. Taskbar: `TIME/BARS`, `♩` tempo, time-sig,
+  `METRO`, dest toggle. Verified end to end with the real engine
+  (`scratchpad/metro-test.mjs`, 8/8 — bounced click track: 8 beats/4 s at
+  120 bpm, correct downbeat pitch). **Still to do**: tempo *map* (ramps /
+  changes), count-in, `beatDiv` UI (state exists), musical-snap for nudge keys,
+  persist tempo in the project (currently localStorage).
 - Video track / reference video scrub for post work.
 - Automation lanes for fader/pan/plugin params tied to transport (turns the
   console into a mixing-with-automation surface, big scope).

@@ -118,6 +118,16 @@ interface DawState {
   gridSize: number;               // seconds
   rippleEdit: boolean;            // Phase 4 — delete/paste close/open the gap after
 
+  // Phase 5 — bars/beats. A single project tempo + time signature (a full
+  // tempo map can come later). gridMode switches the ruler + snap between
+  // seconds and musical time; beatDiv is the musical snap subdivision.
+  tempo: number;                  // BPM
+  timeSig: { num: number; den: number };
+  gridMode: 'time' | 'bars';
+  beatDiv: number;                // 1 = beat, 2 = 1/8, 4 = 1/16 (in 4/4 terms)
+  metronomeOn: boolean;           // engine click while rolling (session state)
+  metroDest: 'monitor' | 'master' | 'both';
+
   fps: number;                    // timecode frame rate (25 | 30)
   timecode: string;               // hh:mm:ss:ff derived from the playhead — toolbar readout
 
@@ -135,6 +145,15 @@ interface DawState {
   setSnapToGrid: (snap: boolean) => void;
   setGridSize: (size: number) => void;
   setFps: (fps: number) => void;
+
+  // Phase 5 — bars/beats + metronome.
+  setTempo: (bpm: number) => void;
+  setTimeSig: (num: number, den: number) => void;
+  setGridMode: (mode: 'time' | 'bars') => void;
+  setBeatDiv: (div: number) => void;
+  setMetronomeOn: (on: boolean) => void;
+  setMetroDest: (dest: 'monitor' | 'master' | 'both') => void;
+  snapTime: (sec: number) => number;   // musical or time snap, per gridMode/snapToGrid
 
   applyTransport: (frame: number, state: number, sr: number) => void;
   flagPlaybackUnderrun: () => void;
@@ -234,6 +253,37 @@ let applyingRemote = false;
 // a stale entry (lost response, socket race) is retried after RETRY_MS.
 const requestedPeaks = new Map<string, number>();
 const PEAK_RETRY_MS = 4000;
+
+// --- Phase 5: bars / beats helpers ---
+export function beatSec(tempo: number): number { return 60 / Math.max(1, tempo); }
+export function musicalGrid(tempo: number, sigNum: number): { beat: number; bar: number } {
+  const beat = beatSec(tempo);
+  return { beat, bar: beat * Math.max(1, sigNum) };
+}
+// 1-indexed bar / beat + 0..959 tick for a ruler label (REAPER-style).
+export function secToBBT(sec: number, tempo: number, sigNum: number): { bar: number; beat: number; tick: number } {
+  const beat = beatSec(tempo);
+  const totalBeats = Math.max(0, sec) / beat;
+  const n = Math.max(1, sigNum);
+  return {
+    bar: Math.floor(totalBeats / n) + 1,
+    beat: Math.floor(totalBeats % n) + 1,
+    tick: Math.round((totalBeats % 1) * 960),
+  };
+}
+export function formatBBT(sec: number, tempo: number, sigNum: number): string {
+  const { bar, beat, tick } = secToBBT(sec, tempo, sigNum);
+  return `${bar}.${beat}.${String(tick).padStart(3, '0')}`;
+}
+
+function pushMetronome(s: { metronomeOn: boolean; tempo: number; timeSig: { num: number; den: number }; metroDest: string }) {
+  wsSend({ type: 'set_metronome', enabled: s.metronomeOn, bpm: s.tempo, sigNum: s.timeSig.num, sigDen: s.timeSig.den, dest: s.metroDest });
+}
+
+// The transport readout string — timecode or bars/beats, per gridMode.
+function fmtPlayhead(s: { gridMode: 'time' | 'bars'; tempo: number; timeSig: { num: number }; fps: number }, sec: number): string {
+  return s.gridMode === 'bars' ? formatBBT(sec, s.tempo, s.timeSig.num) : formatTimecode(sec, s.fps);
+}
 
 export function formatTimecode(sec: number, fps: number): string {
   const s = Math.max(0, sec);
@@ -390,6 +440,12 @@ export const useDawStore = create<DawState>()(
       snapToGrid: true,
       gridSize: 1.0,
       rippleEdit: false,
+      tempo: 120,
+      timeSig: { num: 4, den: 4 },
+      gridMode: 'time',
+      beatDiv: 1,
+      metronomeOn: false,
+      metroDest: 'monitor',
       fps: 30,
       timecode: '00:00:00:00',
 
@@ -585,12 +641,12 @@ export const useDawStore = create<DawState>()(
       setPlayheadPosition: (pos) => set({ playheadPosition: Math.max(0, pos) }),
 
       locate: (sec) => {
-        const s = Math.max(0, sec);
+        const p = Math.max(0, sec);
         set({
-          playheadPosition: s, _engineSec: s, _engineWall: performance.now(),
-          playbackUnderrun: false, timecode: formatTimecode(s, get().fps),
+          playheadPosition: p, _engineSec: p, _engineWall: performance.now(),
+          playbackUnderrun: false, timecode: fmtPlayhead(get(), p),
         });
-        wsSend({ type: 'transport_locate', frame: Math.round(s * get().sampleRate) });
+        wsSend({ type: 'transport_locate', frame: Math.round(p * get().sampleRate) });
       },
 
       tickPlayhead: () => {
@@ -598,14 +654,48 @@ export const useDawStore = create<DawState>()(
         if (s.engineState === 0) return;
         const next = s._engineSec + (performance.now() - s._engineWall) / 1000;
         if (Math.abs(next - s.playheadPosition) > 0.0005) {
-          set({ playheadPosition: next, timecode: formatTimecode(next, s.fps) });
+          set({ playheadPosition: next, timecode: fmtPlayhead(s, next) });
         }
       },
 
       setRecordStartTime: (time) => set({ recordStartTime: time }),
       setSnapToGrid: (snap) => set({ snapToGrid: snap }),
       setGridSize: (size) => set({ gridSize: size }),
-      setFps: (fps) => set({ fps, timecode: formatTimecode(get().playheadPosition, fps) }),
+
+      // --- Phase 5: bars/beats + metronome ---
+      setTempo: (bpm) => {
+        const t = Math.max(20, Math.min(300, Math.round(bpm) || 120));
+        set({ tempo: t, timecode: fmtPlayhead({ ...get(), tempo: t }, get().playheadPosition) });
+        pushMetronome({ ...get(), tempo: t });
+        scheduleSave();
+      },
+      setTimeSig: (num, den) => {
+        const n = Math.max(1, Math.min(16, Math.round(num) || 4));
+        const d = [1, 2, 4, 8, 16].includes(den) ? den : 4;
+        const timeSig = { num: n, den: d };
+        set({ timeSig, timecode: fmtPlayhead({ ...get(), timeSig }, get().playheadPosition) });
+        pushMetronome({ ...get(), timeSig });
+        scheduleSave();
+      },
+      setGridMode: (mode) => {
+        const gridMode = mode === 'bars' ? 'bars' : 'time';
+        set({ gridMode, timecode: fmtPlayhead({ ...get(), gridMode }, get().playheadPosition) });
+        scheduleSave();
+      },
+      setBeatDiv: (div) => set({ beatDiv: [1, 2, 4].includes(div) ? div : 1 }),
+      setMetronomeOn: (on) => { set({ metronomeOn: !!on }); pushMetronome({ ...get(), metronomeOn: !!on }); },
+      setMetroDest: (dest) => {
+        const d = dest === 'master' || dest === 'both' ? dest : 'monitor';
+        set({ metroDest: d });
+        pushMetronome({ ...get(), metroDest: d });
+      },
+      snapTime: (sec) => {
+        const s = get();
+        if (!s.snapToGrid) return sec;
+        const step = s.gridMode === 'bars' ? beatSec(s.tempo) / Math.max(1, s.beatDiv) : s.gridSize;
+        return step > 0 ? Math.round(sec / step) * step : sec;
+      },
+      setFps: (fps) => set({ fps, timecode: fmtPlayhead({ ...get(), fps }, get().playheadPosition) }),
 
       applyTransport: (frame, state, sr) => {
         const s = get();
@@ -647,7 +737,7 @@ export const useDawStore = create<DawState>()(
           _engineWall: performance.now(),
           ...(clips !== s.clips ? { clips } : {}),
           // When stopped, snap exactly; while rolling, tickPlayhead interpolates.
-          ...(st === 0 ? { playheadPosition: sec, timecode: formatTimecode(sec, s.fps) } : {}),
+          ...(st === 0 ? { playheadPosition: sec, timecode: fmtPlayhead(s, sec) } : {}),
         });
       },
 
@@ -1096,6 +1186,11 @@ export const useDawStore = create<DawState>()(
         snapToGrid: s.snapToGrid,
         gridSize: s.gridSize,
         rippleEdit: s.rippleEdit,
+        tempo: s.tempo,
+        timeSig: s.timeSig,
+        gridMode: s.gridMode,
+        beatDiv: s.beatDiv,
+        metroDest: s.metroDest,
         fps: s.fps,
         cuesOpen: s.cuesOpen,
         loudnessOpen: s.loudnessOpen,
