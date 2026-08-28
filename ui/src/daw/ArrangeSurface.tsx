@@ -14,29 +14,35 @@ interface RenameState { x: number; y: number; w: number; clipId: string; value: 
 
 export function ArrangeSurface() {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);       // scene (repaints on edit)
+  const overlayRef = useRef<HTMLCanvasElement>(null);      // playhead (repaints per frame while rolling)
   const modelRef = useRef<SurfaceModel | null>(null);
   const dirtyRef = useRef(true);
+  const overlayDirtyRef = useRef(true);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [rename, setRename] = useState<RenameState | null>(null);
 
   if (!modelRef.current) modelRef.current = new SurfaceModel();
   const model = modelRef.current;
+  if (import.meta.env.DEV) (window as unknown as { __arrangeModel?: SurfaceModel }).__arrangeModel = model;
 
   // --- sizing (DPR-aware) ---
   useEffect(() => {
     const wrap = wrapRef.current!;
-    const canvas = canvasRef.current!;
     const resize = () => {
       const r = wrap.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.round(r.width * dpr);
-      canvas.height = Math.round(r.height * dpr);
-      canvas.style.width = `${r.width}px`;
-      canvas.style.height = `${r.height}px`;
+      for (const canvas of [canvasRef.current, overlayRef.current]) {
+        if (!canvas) continue;
+        canvas.width = Math.round(r.width * dpr);
+        canvas.height = Math.round(r.height * dpr);
+        canvas.style.width = `${r.width}px`;
+        canvas.style.height = `${r.height}px`;
+      }
       model.width = r.width;
       model.height = r.height;
       dirtyRef.current = true;
+      overlayDirtyRef.current = true;
     };
     resize();
     const ro = new ResizeObserver(resize);
@@ -46,30 +52,56 @@ export function ArrangeSurface() {
 
   // --- render loop (the only rAF loop in the timeline) ---
   useEffect(() => {
-    const canvas = canvasRef.current!;
-    const ctx = canvas.getContext('2d')!;
+    const sceneCtx = canvasRef.current!.getContext('2d')!;
+    const overlayCtx = overlayRef.current!.getContext('2d')!;
     let raf = 0;
     const frame = () => {
-      const rolling = useMixerStore.getState().transportState !== 'stopped';
+      const mix = useMixerStore.getState();
+      const rolling = mix.transportState !== 'stopped';
+      // Live-take placeholders pulse + their waveform grows, so keep the scene
+      // repainting during a recording; plain playback only moves the playhead.
+      const busy = mix.transportState === 'recording'
+        || Object.keys(useDawStore.getState().recordingClips).length > 0;
       if (rolling) useDawStore.getState().tickPlayhead(); // interpolate engine clock
-      if (dirtyRef.current || rolling) {
-        const dpr = window.devicePixelRatio || 1;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        model.draw(ctx);
+      const dpr = window.devicePixelRatio || 1;
+      if (dirtyRef.current || busy) {
+        sceneCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        model.draw(sceneCtx);
         dirtyRef.current = false;
+        overlayDirtyRef.current = true;
+      }
+      if (overlayDirtyRef.current || rolling) {
+        overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        model.drawOverlay(overlayCtx);
+        overlayDirtyRef.current = false;
       }
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
-    // Any DAW-store change (clips, selection, scroll, zoom, playhead, peaks,
-    // marquee, drag target) flags a repaint.
-    const unsub = useDawStore.subscribe(() => { dirtyRef.current = true; });
+
+    // A store change flags a scene repaint — but ignore playhead-only ticks
+    // (those just move the overlay), so steady-state playback stays cheap.
+    const sceneSig = () => {
+      const s = useDawStore.getState();
+      return [
+        s.clips, s.markers, s.trackHeights, s.laneExpand, s.selectedClipIds,
+        s.region, s.loopEnabled, s.punchEnabled, s.scrollX, s.scrollY, s.zoom,
+        s.marquee, s.dragOverTrackId, s.dragOverLane, s.compPreview, s.peaks,
+        s.snapToGrid, s.gridSize, s.fps, s.recordingClips, s.livePeaks,
+      ];
+    };
+    let prevSig = sceneSig();
+    const unsub = useDawStore.subscribe(() => {
+      const sig = sceneSig();
+      if (sig.some((v, i) => v !== prevSig[i])) dirtyRef.current = true;
+      prevSig = sig;
+    });
     return () => { cancelAnimationFrame(raf); unsub(); };
   }, [model]);
 
   // --- pointer interaction ---
   useEffect(() => {
-    const canvas = canvasRef.current!;
+    const canvas = overlayRef.current!;   // top-most; receives the events
     const daw = useDawStore;
 
     const snap = (t: number) => {
@@ -393,6 +425,7 @@ export function ArrangeSurface() {
   return (
     <div ref={wrapRef} className="flex-1 relative overflow-hidden bg-[#16181d]">
       <canvas ref={canvasRef} className="absolute inset-0 block" />
+      <canvas ref={overlayRef} className="absolute inset-0 block" />
       <div className="pointer-events-none absolute left-0 right-0 top-0" style={{ height: RULER_H }} />
 
       {menu && menuClip && (
