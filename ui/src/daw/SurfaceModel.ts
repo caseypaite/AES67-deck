@@ -19,7 +19,8 @@ export interface HitResult {
   kind:
     | 'clip' | 'clip-left' | 'clip-right'
     | 'clip-fade-in' | 'clip-fade-out' | 'clip-gain'
-    | 'lane' | 'ruler' | 'marker' | 'empty';
+    | 'lane' | 'ruler' | 'marker' | 'empty'
+    | 'region-in' | 'region-out' | 'region-body';
   clipId?: string;
   trackId?: number;
   markerId?: string;
@@ -133,6 +134,15 @@ export class SurfaceModel {
   hitTest(px: number, py: number): HitResult {
     const time = Math.max(0, this.xToTime(px));
     if (py < RULER_H) {
+      // Region handles sit in the top band of the ruler (above the marker heads).
+      const region = useDawStore.getState().region;
+      if (region && py < RULER_H - 12) {
+        const rx0 = this.timeToX(region.inSec);
+        const rx1 = this.timeToX(region.outSec);
+        if (Math.abs(px - rx0) <= 6) return { kind: 'region-in', time, cursor: 'ew-resize' };
+        if (Math.abs(px - rx1) <= 6) return { kind: 'region-out', time, cursor: 'ew-resize' };
+        if (px > rx0 && px < rx1) return { kind: 'region-body', time, cursor: 'grab' };
+      }
       // Marker heads sit in the bottom half of the ruler.
       if (py >= RULER_H - 12) {
         const markers = Object.values(useDawStore.getState().markers);
@@ -240,6 +250,7 @@ export class SurfaceModel {
       ctx.strokeRect(rx + 0.5, ry + 0.5, rw, rh);
     }
 
+    this.drawRegion(ctx);
     this.drawMarkerLines(ctx);
     this.drawRuler(ctx, tStart, tEnd, major, minor);
 
@@ -527,6 +538,39 @@ export class SurfaceModel {
         ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
         ctx.fillText(m.name, x + 11, RULER_H - 4);
       }
+    }
+  }
+
+  // Phase 3e — the shared loop / punch region: a tinted span across the lanes
+  // plus a band with drag handles in the ruler. Colour follows what it drives.
+  private drawRegion(ctx: CanvasRenderingContext2D) {
+    const s = useDawStore.getState();
+    if (!s.region) return;
+    const x0 = this.timeToX(s.region.inSec);
+    const x1 = this.timeToX(s.region.outSec);
+    if (x1 < 0 || x0 > this.width) return;
+    const w = Math.max(1, x1 - x0);
+
+    // punch (recording) wins the colour; else loop; else a neutral selection.
+    const c = s.punchEnabled ? [239, 68, 68] : s.loopEnabled ? [56, 189, 219] : [148, 163, 184];
+    const rgb = (a: number) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+    ctx.fillStyle = rgb(s.punchEnabled || s.loopEnabled ? 0.09 : 0.05);
+    ctx.fillRect(x0, RULER_H, w, this.height - RULER_H);
+    ctx.strokeStyle = rgb(0.5);
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0 + 0.5, RULER_H); ctx.lineTo(x0 + 0.5, this.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x1 - 0.5, RULER_H); ctx.lineTo(x1 - 0.5, this.height); ctx.stroke();
+
+    // ruler band + end caps
+    ctx.fillStyle = rgb(s.punchEnabled || s.loopEnabled ? 0.85 : 0.4);
+    ctx.fillRect(x0, 0, w, 4);
+    ctx.fillRect(x0, 0, 3, RULER_H - 12);
+    ctx.fillRect(x1 - 3, 0, 3, RULER_H - 12);
+    if (s.punchEnabled || s.loopEnabled) {
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.font = '8px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(s.punchEnabled ? 'PUNCH' : 'LOOP', x0 + 5, 12);
     }
   }
 

@@ -273,19 +273,37 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
 - **MTC** over a virtual MIDI port for DAWs/lighting.
 - **Chase external LTC** on an input (decode → drive `transport_locate`).
 
-### 3e. Punch & pre-roll
+### 3e. Punch & pre-roll — DONE 2026-08-28
 
-- In/out points, auto-punch on armed tracks, pre-roll seconds, loop-record
-  takes into lanes (feeds Phase 4 comping).
+- [x] **One shared loop/punch region** (a time selection) — `useDawStore`
+  `region` / `loopEnabled` / `punchEnabled` / `preRollSec`, drawn as a band on
+  the ruler + a lane tint (`SurfaceModel.drawRegion`), Alt-drag the ruler to
+  create, drag the in/out handles. Persisted in `project.json` (the server's
+  `DawProject.loop` slot) and localStorage.
+- [x] **Loop** — the engine's `transport_set_loop` (dead code until now) is
+  wired; the region drives it, wrap already handled in the process callback.
+- [x] **Engine** — `Transport` punch fields + `transport_set_punch` IPC;
+  `loopOn/In/Out` + `punchOn/In/Out` echoed on the metering `transport` key.
+- [x] **Server-timed auto-punch** (`maybePunch` in the IPC metering handler):
+  crosses the in-point with armed tracks → `startTake`; crosses the out-point
+  → `stopTake`. Metering-rate accuracy (~±25 ms) — fine for broadcast with
+  pre-roll; sample-accurate would need engine file-open-ahead.
+- [x] **Pre-roll** — `toggleTransport` locates `preRollSec` before the
+  in-point and rolls; the take still opens only at the in-point.
+- [x] **Loop-record** — a loop wrap while a take is open → `maybePunch`
+  triggers the existing VSC split, one take per pass. Comping lanes to stack
+  them are Phase 4.
 
 ---
 
 ## Phase 4 — Editing polish
 
-- **Undo/redo** — command stack in `useDawStore` (zundo middleware or a manual
-  ring); every clip mutation goes through a command. The store is already
-  action-oriented (`addClip`/`updateClip`/`removeClip`/`sliceSelectedAtPlayhead`
-  `useDawStore.ts:81-141`), so this is a wrapping pass, not a rewrite.
+- **Undo/redo — DONE 2026-08-28.** Manual snapshot stack in `useDawStore`
+  (`{clips, markers, trackHeights}`, cap 60) with 250 ms time-coalescing so a
+  pointer gesture = one step; `pushHistory()` at the head of every mutator,
+  `undo` / `redo` / `historyBegin` / `historyEnd`, `canUndo` / `canRedo` for
+  the toolbar, `Ctrl/⌘+Z` · `Ctrl+Shift+Z` · `Ctrl+Y`. Cleared on project
+  load. Region / transport modes are excluded by design.
 - **Crossfades** — overlap two clips → equal-power crossfade region, rendered by
   the playback voice envelope (2a).
 - **Take comping** — stacked lanes per track, swipe-to-select the active take,

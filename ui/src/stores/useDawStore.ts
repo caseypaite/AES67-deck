@@ -81,6 +81,13 @@ interface DawState {
   cuesOpen: boolean;
   loudnessOpen: boolean;
 
+  // Phase 3e — one shared loop / punch region (a time selection). Persisted
+  // in the project (server DawProject.loop) and localStorage.
+  region: { inSec: number; outSec: number } | null;
+  loopEnabled: boolean;
+  punchEnabled: boolean;
+  preRollSec: number;
+
   selectedClipIds: string[];
   clipboard: DawClip[];
 
@@ -119,6 +126,22 @@ interface DawState {
 
   setCuesOpen: (v: boolean) => void;
   setLoudnessOpen: (v: boolean) => void;
+
+  // Phase 3e — region + transport modes (each syncs the engine loop/punch).
+  setRegion: (inSec: number, outSec: number) => void;
+  clearRegion: () => void;
+  setLoopEnabled: (v: boolean) => void;
+  setPunchEnabled: (v: boolean) => void;
+  setPreRoll: (sec: number) => void;
+  reassertRegionToEngine: (engineLoopOn: boolean, enginePunchOn: boolean) => void;
+
+  // Phase 4 — undo / redo over clip + marker + track-layout edits.
+  canUndo: boolean;
+  canRedo: boolean;
+  undo: () => void;
+  redo: () => void;
+  historyBegin: () => void;   // open a coalescing txn (a pointer gesture)
+  historyEnd: () => void;
 
   beginRecordingClips: (armed: number[], originSec: number, sr: number) => void;
   pushRecPeaks: (byTrack: Record<string, number[]>) => void;
@@ -188,6 +211,10 @@ function serializeProject(s: DawState) {
     clips: Object.values(s.clips).filter((c) => !c.recording),
     markers: Object.values(s.markers),
     trackHeights: s.trackHeights,
+    // Rides the server's DawProject.loop slot (pass-through); extra keys survive.
+    loop: s.region
+      ? { start: s.region.inSec, end: s.region.outSec, loop: s.loopEnabled, punch: s.punchEnabled, preRoll: s.preRollSec }
+      : null,
   };
 }
 
@@ -198,6 +225,54 @@ function scheduleSave() {
     const s = useDawStore.getState();
     wsSend({ type: 'save_project', name: s.projectName, project: serializeProject(s) });
   }, 500);
+}
+
+// --- Phase 3e: push the region to the engine as loop + punch ------------
+function syncRegionToEngine(s: Pick<DawState, 'region' | 'loopEnabled' | 'punchEnabled' | 'sampleRate'>) {
+  const sr = s.sampleRate > 0 ? s.sampleRate : 48000;
+  const start = s.region ? Math.round(s.region.inSec * sr) : 0;
+  const end = s.region ? Math.round(s.region.outSec * sr) : 0;
+  wsSend({ type: 'transport_set_loop', start, end, enabled: !!s.region && s.loopEnabled });
+  wsSend({ type: 'transport_set_punch', start, end, enabled: !!s.region && s.punchEnabled });
+}
+
+// --- Phase 4: undo / redo -----------------------------------------------
+// Snapshot the editable arrangement (clips + markers + track layout). Region
+// and transport modes are deliberately excluded — they're transport settings,
+// not arrangement edits.
+type HistSnap = {
+  clips: Record<string, DawClip>;
+  markers: Record<string, DawMarker>;
+  trackHeights: Record<number, number>;
+};
+const HIST_CAP = 60;
+const HIST_COALESCE_MS = 250;
+let undoStack: HistSnap[] = [];
+let redoStack: HistSnap[] = [];
+let lastSnapMs = 0;
+let txnDepth = 0;
+
+function histSnap(s: DawState): HistSnap {
+  return { clips: s.clips, markers: s.markers, trackHeights: s.trackHeights };
+}
+function clearHistory() {
+  undoStack = [];
+  redoStack = [];
+  lastSnapMs = 0;
+  txnDepth = 0;
+  useDawStore.setState({ canUndo: false, canRedo: false });
+}
+// Called at the START of every arrangement mutator, before it changes state.
+function pushHistory(force = false) {
+  if (applyingRemote) return;
+  const now = Date.now();
+  if (!force && txnDepth > 0) return;                 // the open txn already snapshotted
+  if (!force && now - lastSnapMs < HIST_COALESCE_MS) return; // fold rapid edits (a drag) into one
+  lastSnapMs = now;
+  undoStack.push(histSnap(useDawStore.getState()));
+  if (undoStack.length > HIST_CAP) undoStack.shift();
+  redoStack = [];
+  useDawStore.setState({ canUndo: true, canRedo: false });
 }
 
 function toRecord<T extends { id: string }>(arr: unknown): Record<string, T> {
@@ -242,6 +317,13 @@ export const useDawStore = create<DawState>()(
       cuesOpen: false,
       loudnessOpen: false,
 
+      region: null,
+      loopEnabled: false,
+      punchEnabled: false,
+      preRollSec: 0,
+      canUndo: false,
+      canRedo: false,
+
       selectedClipIds: [],
       clipboard: [],
 
@@ -265,6 +347,52 @@ export const useDawStore = create<DawState>()(
 
       setCuesOpen: (v) => set({ cuesOpen: v }),
       setLoudnessOpen: (v) => set({ loudnessOpen: v }),
+
+      // --- Phase 3e: region + transport modes ---
+      setRegion: (inSec, outSec) => {
+        const a = Math.max(0, Math.min(inSec, outSec));
+        const b = Math.max(a + 0.01, Math.max(inSec, outSec));
+        set({ region: { inSec: a, outSec: b } });
+        syncRegionToEngine(get());
+        scheduleSave();
+      },
+      clearRegion: () => {
+        set({ region: null, loopEnabled: false, punchEnabled: false });
+        syncRegionToEngine(get());
+        scheduleSave();
+      },
+      setLoopEnabled: (v) => { set({ loopEnabled: v }); syncRegionToEngine(get()); scheduleSave(); },
+      setPunchEnabled: (v) => { set({ punchEnabled: v }); syncRegionToEngine(get()); scheduleSave(); },
+      setPreRoll: (sec) => { set({ preRollSec: Math.max(0, Math.min(30, sec)) }); scheduleSave(); },
+      reassertRegionToEngine: (engineLoopOn, enginePunchOn) => {
+        const s = get();
+        const want = { loop: !!s.region && s.loopEnabled, punch: !!s.region && s.punchEnabled };
+        if (want.loop !== engineLoopOn || want.punch !== enginePunchOn) syncRegionToEngine(s);
+      },
+
+      // --- Phase 4: undo / redo ---
+      historyBegin: () => { if (txnDepth === 0) pushHistory(true); txnDepth += 1; },
+      historyEnd: () => { txnDepth = Math.max(0, txnDepth - 1); },
+      undo: () => {
+        if (!undoStack.length) return;
+        const s = get();
+        redoStack.push(histSnap(s));
+        const prev = undoStack.pop() as HistSnap;
+        applyingRemote = true;
+        set({ ...prev, selectedClipIds: [], canUndo: undoStack.length > 0, canRedo: true });
+        applyingRemote = false;
+        scheduleSave();
+      },
+      redo: () => {
+        if (!redoStack.length) return;
+        const s = get();
+        undoStack.push(histSnap(s));
+        const next = redoStack.pop() as HistSnap;
+        applyingRemote = true;
+        set({ ...next, selectedClipIds: [], canUndo: true, canRedo: redoStack.length > 0 });
+        applyingRemote = false;
+        scheduleSave();
+      },
 
       setPeaks: (key, data) => {
         requestedPeaks.delete(key);
@@ -393,10 +521,12 @@ export const useDawStore = create<DawState>()(
       },
 
       addClip: (clip) => {
+        pushHistory();
         set((state) => ({ clips: { ...state.clips, [clip.id]: clip } }));
         scheduleSave();
       },
       updateClip: (id, updates) => {
+        pushHistory();
         set((state) => {
           const clip = state.clips[id];
           if (!clip) return state;
@@ -405,6 +535,7 @@ export const useDawStore = create<DawState>()(
         scheduleSave();
       },
       removeClip: (id) => {
+        pushHistory();
         set((state) => {
           const nextClips = { ...state.clips };
           delete nextClips[id];
@@ -414,11 +545,13 @@ export const useDawStore = create<DawState>()(
       },
 
       addMarker: (time, name) => {
+        pushHistory();
         const m: DawMarker = { id: uuid(), time: Math.max(0, time), name: name || 'Marker' };
         set((state) => ({ markers: { ...state.markers, [m.id]: m } }));
         scheduleSave();
       },
       updateMarker: (id, updates) => {
+        pushHistory();
         set((state) => {
           const m = state.markers[id];
           if (!m) return state;
@@ -427,6 +560,7 @@ export const useDawStore = create<DawState>()(
         scheduleSave();
       },
       removeMarker: (id) => {
+        pushHistory();
         set((state) => {
           const next = { ...state.markers };
           delete next[id];
@@ -445,6 +579,7 @@ export const useDawStore = create<DawState>()(
       clearSelection: () => set({ selectedClipIds: [] }),
 
       deleteSelected: () => {
+        pushHistory();
         set((state) => {
           const nextClips = { ...state.clips };
           state.selectedClipIds.forEach((id) => delete nextClips[id]);
@@ -454,6 +589,7 @@ export const useDawStore = create<DawState>()(
       },
 
       sliceSelectedAtPlayhead: () => {
+        pushHistory();
         set((state) => {
           const nextClips = { ...state.clips };
           const newSelection = [...state.selectedClipIds];
@@ -486,6 +622,7 @@ export const useDawStore = create<DawState>()(
       },
 
       splitClipAt: (clipId, time) => {
+        pushHistory();
         set((state) => {
           const clip = state.clips[clipId];
           if (!clip || time <= clip.start + 0.01 || time >= clip.start + clip.length - 0.01) return state;
@@ -508,6 +645,7 @@ export const useDawStore = create<DawState>()(
       },
 
       renameClip: (id, name) => {
+        pushHistory();
         set((state) => {
           const c = state.clips[id];
           if (!c) return state;
@@ -517,6 +655,7 @@ export const useDawStore = create<DawState>()(
       },
 
       setClipFade: (id, edge, seconds) => {
+        pushHistory();
         set((state) => {
           const c = state.clips[id];
           if (!c) return state;
@@ -527,6 +666,7 @@ export const useDawStore = create<DawState>()(
       },
 
       setClipGain: (id, gain) => {
+        pushHistory();
         set((state) => {
           const c = state.clips[id];
           if (!c) return state;
@@ -544,6 +684,7 @@ export const useDawStore = create<DawState>()(
         })),
 
       pasteClipboard: () => {
+        pushHistory();
         set((state) => {
           if (state.clipboard.length === 0) return state;
           const earliestStart = Math.min(...state.clipboard.map((c) => c.start));
@@ -561,6 +702,7 @@ export const useDawStore = create<DawState>()(
       },
 
       setTrackHeight: (trackId, height) => {
+        pushHistory();
         set((state) => ({
           trackHeights: { ...state.trackHeights, [trackId]: Math.max(48, height) },
         }));
@@ -568,8 +710,14 @@ export const useDawStore = create<DawState>()(
       },
 
       loadProjectData: (name, project) => {
-        const p = (project || {}) as { clips?: unknown; markers?: unknown; trackHeights?: unknown };
+        const p = (project || {}) as {
+          clips?: unknown; markers?: unknown; trackHeights?: unknown;
+          loop?: { start?: number; end?: number; loop?: boolean; punch?: boolean; preRoll?: number } | null;
+        };
         applyingRemote = true;
+        const lp = p.loop && typeof p.loop === 'object' ? p.loop : null;
+        const region = lp && typeof lp.start === 'number' && typeof lp.end === 'number' && lp.end > lp.start
+          ? { inSec: lp.start, outSec: lp.end } : null;
         set({
           projectName: name || 'default',
           clips: toRecord<DawClip>(p.clips),
@@ -579,8 +727,14 @@ export const useDawStore = create<DawState>()(
               ? (p.trackHeights as Record<number, number>)
               : {},
           selectedClipIds: [],
+          region,
+          loopEnabled: !!(lp && lp.loop) && !!region,
+          punchEnabled: !!(lp && lp.punch) && !!region,
+          preRollSec: lp && typeof lp.preRoll === 'number' ? Math.max(0, Math.min(30, lp.preRoll)) : 0,
         });
         applyingRemote = false;
+        clearHistory();
+        syncRegionToEngine(get());
       },
 
       setProjectList: (list, active) =>
@@ -590,6 +744,7 @@ export const useDawStore = create<DawState>()(
         }),
 
       addCommittedClips: (clips, overrun) => {
+        pushHistory(true); // a finished recording is one undoable step
         set((state) => {
           const next = { ...state.clips };
           for (const c of clips) if (c && c.id) next[c.id] = c;
@@ -627,6 +782,10 @@ export const useDawStore = create<DawState>()(
         fps: s.fps,
         cuesOpen: s.cuesOpen,
         loudnessOpen: s.loudnessOpen,
+        region: s.region,
+        loopEnabled: s.loopEnabled,
+        punchEnabled: s.punchEnabled,
+        preRollSec: s.preRollSec,
       }),
     }
   )

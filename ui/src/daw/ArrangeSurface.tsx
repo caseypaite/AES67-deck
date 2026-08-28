@@ -114,8 +114,36 @@ export function ArrangeSurface() {
         return;
       }
 
+      // Phase 3e — loop/punch region: drag the in/out handles or the whole span.
+      if (hit.kind === 'region-in' || hit.kind === 'region-out' || hit.kind === 'region-body') {
+        const r0 = daw.getState().region;
+        if (!r0) return;
+        const startT = model.xToTime(e.clientX - rect.left);
+        drag((ev) => {
+          const t = snap(Math.max(0, model.xToTime(ev.clientX - rect.left)));
+          const r = daw.getState().region ?? r0;
+          if (hit.kind === 'region-in') daw.getState().setRegion(t, r.outSec);
+          else if (hit.kind === 'region-out') daw.getState().setRegion(r.inSec, t);
+          else {
+            const dt = snap(model.xToTime(ev.clientX - rect.left) - startT + r0.inSec) - r0.inSec;
+            daw.getState().setRegion(Math.max(0, r0.inSec + dt), Math.max(0.01, r0.outSec + dt));
+          }
+        });
+        return;
+      }
+
       if (hit.kind === 'ruler') {
         if (e.shiftKey) { s.addMarker(snap(Math.max(0, model.xToTime(e.clientX - rect.left)))); return; }
+        // Alt-drag paints a new loop/punch region.
+        if (e.altKey) {
+          const a = snap(Math.max(0, model.xToTime(e.clientX - rect.left)));
+          let dragged = false;
+          drag(
+            (ev) => { dragged = true; const b = snap(Math.max(0, model.xToTime(ev.clientX - rect.left))); daw.getState().setRegion(Math.min(a, b), Math.max(a, b)); },
+            () => { if (!dragged) daw.getState().setRegion(a, a + Math.max(1, daw.getState().gridSize * 4)); },
+          );
+          return;
+        }
         const scrub = (cx: number) => s.locate(snap(Math.max(0, model.xToTime(cx - rect.left))));
         scrub(e.clientX);
         drag((ev) => scrub(ev.clientX));

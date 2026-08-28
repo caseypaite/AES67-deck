@@ -14,6 +14,10 @@ exercises the panels, downloads, and CSV output end to end.
 - The loudness strip draws the Short-term / Integrated traces and a live
   M/S/I/TP readout; the target selector switches −14 / −23.
 - **REPORT REGION** downloads a compliance report with a PASS/FAIL summary.
+- **Phase 3e** — `REGION` creates a loop/punch span and enables `LOOP`;
+  `LOOP` wraps the transport inside it; `PUNCH` + an armed track auto-drops a
+  take in over the region and out after it (server-timed).
+- **Phase 4** — `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo marker + clip edits.
 
 ## Isolation
 

@@ -265,6 +265,13 @@ struct Transport {
     std::atomic<uint64_t> loop_start{0};
     std::atomic<uint64_t> loop_end{0};
     std::atomic<bool> loop_enabled{false};
+    // Punch region (plan Phase 3e). The engine only stores + echoes it; the
+    // server does the actual auto drop-in / drop-out by watching the frame on
+    // the metering stream (metering-rate accuracy is fine for broadcast, and
+    // opening take files must happen off the audio thread anyway).
+    std::atomic<uint64_t> punch_in{0};
+    std::atomic<uint64_t> punch_out{0};
+    std::atomic<bool> punch_enabled{false};
 };
 static Transport g_transport;
 
@@ -520,6 +527,14 @@ int main(int argc, char** argv) {
             g_transport.loop_end.store(e, std::memory_order_relaxed);
             g_transport.loop_enabled.store(j.value("enabled", false) && e > s,
                                           std::memory_order_relaxed);
+
+        } else if (type == "transport_set_punch") {
+            uint64_t s = j.value("start", (uint64_t)0);
+            uint64_t e = j.value("end", (uint64_t)0);
+            g_transport.punch_in.store(s, std::memory_order_relaxed);
+            g_transport.punch_out.store(e, std::memory_order_relaxed);
+            g_transport.punch_enabled.store(j.value("enabled", false) && e > s,
+                                            std::memory_order_relaxed);
 
         } else if (type == "start_multitrack_record") {
             const std::string dir = j.value("dir", "");
@@ -1276,13 +1291,20 @@ int main(int argc, char** argv) {
             // ── Transport position (engine-owned clock; UI/server follow).
             //    `buf` = the process block size, for the toolbar latency readout.
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
-                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d,\"monInMask\":%u}",
+                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d,\"monInMask\":%u,"
+                "\"loopOn\":%d,\"loopIn\":%llu,\"loopOut\":%llu,\"punchOn\":%d,\"punchIn\":%llu,\"punchOut\":%llu}",
                 static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
                 g_transport.state.load(std::memory_order_relaxed),
                 static_cast<int>(jack.get_sample_rate()),
                 static_cast<unsigned>(nframes),
                 player.take_underrun() ? 1 : 0,
-                g_monitor_input_mask.load(std::memory_order_relaxed));
+                g_monitor_input_mask.load(std::memory_order_relaxed),
+                g_transport.loop_enabled.load(std::memory_order_relaxed) ? 1 : 0,
+                static_cast<unsigned long long>(g_transport.loop_start.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_transport.loop_end.load(std::memory_order_relaxed)),
+                g_transport.punch_enabled.load(std::memory_order_relaxed) ? 1 : 0,
+                static_cast<unsigned long long>(g_transport.punch_in.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_transport.punch_out.load(std::memory_order_relaxed)));
 
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 
