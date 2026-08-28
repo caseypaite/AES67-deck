@@ -65,6 +65,11 @@ export class SurfaceModel {
   width = 800;
   height = 600;
 
+  // paint counters (perf visibility): scene repaints only on edits/view change,
+  // overlay every frame while rolling.
+  sceneDraws = 0;
+  overlayDraws = 0;
+
   private get pxPerSec() { return useDawStore.getState().zoom; }
   get scrollX() { return useDawStore.getState().scrollX; }
   get scrollY() { return useDawStore.getState().scrollY; }
@@ -232,12 +237,32 @@ export class SurfaceModel {
   }
 
   // --- painting ---
+  // Two layers: the scene (grid / tracks / clips / waveforms / region /
+  // markers) repaints only on an edit or view change; the overlay (playhead)
+  // repaints every frame while the transport rolls. Keeps steady-state
+  // playback at one thin line per frame instead of the whole arrange view.
+
+  // Playhead line + head, on the transparent overlay canvas.
+  drawOverlay(ctx: CanvasRenderingContext2D) {
+    this.overlayDraws++;
+    const { width: w, height: h } = this;
+    ctx.clearRect(0, 0, w, h);
+    const daw = useDawStore.getState();
+    const recording = useMixerStore.getState().transportState === 'recording';
+    const px = this.timeToX(daw.playheadPosition);
+    if (px < 0 || px > w) return;
+    ctx.strokeStyle = recording ? '#ef4444' : '#ffffff';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px + 0.5, 0); ctx.lineTo(px + 0.5, h); ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle as string;
+    ctx.beginPath(); ctx.moveTo(px - 4, 0); ctx.lineTo(px + 5, 0); ctx.lineTo(px + 0.5, 7); ctx.fill();
+  }
 
   draw(ctx: CanvasRenderingContext2D) {
+    this.sceneDraws++;
     const { width: w, height: h } = this;
     const pps = this.pxPerSec;
     const daw = useDawStore.getState();
-    const playing = useMixerStore.getState().transportState;
 
     ctx.fillStyle = '#16181d';
     ctx.fillRect(0, 0, w, h);
@@ -262,6 +287,11 @@ export class SurfaceModel {
     const tracks = this.tracks();
     const selected = new Set(daw.selectedClipIds);
     const dropTrack = daw.dragOverTrackId;
+    const clipsByTrack = new Map<number, DawClip[]>();
+    for (const c of Object.values(daw.clips)) {
+      const a = clipsByTrack.get(c.trackId);
+      if (a) a.push(c); else clipsByTrack.set(c.trackId, [c]);
+    }
     for (const tr of tracks) {
       if (tr.y + tr.height < RULER_H || tr.y > h) continue;
       ctx.fillStyle = (tr.id % 2) ? '#1a1d23' : '#181b20';
@@ -273,7 +303,7 @@ export class SurfaceModel {
       ctx.strokeStyle = 'rgba(0,0,0,0.5)';
       ctx.beginPath(); ctx.moveTo(0, tr.y + tr.height - 0.5); ctx.lineTo(w, tr.y + tr.height - 0.5); ctx.stroke();
 
-      const trackClips = Object.values(daw.clips).filter((c) => c.trackId === tr.id);
+      const trackClips = clipsByTrack.get(tr.id) || [];
 
       // Which spans of each take lane are currently the active comp — a comp-lane
       // clip that references the same source with a matching source offset.
@@ -376,16 +406,7 @@ export class SurfaceModel {
     this.drawRegion(ctx);
     this.drawMarkerLines(ctx);
     this.drawRuler(ctx, tStart, tEnd, major, minor);
-
-    // playhead
-    const px = this.timeToX(daw.playheadPosition);
-    if (px >= 0 && px <= w) {
-      ctx.strokeStyle = playing === 'recording' ? '#ef4444' : '#ffffff';
-      ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(px + 0.5, 0); ctx.lineTo(px + 0.5, h); ctx.stroke();
-      ctx.fillStyle = ctx.strokeStyle as string;
-      ctx.beginPath(); ctx.moveTo(px - 4, 0); ctx.lineTo(px + 5, 0); ctx.lineTo(px + 0.5, 7); ctx.fill();
-    }
+    // playhead is drawn on the overlay canvas (drawOverlay)
   }
 
   private drawClip(

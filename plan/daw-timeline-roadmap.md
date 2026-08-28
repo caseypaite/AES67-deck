@@ -350,8 +350,17 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
   `expandGroups` folds the group into every selection. Verified end to end
   (`scratchpad/edit-test.mjs`, 12/12).
 - **Clip fx / clip gain automation** — deferred to a later pass.
-- Viewport virtualisation and canvas grid (the current repeating-gradient grid
-  at `DawView.tsx:229-233` / `:265` is fine visually but everything mounts).
+- **Render virtualisation — DONE 2026-08-28.** The arrange surface is already
+  one viewport-sized `<canvas>` with off-screen tracks/clips culled in `draw()`.
+  Split into two stacked canvases: the **scene** (grid / tracks / clips /
+  waveforms / region / markers) repaints only on an edit or view change — a
+  `sceneSig` diff in `ArrangeSurface` ignores playhead-only ticks — and the
+  transparent **overlay** carries just the playhead, repainted every frame
+  while rolling. Clips are bucketed by track once per scene paint instead of a
+  per-track `filter`. `SurfaceModel.sceneDraws` / `overlayDraws` counters +
+  `window.__arrangeModel` (DEV) for perf visibility. Measured: 2 s of playback
+  = ~130 overlay paints, **0 scene paints** (`scratchpad/edit-test.mjs`).
+  Recording still repaints the scene continuously (live-take waveform grows).
 
 ---
 
