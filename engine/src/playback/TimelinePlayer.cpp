@@ -289,10 +289,20 @@ void TimelinePlayer::reader_loop() {
             continue;
         }
 
-        const bool locate =
-            !was_playing_ ||
-            std::llabs(static_cast<int64_t>(frame) - static_cast<int64_t>(fill_pos_)) > SEEK_THRESH;
-        if (locate) {
+        // A re-seek is needed on stop->play, a transport discontinuity (manual
+        // locate / loop wrap), or if the playhead has run past what we've
+        // buffered. The reader normally sits FILL lead-frames *ahead* of the
+        // playhead — that is not a seek, so compare against the last observed
+        // transport frame, never against fill_pos_.
+        const int64_t advance =
+            static_cast<int64_t>(frame) - static_cast<int64_t>(last_transport_frame_);
+        const bool discontinuity =
+            advance < 0 || advance > static_cast<int64_t>(sample_rate_) / 2;
+        const bool playhead_ran_dry =
+            static_cast<int64_t>(frame) > static_cast<int64_t>(fill_pos_) + SEEK_THRESH;
+        last_transport_frame_ = frame;
+
+        if (!was_playing_ || discontinuity || playhead_ran_dry) {
             priming_.store(true, std::memory_order_relaxed);
             for (int t = 1; t <= MAX_CH; ++t) {
                 jack_ringbuffer_reset(tracks_[t]->ring);

@@ -112,7 +112,8 @@ private:
     std::unique_ptr<TrackReader> tracks_[MAX_CH + 1];
     std::unique_ptr<TrackReader> tracks_b_[MAX_CH + 1];
 
-    uint64_t fill_pos_ = 0;
+    uint64_t fill_pos_ = 0;             // reader write cursor (runs ahead of playhead)
+    uint64_t last_transport_frame_ = 0; // playhead at the previous reader pass
     bool was_playing_ = false;
     std::atomic<bool> priming_{false}; // reader flushed, ring not yet refilled
 
