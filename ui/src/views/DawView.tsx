@@ -112,9 +112,12 @@ export const DawView = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [deleteSelected, copySelected, pasteClipboard, sliceSelectedAtPlayhead]);
 
+  const tBtn = (active: boolean, activeCls = 'bg-blue-600 text-white') =>
+    `px-2.5 py-1 text-xs font-bold rounded transition-colors ${active ? activeCls : 'bg-[#222] text-gray-500 hover:text-gray-300'}`;
+
   return (
     <div className="w-full h-full flex flex-col bg-[#16181d] select-none outline-none" tabIndex={0}>
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 min-h-0 flex overflow-hidden">
         <TrackPanel width={PANEL_W} />
         <ArrangeSurface />
         {cuesOpen && <CueListPanel />}
@@ -124,103 +127,63 @@ export const DawView = () => {
       {bounceOpen && <BounceDialog onClose={() => setBounceOpen(false)} />}
 
       {(lastOverrun || playbackUnderrun) && (
-        <div className={`absolute ${loudnessOpen ? 'bottom-[152px]' : 'bottom-[54px]'} left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400`}>
+        <div className="absolute bottom-[46px] left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400">
           ⚠ {lastOverrun ? 'Last take dropped audio — disk could not keep up' : 'Playback dropout — disk could not keep up'}
         </div>
       )}
-
       {(vscMessage || vscDiskLow) && (
-        <div className={`absolute ${loudnessOpen ? 'bottom-[192px]' : 'bottom-[94px]'} left-8 z-40 px-3 py-1.5 rounded text-white text-xs font-bold shadow-xl border ${vscDiskLow ? 'bg-red-700 border-red-400' : 'bg-blue-700 border-blue-400'}`}>
+        <div className={`absolute bottom-[46px] left-8 z-40 px-3 py-1.5 rounded text-white text-xs font-bold shadow-xl border ${(lastOverrun || playbackUnderrun) ? 'translate-y-[-32px] ' : ''}${vscDiskLow ? 'bg-red-700 border-red-400' : 'bg-blue-700 border-blue-400'}`}>
           {vscDiskLow ? '⚠ ' : ''}{vscMessage || 'Disk space low'}
         </div>
       )}
 
-      {/* Phase 3e / 4 — region · loop · punch · pre-roll · undo/redo */}
-      <div className={`absolute ${loudnessOpen ? 'bottom-[104px]' : 'bottom-6'} left-8 flex items-center bg-[#111] rounded-lg shadow-xl border border-[#333] p-1 z-40 gap-1`}>
-        <button
-          onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
-          className="w-7 h-7 flex items-center justify-center text-sm rounded bg-[#222] text-gray-400 enabled:hover:text-white disabled:opacity-30"
-        >⤺</button>
-        <button
-          onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)"
-          className="w-7 h-7 flex items-center justify-center text-sm rounded bg-[#222] text-gray-400 enabled:hover:text-white disabled:opacity-30"
-        >⤻</button>
-        <div className="w-px h-6 bg-[#333] mx-1" />
-        <button
-          onClick={setRegionFromContext} title="Set loop/punch region from selection (or playhead)"
-          className={`px-2.5 py-1 text-xs font-bold rounded transition-colors ${region ? 'bg-[#2a2f3a] text-gray-200' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
-        >REGION</button>
-        {region && (
-          <button onClick={clearRegion} title="Clear region" className="w-6 h-7 flex items-center justify-center text-xs rounded bg-[#222] text-gray-500 hover:text-red-400">✕</button>
-        )}
-        <button
-          onClick={() => setLoopEnabled(!loopEnabled)} disabled={!region} title="Loop the region (L)"
-          className={`px-2.5 py-1 text-xs font-bold rounded transition-colors disabled:opacity-30 ${loopEnabled ? 'bg-cyan-600 text-white' : 'bg-[#222] text-gray-500 enabled:hover:text-gray-300'}`}
-        >LOOP</button>
-        <button
-          onClick={() => setPunchEnabled(!punchEnabled)} disabled={!region} title="Auto-punch armed tracks on the region"
-          className={`px-2.5 py-1 text-xs font-bold rounded transition-colors disabled:opacity-30 ${punchEnabled ? 'bg-red-600 text-white' : 'bg-[#222] text-gray-500 enabled:hover:text-gray-300'}`}
-        >PUNCH</button>
-        <label className="flex items-center gap-1 text-[10px] font-bold text-gray-500 pl-1" title="Pre-roll seconds before the punch in-point">
-          PRE
-          <input
-            type="number" min={0} max={30} step={1} value={preRollSec}
-            onChange={(e) => setPreRoll(Number(e.target.value))}
-            className="w-9 bg-[#0d0f13] border border-[#333] rounded px-1 py-0.5 text-right text-gray-300 outline-none"
-          />
-        </label>
-        <div className="w-px h-6 bg-[#333] mx-1" />
-        <button
-          onClick={() => setRippleEdit(!rippleEdit)} title="Ripple edit — delete/paste close/open the gap after"
-          className={`px-2.5 py-1 text-xs font-bold rounded transition-colors ${rippleEdit ? 'bg-amber-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
-        >RIPPLE</button>
-        {region && (
-          <button
-            onClick={rippleDelete} title="Cut the region out of every track and close the gap"
-            className="px-2 py-1 text-xs font-bold rounded bg-[#222] text-gray-400 hover:bg-red-700 hover:text-white transition-colors"
-          >✂ CUT</button>
-        )}
-      </div>
+      {/* Bottom taskbar — track area scrolls between the app header and this bar */}
+      <div className="shrink-0 h-10 flex items-center gap-1 px-2 bg-[#111] border-t border-[#333] overflow-x-auto">
+        <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
+          className="w-7 h-7 shrink-0 flex items-center justify-center text-sm rounded bg-[#222] text-gray-400 enabled:hover:text-white disabled:opacity-30">⤺</button>
+        <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)"
+          className="w-7 h-7 shrink-0 flex items-center justify-center text-sm rounded bg-[#222] text-gray-400 enabled:hover:text-white disabled:opacity-30">⤻</button>
+        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
 
-      <div className={`absolute ${loudnessOpen ? 'bottom-[104px]' : 'bottom-6'} ${cuesOpen ? 'right-[280px]' : 'right-8'} flex items-center bg-[#111] rounded-lg shadow-xl border border-[#333] p-1 z-40 gap-1`}>
-        <button
-          onClick={() => setCuesOpen(!cuesOpen)}
-          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${cuesOpen ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
-          title="Cue list"
-        >
-          CUES
-        </button>
-        <button
-          onClick={() => setLoudnessOpen(!loudnessOpen)}
-          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${loudnessOpen ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
-          title="Loudness log"
-        >
-          LUFS
-        </button>
-        <button
-          onClick={() => setBounceOpen(true)}
-          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${bounceState === 'running' ? 'bg-blue-600 text-white animate-pulse' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
-          title="Bounce a region (or the whole project) through the master chain to a WAV"
-        >
-          BOUNCE
-        </button>
-        <div className="w-px h-6 bg-[#333] mx-1" />
-        <button
-          onClick={() => setSnapToGrid(!snapToGrid)}
-          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${snapToGrid ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
-        >
-          SNAP
-        </button>
-        <button
-          onClick={() => setFps(fps === 30 ? 25 : 30)}
-          className="px-2 py-1 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white"
-          title="Timecode frame rate"
-        >
-          {fps} fps
-        </button>
-        <div className="w-px h-6 bg-[#333] mx-1" />
-        <button className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom / 1.3)}>−</button>
-        <button className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom * 1.3)}>+</button>
+        <button onClick={setRegionFromContext} title="Set loop/punch region from selection (or playhead)"
+          className={`shrink-0 ${tBtn(!!region, 'bg-[#2a2f3a] text-gray-200')}`}>REGION</button>
+        {region && (
+          <button onClick={clearRegion} title="Clear region"
+            className="w-6 h-7 shrink-0 flex items-center justify-center text-xs rounded bg-[#222] text-gray-500 hover:text-red-400">✕</button>
+        )}
+        <button onClick={() => setLoopEnabled(!loopEnabled)} disabled={!region} title="Loop the region (L)"
+          className={`shrink-0 disabled:opacity-30 ${tBtn(loopEnabled, 'bg-cyan-600 text-white')}`}>LOOP</button>
+        <button onClick={() => setPunchEnabled(!punchEnabled)} disabled={!region} title="Auto-punch armed tracks on the region"
+          className={`shrink-0 disabled:opacity-30 ${tBtn(punchEnabled, 'bg-red-600 text-white')}`}>PUNCH</button>
+        <label className="flex items-center gap-1 text-[10px] font-bold text-gray-500 pl-1 shrink-0" title="Pre-roll seconds before the punch in-point">
+          PRE
+          <input type="number" min={0} max={30} step={1} value={preRollSec}
+            onChange={(e) => setPreRoll(Number(e.target.value))}
+            className="w-9 bg-[#0d0f13] border border-[#333] rounded px-1 py-0.5 text-right text-gray-300 outline-none" />
+        </label>
+        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
+        <button onClick={() => setRippleEdit(!rippleEdit)} title="Ripple edit — delete/paste close/open the gap after"
+          className={`shrink-0 ${tBtn(rippleEdit, 'bg-amber-600 text-white')}`}>RIPPLE</button>
+        {region && (
+          <button onClick={rippleDelete} title="Cut the region out of every track and close the gap"
+            className="px-2 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:bg-red-700 hover:text-white transition-colors">✂ CUT</button>
+        )}
+
+        <div className="flex-1 min-w-[8px]" />
+
+        <button onClick={() => setCuesOpen(!cuesOpen)} title="Cue list"
+          className={`shrink-0 ${tBtn(cuesOpen)}`}>CUES</button>
+        <button onClick={() => setLoudnessOpen(!loudnessOpen)} title="Loudness log"
+          className={`shrink-0 ${tBtn(loudnessOpen)}`}>LUFS</button>
+        <button onClick={() => setBounceOpen(true)} title="Bounce a region (or the whole project) through the master chain to a WAV"
+          className={`shrink-0 ${tBtn(bounceState === 'running')} ${bounceState === 'running' ? 'animate-pulse' : ''}`}>BOUNCE</button>
+        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
+        <button onClick={() => setSnapToGrid(!snapToGrid)} className={`shrink-0 ${tBtn(snapToGrid)}`}>SNAP</button>
+        <button onClick={() => setFps(fps === 30 ? 25 : 30)} title="Timecode frame rate"
+          className="px-2 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white">{fps} fps</button>
+        <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
+        <button className="w-7 h-7 shrink-0 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom / 1.3)}>−</button>
+        <button className="w-7 h-7 shrink-0 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom * 1.3)}>+</button>
       </div>
     </div>
   );
