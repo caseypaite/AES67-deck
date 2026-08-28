@@ -62,6 +62,13 @@ const RECORDS_DIR = process.env.AES67_RECORDS_DIR
   : path.join(process.cwd(), '..', 'records');
 try { fs.mkdirSync(RECORDS_DIR, { recursive: true }); } catch { /* ignore */ }
 
+// As-run logs (plan/daw-timeline-roadmap.md Phase 3c): the ~1 Hz loudness CSV
+// and the compliance reports exported from it.
+const LOGS_DIR = process.env.AES67_LOGS_DIR
+  ? path.resolve(process.env.AES67_LOGS_DIR)
+  : path.join(process.cwd(), '..', 'logs');
+try { fs.mkdirSync(LOGS_DIR, { recursive: true }); } catch { /* ignore */ }
+
 // Name of the recording project currently open, or null for the scratch
 // session. When set, its media lives in records/<name>/ (flat) and autosave
 // rewrites records/<name>/<name>.rpp.
@@ -325,7 +332,7 @@ function setActiveProject(name: string): void {
 // issue start_multitrack_record, read when take_started/finished comes back).
 let activeTakeDir: string | null = null;
 
-const SOCKET_PATH = '/tmp/aes67_deck.sock';
+const SOCKET_PATH = process.env.AES67_SOCKET_PATH || '/tmp/aes67_deck.sock';
 const WSS_PORT = parseInt(process.env.PORT || '8081', 10);
 
 const PATCHBAY_CONFIG_PATH = 'patchbay_config.json';
@@ -777,6 +784,161 @@ function rearmVscSchedule(): void {
 
 rearmVscSchedule();
 
+// --- Loudness logging & compliance (plan/daw-timeline-roadmap.md Phase 3c) --
+// The engine already computes BS.1770 M/S/I + true-peak on the Master and ships
+// it on every metering frame (`lufs` key). Persist it: a ~1 Hz CSV in logs/, an
+// in-memory ring for the UI history strip, and an on-demand compliance report
+// for a marked region.
+const LOUDNESS_CONFIG_PATH = 'loudness_config.json';
+const LOUDNESS_TARGETS = [-14, -23, -24];
+
+interface LoudnessConfig {
+  target: number;           // LUFS target for the history strip + report
+  logWhileStopped: boolean; // append rows even when the transport is parked
+}
+const LOUDNESS_DEFAULTS: LoudnessConfig = { target: -14, logWhileStopped: false };
+
+function getLoudnessConfig(): LoudnessConfig {
+  try {
+    if (fs.existsSync(LOUDNESS_CONFIG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(LOUDNESS_CONFIG_PATH, 'utf8'));
+      return {
+        target: LOUDNESS_TARGETS.includes(Number(raw.target)) ? Number(raw.target) : LOUDNESS_DEFAULTS.target,
+        logWhileStopped: typeof raw.logWhileStopped === 'boolean' ? raw.logWhileStopped : LOUDNESS_DEFAULTS.logWhileStopped,
+      };
+    }
+  } catch (e) {
+    console.error('Error reading loudness_config.json, using defaults', e);
+  }
+  return { ...LOUDNESS_DEFAULTS };
+}
+
+function writeLoudnessConfig(patch: Partial<LoudnessConfig>): LoudnessConfig {
+  const next = getLoudnessConfig();
+  if (LOUDNESS_TARGETS.includes(Number(patch.target))) next.target = Number(patch.target);
+  if (typeof patch.logWhileStopped === 'boolean') next.logWhileStopped = patch.logWhileStopped;
+  try {
+    fs.writeFileSync(LOUDNESS_CONFIG_PATH, JSON.stringify(next, null, 2));
+  } catch (e) {
+    console.error('Error writing loudness_config.json', e);
+  }
+  return next;
+}
+
+interface LoudnessSample { wall: number; frame: number; sec: number; m: number; s: number; i: number; tp: number; }
+const loudnessRing: LoudnessSample[] = [];
+const LOUDNESS_RING_CAP = 5400;   // ~90 min at 1 Hz
+const LOUDNESS_LOG_INTERVAL_MS = 1000;
+const LOUDNESS_CSV_HEADER = 'wallClock,projectFrame,sec,M,S,I,TP\n';
+let lastLoudnessLogMs = 0;
+
+function loudnessCsvPath(d = new Date()): string {
+  return path.join(LOGS_DIR, `loudness-${d.toISOString().slice(0, 10)}.csv`);
+}
+
+// Called for every engine `metering` frame (from the IPC data handler). Cheap
+// guard + 1 Hz throttle so this costs ~1 append/sec while the transport rolls.
+function maybeLogLoudness(frame: any): void {
+  const lufs = frame?.lufs;
+  const tr = frame?.transport;
+  if (!lufs || !tr) return;
+  const rolling = tr.state === 1 || tr.state === 2;
+  if (!rolling && !getLoudnessConfig().logWhileStopped) return;
+  const now = Date.now();
+  if (now - lastLoudnessLogMs < LOUDNESS_LOG_INTERVAL_MS) return;
+  lastLoudnessLogMs = now;
+
+  const sr = Number(tr.sr) || 48000;
+  const f = Number(tr.frame) || 0;
+  const sec = f / sr;
+  const m = Number(lufs.m), s = Number(lufs.s), i = Number(lufs.i), tp = Number(lufs.tp);
+
+  loudnessRing.push({ wall: now, frame: f, sec, m, s, i, tp });
+  if (loudnessRing.length > LOUDNESS_RING_CAP) loudnessRing.splice(0, loudnessRing.length - LOUDNESS_RING_CAP);
+
+  const p = loudnessCsvPath(new Date(now));
+  const row = `${new Date(now).toISOString()},${f},${sec.toFixed(3)},${m.toFixed(1)},${s.toFixed(1)},${i.toFixed(1)},${tp.toFixed(1)}\n`;
+  try {
+    if (!fs.existsSync(p)) fs.writeFileSync(p, LOUDNESS_CSV_HEADER);
+    fs.appendFile(p, row, () => { /* best-effort */ });
+  } catch (e) {
+    console.error('loudness log write failed', e);
+  }
+}
+
+function fmtTc(sec: number): string {
+  const x = Math.max(0, sec);
+  const hh = String(Math.floor(x / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((x % 3600) / 60)).padStart(2, '0');
+  const ss = String(Math.floor(x % 60)).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+// Compliance report for [startSec, endSec], scanned from the day's CSV logs.
+// Metrics come from the 1 Hz samples, not a sample-accurate re-measure.
+function buildLoudnessReport(startSec: number, endSec: number, name: unknown, target: number): { csv: string; summary: any } {
+  const lo = Math.min(startSec, endSec), hi = Math.max(startSec, endSec);
+  const rows: LoudnessSample[] = [];
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(LOGS_DIR).filter((f) => /^loudness-\d{4}-\d{2}-\d{2}\.csv$/.test(f));
+  } catch { /* ignore */ }
+  for (const f of files) {
+    let text = '';
+    try { text = fs.readFileSync(path.join(LOGS_DIR, f), 'utf8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line || line.startsWith('wallClock') || line.startsWith('#')) continue;
+      const [wall, frame, sec, m, s, i, tp] = line.split(',');
+      const secN = Number(sec);
+      if (!Number.isFinite(secN) || secN < lo || secN > hi) continue;
+      rows.push({
+        wall: Date.parse(wall) || 0, frame: Number(frame) || 0, sec: secN,
+        m: Number(m), s: Number(s), i: Number(i), tp: Number(tp),
+      });
+    }
+  }
+  rows.sort((a, b) => a.sec - b.sec);
+
+  const stVals = rows.map((r) => r.s).filter((v) => Number.isFinite(v) && v > -120);
+  const iVals = rows.map((r) => r.i).filter((v) => Number.isFinite(v) && v > -120);
+  const tpVals = rows.map((r) => r.tp).filter((v) => Number.isFinite(v) && v > -120);
+  const integrated = iVals.length ? iVals[iVals.length - 1] : NaN;
+  const shortTermMax = stVals.length ? Math.max(...stVals) : NaN;
+  const shortTermMean = stVals.length ? stVals.reduce((a, b) => a + b, 0) / stVals.length : NaN;
+  const truePeakMax = tpVals.length ? Math.max(...tpVals) : NaN;
+  const pass = Number.isFinite(integrated) && Math.abs(integrated - target) <= 1
+    && (!Number.isFinite(truePeakMax) || truePeakMax <= -1);
+
+  const n1 = (v: number) => (Number.isFinite(v) ? v.toFixed(1) : 'n/a');
+  const head = [
+    `# AES67-Deck loudness compliance report`,
+    `# region: ${fmtTc(lo)} - ${fmtTc(hi)}  (${(hi - lo).toFixed(1)} s, ${rows.length} samples @ ~1 Hz)`,
+    `# generated: ${new Date().toISOString()}`,
+    `# target: ${target} LUFS   tolerance: +/-1 LU   true-peak ceiling: -1 dBTP`,
+    `# integrated (LUFS): ${n1(integrated)}`,
+    `# short-term max / mean (LUFS): ${n1(shortTermMax)} / ${n1(shortTermMean)}`,
+    `# true-peak max (dBTP): ${n1(truePeakMax)}`,
+    `# result: ${pass ? 'PASS' : 'FAIL'}`,
+    `# note: metrics derived from 1 Hz M/S/I/TP samples, not a sample-accurate re-measure.`,
+    `#       the sec-range filter can mix rows if multiple sessions share a timeline range on the same day.`,
+    LOUDNESS_CSV_HEADER.trim(),
+  ].join('\n');
+  const body = rows.map((r) =>
+    `${new Date(r.wall).toISOString()},${r.frame},${r.sec.toFixed(3)},${r.m.toFixed(1)},${r.s.toFixed(1)},${r.i.toFixed(1)},${r.tp.toFixed(1)}`,
+  ).join('\n');
+  const csv = `${head}\n${body}\n`;
+
+  const safe = String(name || 'region').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 48) || 'region';
+  const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const outName = `report-${safe}-${ts}.csv`;
+  try { fs.writeFileSync(path.join(LOGS_DIR, outName), csv); } catch (e) { console.error('report write failed', e); }
+
+  return {
+    csv,
+    summary: { region: [lo, hi], samples: rows.length, target, integrated, shortTermMax, shortTermMean, truePeakMax, pass, file: outName },
+  };
+}
+
 // Set up WebSocket server
 const wss = new WebSocketServer({ port: WSS_PORT });
 console.log(`WebSocket Server listening on ws://localhost:${WSS_PORT}`);
@@ -798,6 +960,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'output_routing_loaded', outputs: getOutputRouting() }));
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
   ws.send(JSON.stringify({ type: 'vsc_config_loaded', config: getVscConfig() }));
+  ws.send(JSON.stringify({ type: 'loudness_config_loaded', config: getLoudnessConfig() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
   ws.send(JSON.stringify(daemonStateMessage()));
   ws.send(JSON.stringify({ type: 'mic_devices_loaded', devices: lastMicDevices }));
@@ -1215,6 +1378,23 @@ wss.on('connection', (ws) => {
         });
         rearmVscSchedule();
         broadcastToClients(JSON.stringify({ type: 'vsc_config_loaded', config: next }));
+      } else if (data.type === 'get_loudness_config') {
+        ws.send(JSON.stringify({ type: 'loudness_config_loaded', config: getLoudnessConfig() }));
+      } else if (data.type === 'set_loudness_config') {
+        const cfg = writeLoudnessConfig({ target: data.target, logWhileStopped: data.logWhileStopped });
+        broadcastToClients(JSON.stringify({ type: 'loudness_config_loaded', config: cfg }));
+      } else if (data.type === 'get_loudness_history') {
+        ws.send(JSON.stringify({ type: 'loudness_history', points: loudnessRing, target: getLoudnessConfig().target }));
+      } else if (data.type === 'export_loudness_report') {
+        const startSec = Number(data.startSec) || 0;
+        const endSec = Number(data.endSec);
+        if (!Number.isFinite(endSec) || endSec <= startSec) {
+          ws.send(JSON.stringify({ type: 'loudness_report', error: 'invalid region' }));
+        } else {
+          const target = LOUDNESS_TARGETS.includes(Number(data.target)) ? Number(data.target) : getLoudnessConfig().target;
+          const { csv, summary } = buildLoudnessReport(startSec, endSec, data.name, target);
+          ws.send(JSON.stringify({ type: 'loudness_report', name: summary.file, csv, summary }));
+        }
       } else if (data.type === 'get_clip_peaks') {
         // Lazy waveform data: compute (and cache) min/max peaks for one take
         // file on first request, then serve from disk.
@@ -1529,6 +1709,10 @@ const ipcServer = net.createServer((socket) => {
           const parsed = JSON.parse(line);
           if (parsed.type === 'plugin_list' && Array.isArray(parsed.plugins)) {
             lastPluginCatalog = parsed.plugins;
+          } else if (parsed.type === 'metering') {
+            // Phase 3c: 1 Hz loudness CSV + history ring. `handled` stays false
+            // so the frame still forwards to every UI unchanged.
+            maybeLogLoudness(parsed);
           } else if (parsed.type === 'take_started') {
             handled = handleTakeStarted(parsed);
           } else if (parsed.type === 'take_finished') {

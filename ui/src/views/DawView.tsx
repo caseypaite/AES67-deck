@@ -3,6 +3,8 @@ import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore } from '../stores/useMixerStore';
 import { ArrangeSurface } from '../daw/ArrangeSurface';
 import { TrackPanel } from '../daw/TrackPanel';
+import { CueListPanel } from '../components/daw/CueListPanel';
+import { LoudnessHistory } from '../components/daw/LoudnessHistory';
 
 const PANEL_W = 208;
 
@@ -15,6 +17,10 @@ export const DawView = () => {
   const setFps = useDawStore((s) => s.setFps);
   const lastOverrun = useDawStore((s) => s.lastOverrun);
   const playbackUnderrun = useDawStore((s) => s.playbackUnderrun);
+  const cuesOpen = useDawStore((s) => s.cuesOpen);
+  const setCuesOpen = useDawStore((s) => s.setCuesOpen);
+  const loudnessOpen = useDawStore((s) => s.loudnessOpen);
+  const setLoudnessOpen = useDawStore((s) => s.setLoudnessOpen);
   const vscMessage = useMixerStore((s) => s.vscStatus.message);
   const vscDiskLow = useMixerStore((s) => s.vscStatus.diskLow);
 
@@ -59,21 +65,39 @@ export const DawView = () => {
       <div className="flex-1 flex overflow-hidden">
         <TrackPanel width={PANEL_W} />
         <ArrangeSurface />
+        {cuesOpen && <CueListPanel />}
       </div>
 
+      {loudnessOpen && <LoudnessHistory />}
+
       {(lastOverrun || playbackUnderrun) && (
-        <div className="absolute bottom-6 left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400">
+        <div className={`absolute ${loudnessOpen ? 'bottom-[104px]' : 'bottom-6'} left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400`}>
           ⚠ {lastOverrun ? 'Last take dropped audio — disk could not keep up' : 'Playback dropout — disk could not keep up'}
         </div>
       )}
 
       {(vscMessage || vscDiskLow) && (
-        <div className={`absolute bottom-16 left-8 z-40 px-3 py-1.5 rounded text-white text-xs font-bold shadow-xl border ${vscDiskLow ? 'bg-red-700 border-red-400' : 'bg-blue-700 border-blue-400'}`}>
+        <div className={`absolute ${loudnessOpen ? 'bottom-[144px]' : 'bottom-16'} left-8 z-40 px-3 py-1.5 rounded text-white text-xs font-bold shadow-xl border ${vscDiskLow ? 'bg-red-700 border-red-400' : 'bg-blue-700 border-blue-400'}`}>
           {vscDiskLow ? '⚠ ' : ''}{vscMessage || 'Disk space low'}
         </div>
       )}
 
-      <div className="absolute bottom-6 right-8 flex items-center bg-[#111] rounded-lg shadow-xl border border-[#333] p-1 z-40 gap-1">
+      <div className={`absolute ${loudnessOpen ? 'bottom-[104px]' : 'bottom-6'} ${cuesOpen ? 'right-[280px]' : 'right-8'} flex items-center bg-[#111] rounded-lg shadow-xl border border-[#333] p-1 z-40 gap-1`}>
+        <button
+          onClick={() => setCuesOpen(!cuesOpen)}
+          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${cuesOpen ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
+          title="Cue list"
+        >
+          CUES
+        </button>
+        <button
+          onClick={() => setLoudnessOpen(!loudnessOpen)}
+          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${loudnessOpen ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
+          title="Loudness log"
+        >
+          LUFS
+        </button>
+        <div className="w-px h-6 bg-[#333] mx-1" />
         <button
           onClick={() => setSnapToGrid(!snapToGrid)}
           className={`px-3 py-1 text-xs font-bold rounded transition-colors ${snapToGrid ? 'bg-blue-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}

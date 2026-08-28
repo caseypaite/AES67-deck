@@ -1,0 +1,102 @@
+# Live-performance readiness review
+
+_Code-level assessment (2026-08-28). Based on reading the engine RT path
+(`engine/src/main.cpp`, `JackClient`, the recorders), the server command /
+reconnect logic, the deploy units, and the timeline roadmap. Not a bench test
+on the reference appliance._
+
+## Verdict
+
+**Usable for lower-stakes live work** (rehearsals, streaming, install playback,
+virtual soundcheck) **— not yet fit for broadcast-critical or one-shot shows.**
+The DSP core is well-built and genuinely low-latency, but recovery from failure
+is a full audio dropout, solo is destructive, and there is no output safety net
+or redundancy.
+
+## What's solid
+
+- **RT discipline is textbook.** The audio callback is lock-free with no
+  allocation: plugin-chain edits marshalled through a `jack_ringbuffer`,
+  instance destruction handed to a trash thread, vectors pre-`reserve()`d to
+  `MAX_PLUGINS_PER_CHANNEL`, transport as relaxed atomics. FX rack edits during
+  a show won't glitch the audio.
+- **Latency claim is credible.** One graph quantum, no added buffering in the
+  DSP path (2.67 ms @ 128/48k). Latency-reporting "studio" plugins are kept out
+  of the live path by design.
+- **Talkback correctness.** PTT and destination mask use acquire/release
+  atomics with a real safety rationale; the Monitor bus is structurally
+  excluded from talkback routing (no bit position, not just a runtime check).
+- **Self-heal on restart.** systemd `Restart=always` + `run-dev.sh` supervisor;
+  the server re-drives every `pw-link` and replays mixer state, FX racks,
+  routing and the timeline on every engine reconnect. Reload the tablet or
+  reboot the box and the console comes back as it was.
+- **Autonomous engine.** UI / network loss doesn't stop audio — the engine runs
+  headless and the browser is only a control surface.
+
+## Real risks for live use (ranked)
+
+### 1. Failure = total audio dropout, not a failover
+Any PipeWire restart or engine crash calls `std::exit(1)` from the JACK
+shutdown callback. Recovery is process restart + JACK reconnect + the server
+re-driving `pw-link` — the server's own comment notes this "can lag by several
+seconds." On the main mix that is a multi-second silence mid-show. No
+redundancy, no second engine, no hardware bypass relay.
+
+### 2. Solo is destructive solo-in-place
+The `any_solo` path mutes every non-soloed input into *all* buses including
+Master (`engine/src/main.cpp:883`). Hitting solo during a live show cuts the
+audience mix. There is no PFL/AFL that routes only to the Monitor bus — which
+is the entire point of solo on a live console.
+
+### 3. No brickwall on the Master output
+A runaway plugin, feedback loop, or bad gain staging goes straight to the AES67
+transmit streams and the PA. There is no engine-level safety clamp; the
+operator has to insert their own limiter.
+
+### 4. Unresolved capture bug: first ~2 s of every multitrack take is distorted
+The head-discard workaround was tried and reverted (commit `a6c2cb7`) because
+the corruption is in the tap itself. Virtual soundcheck and any as-recorded
+broadcast capture start with garbage. Does not affect the live mix path, but it
+undercuts the headline DAW feature. See "Known issues (unresolved)" in
+`plan/daw-timeline-roadmap.md`.
+
+### 5. `aux_sends` is a `std::map` mutated from the IPC thread while the audio thread reads it
+The *first* time an aux send is set for a channel during a show,
+`channels[id].aux_sends[bus] = value` inserts a node and can rebalance the tree
+mid-traversal on the RT thread — a genuine data race (torn read / rare crash).
+Subsequent updates to an existing key are benign. Pre-seeding every channel's 8
+aux entries at startup, or moving to a fixed array, closes this. (Faders / pans
+/ mutes are also written unsynchronized, but a torn float there is harmless —
+the map is the exception.)
+
+### 6. No xrun visibility
+The engine never registers `jack_set_xrun_callback`. Playback underruns are
+reported (`pbUnderrun`), but live dropouts under CPU pressure are invisible
+except via the toolbar CPU meter. On an i5-4570 with the RTA, LUFS, Goertzel
+master analyser and 40 Hz `snprintf`-built metering JSON all on the RT thread,
+the headroom question is real and currently unmeasured.
+
+### 7. Loudness / true-peak numbers are approximate
+True-peak is a "cheap 2x estimate," not the ITU 4x oversampled filter — fine
+for guidance, not for a compliance report.
+
+### 8. No test coverage
+Zero engine or server tests. The recorder finalisation path is documented as
+fragile and has broken twice.
+
+## Recommendations before trusting it on a real show
+
+- Add a `jack_set_xrun_callback` and surface xrun count / DSP load in the UI;
+  then run a soak test on the actual appliance with a full plugin load and all
+  analysers active.
+- Fix solo: route soloed channels to the Monitor bus only, leave Master
+  untouched (PFL/AFL).
+- Add a fixed peak limiter (or at least a hard clip guard) on the Master / Aux
+  outputs.
+- Pre-populate `aux_sends` for all 42 channel objects at startup so the IPC
+  thread never inserts into the map.
+- Treat the record-startup distortion as a release blocker for the
+  virtual-soundcheck workflow.
+- Address the dropout-on-restart story explicitly — a watchdog "hold last
+  buffer / fade," or document that anything critical needs an external safety
+  path.

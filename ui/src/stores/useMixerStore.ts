@@ -1,9 +1,11 @@
 import { create } from 'zustand';
 import { usePatchbayStore } from './usePatchbayStore';
 import { useDawStore } from './useDawStore';
+import { useLoudnessStore } from './useLoudnessStore';
 import { calfDefaultParams } from '../data/calfPlugins';
 import { uuid } from '../lib/uuid';
 import { setWs } from '../lib/wsBus';
+import { downloadText } from '../lib/download';
 
 export interface PluginNode {
   id: string;
@@ -595,6 +597,8 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       ws.send(JSON.stringify({ type: 'list_scenes' }));
       ws.send(JSON.stringify({ type: 'list_recording_projects' }));
       ws.send(JSON.stringify({ type: 'list_rack_presets' }));
+      ws.send(JSON.stringify({ type: 'get_loudness_config' }));
+      ws.send(JSON.stringify({ type: 'get_loudness_history' }));
       const mask = get().monitorInputMask;
       if (mask !== 0) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask }));
     };
@@ -924,6 +928,14 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             if (t.pbUnderrun) useDawStore.getState().flagPlaybackUnderrun();
             const st = t.state === 2 ? 'recording' : t.state === 1 ? 'playing' : 'stopped';
             if (get().transportState !== st) set({ transportState: st });
+            // Phase 3c: feed the timeline loudness-history strip (in-store 1 Hz
+            // throttle; only accumulates while rolling, matching the server log).
+            if (data.lufs && t.sr) {
+              useLoudnessStore.getState().push(
+                { sec: t.frame / t.sr, m: data.lufs.m, s: data.lufs.s, i: data.lufs.i, tp: data.lufs.tp },
+                t.state !== 0,
+              );
+            }
             // Engine restarts back to mask 0; re-assert our VSC monitor override
             // so per-channel live/timeline choices survive an engine recovery.
             const want = get().monitorInputMask;
@@ -960,6 +972,13 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           console.warn('multitrack take failed:', data.reason || 'unknown');
           useDawStore.getState().endRecordingClips();
           set({ transportState: 'stopped' });
+        } else if (data.type === 'loudness_config_loaded') {
+          useLoudnessStore.getState().applyConfig(data.config || {});
+        } else if (data.type === 'loudness_history') {
+          useLoudnessStore.getState().seed(data.points || [], data.target);
+        } else if (data.type === 'loudness_report') {
+          if (data.error) console.warn('loudness report:', data.error);
+          else if (data.csv) downloadText(String(data.name || 'loudness-report.csv'), data.csv);
         }
       } catch (e) {
         // Malformed or partial WebSocket frame — drop it, matching the
