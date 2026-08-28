@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore, type Channel } from '../stores/useMixerStore';
 import { RULER_H, DEFAULT_TRACK_H, LANE_H } from './SurfaceModel';
@@ -12,11 +13,14 @@ export function TrackPanel({ width }: { width: number }) {
   const monitorInputMask = useMixerStore((s) => s.monitorInputMask);
   const setChannelMonitorInput = useMixerStore((s) => s.setChannelMonitorInput);
   const scrollY = useDawStore((s) => s.scrollY);
+  const scrollX = useDawStore((s) => s.scrollX);
+  const setScroll = useDawStore((s) => s.setScroll);
   const heights = useDawStore((s) => s.trackHeights);
   const setTrackHeight = useDawStore((s) => s.setTrackHeight);
   const clips = useDawStore((s) => s.clips);
   const laneExpand = useDawStore((s) => s.laneExpand);
   const toggleLaneExpand = useDawStore((s) => s.toggleLaneExpand);
+  const outerRef = useRef<HTMLDivElement>(null);
 
   const tracks = Object.values(channels).filter((c: Channel) => c.type === 'input').sort((a, b) => a.id - b.id);
 
@@ -27,8 +31,22 @@ export function TrackPanel({ width }: { width: number }) {
     if (L > (laneCounts[c.trackId] || 0)) laneCounts[c.trackId] = L;
   }
 
+  const contentH = RULER_H + tracks.reduce((sum, t) => {
+    const compH = heights[t.id] || DEFAULT_TRACK_H;
+    const lanes = laneCounts[t.id] || 0;
+    return sum + compH + (laneExpand[t.id] && lanes > 0 ? LANE_H * lanes : 0);
+  }, 0);
+
+  // Wheel over the track headers scrolls the shared vertical position, so you
+  // don't have to be over the canvas to scroll the track list.
+  const onWheel = (e: React.WheelEvent) => {
+    const max = Math.max(0, contentH - (outerRef.current?.clientHeight ?? 0));
+    if (max <= 0) return;
+    setScroll(scrollX, Math.min(max, scrollY + e.deltaY));
+  };
+
   return (
-    <div className="shrink-0 bg-[#14161a] border-r border-black/60 relative overflow-hidden" style={{ width }}>
+    <div ref={outerRef} onWheel={onWheel} className="shrink-0 bg-[#14161a] border-r border-black/60 relative overflow-hidden" style={{ width }}>
       <div className="h-full" style={{ transform: `translateY(${-scrollY}px)` }}>
         <div style={{ height: RULER_H }} className="border-b border-black/60 bg-[#101216] flex items-center px-3 text-[10px] font-black tracking-widest text-gray-500">
           TRACKS
