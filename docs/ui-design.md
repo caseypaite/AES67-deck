@@ -119,9 +119,14 @@ Layers, bottom to top:
   slow-drag / Shift = fine.
 - Bipolar params: red centre tick + centre detent.
 - Accent = category / section colour.
-- `KNOB2624.knob` (WebKnobMan, see `webknobman.html`) is the sanctioned
-  photoreal sprite path — frames + rotation mapping live inside `<Knob>` so
-  every caller gets it.
+- **The FX editors already ship this as `AnalogKnob`
+  (`ui/src/components/analog/AnalogKnob.tsx`)** in the "LED level ring"
+  treatment — accent `conic-gradient` value arc (layer 6) instead of an
+  engraved tick ring, chromed cap, glowing accent pointer, pure CSS.
+  See `fx-ui-design.md` §3. The channel-strip `MiniAnalogKnob` still uses the
+  older skirt/knurl look; unify on `AnalogKnob` when `<Knob>` lands.
+- ~~`KNOB2624.knob` (WebKnobMan) sprite path~~ — superseded by the pure-CSS
+  LED-ring knob above.
 
 ### 2.2 Faders — `<Fader>`
 

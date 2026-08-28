@@ -1,7 +1,7 @@
 #!/bin/bash
 # Mixer-panel feature showcase: drives the real UI (against an isolated stack
 # with an animated fake engine) through a scripted tour, capturing a numbered
-# series of screenshots plus an animated GIF of the whole run.
+# series of screenshots plus a 1280x720 H.264 MP4 of the whole run.
 #
 #   cd test/browser && npm install && npm run showcase
 #
