@@ -99,6 +99,28 @@ interface MixerState {
 
   connectWebSocket: () => void;
   scenes: string[];
+  deleteScene: (name: string) => void;
+
+  // --- Virtual soundcheck (plan/daw-timeline-roadmap.md Phase 3a) ---
+  // Per-channel monitor override: bit (id-1) set => channel id monitors its
+  // LIVE input even while the timeline plays. Mirrors the engine's
+  // g_monitor_input_mask; 0 = every channel follows the transport.
+  monitorInputMask: number;
+  setChannelMonitorInput: (id: number, live: boolean) => void;
+  setAllMonitorInput: (live: boolean) => void;
+
+  // One-button arming for a virtual soundcheck: arm every input channel that
+  // has an AES67 source mapped in the patchbay (or disarm all inputs).
+  armAllMappedInputs: () => void;
+  disarmAllInputs: () => void;
+
+  vscConfig: {
+    autoRecord: boolean; splitOnMarker: boolean; minFreeGb: number;
+    schedule: { enabled: boolean; at: string };
+  };
+  vscStatus: { diskLow: boolean; freeGb: number | null; message: string | null };
+  setVscConfig: (patch: Partial<Omit<MixerState['vscConfig'], 'schedule'>> & { schedule?: Partial<MixerState['vscConfig']['schedule']> }) => void;
+  vscSplit: () => void;
 
   // Full system LV2 plugin catalog for the FX Rack's "Add Effect" browser,
   // populated once from the engine's startup scan (plugin_list/plugin_list_loaded).
@@ -249,7 +271,62 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   transportState: 'stopped',
   ws: null,
   selectedChannelId: null,
-  
+
+  monitorInputMask: 0,
+  vscConfig: { autoRecord: false, splitOnMarker: true, minFreeGb: 5, schedule: { enabled: false, at: '19:00' } },
+  vscStatus: { diskLow: false, freeGb: null, message: null },
+
+  setChannelMonitorInput: (id, live) => {
+    const bit = 1 << (id - 1);
+    const mask = live ? (get().monitorInputMask | bit) : (get().monitorInputMask & ~bit);
+    set({ monitorInputMask: mask >>> 0 });
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask: mask >>> 0 }));
+  },
+  setAllMonitorInput: (live) => {
+    let mask = 0;
+    if (live) {
+      for (const c of Object.values(get().channels)) if (c.type === 'input') mask |= (1 << (c.id - 1));
+    }
+    mask = mask >>> 0;
+    set({ monitorInputMask: mask });
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask }));
+  },
+
+  armAllMappedInputs: () => {
+    import('./usePatchbayStore').then(({ usePatchbayStore }) => {
+      const mappings = usePatchbayStore.getState().mappings;
+      for (const c of Object.values(get().channels)) {
+        if (c.type !== 'input') continue;
+        const mapped = !!mappings[c.id]?.sourceStreamId;
+        if (mapped && !c.arm) get().setChannelValue(c.id, 'arm', true);
+      }
+    });
+  },
+  disarmAllInputs: () => {
+    for (const c of Object.values(get().channels)) {
+      if (c.type === 'input' && c.arm) get().setChannelValue(c.id, 'arm', false);
+    }
+  },
+
+  setVscConfig: (patch) => {
+    set((s) => ({
+      vscConfig: {
+        autoRecord: patch.autoRecord ?? s.vscConfig.autoRecord,
+        splitOnMarker: patch.splitOnMarker ?? s.vscConfig.splitOnMarker,
+        minFreeGb: patch.minFreeGb ?? s.vscConfig.minFreeGb,
+        schedule: { ...s.vscConfig.schedule, ...(patch.schedule || {}) },
+      },
+    }));
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'vsc_set_config', ...get().vscConfig }));
+  },
+  vscSplit: () => {
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'vsc_split' }));
+  },
+
   setActiveView: (view) => set({ activeView: view }),
   setSelectedChannel: (id) => set({ selectedChannelId: id }),
   
@@ -266,6 +343,11 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       if (key === 'pan') ws.send(JSON.stringify({ type: 'set_pan', channel: id, value }));
       if (key === 'mute') ws.send(JSON.stringify({ type: 'set_mute', channel: id, value: value ? 1 : 0 }));
       if (key === 'solo') ws.send(JSON.stringify({ type: 'set_solo', channel: id, value: value ? 1 : 0 }));
+      // arm is persisted server-side (mixer_state.json) so the server knows the
+      // armed set for VSC auto-record; the engine ignores it (it gets the armed
+      // list at start_multitrack_record).
+      if (key === 'arm') ws.send(JSON.stringify({ type: 'set_arm', channel: id, value: value ? 1 : 0 }));
+      if (key === 'phase') ws.send(JSON.stringify({ type: 'set_phase', channel: id, value: value ? 1 : 0 }));
     }
   },
 
@@ -296,7 +378,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         // No index sent — the engine appends when it's omitted, matching
         // where this new plugin lands in the array below.
-        state.ws.send(JSON.stringify({ type: 'add_plugin', channel: channelId, uri: plugin.uri, enabled: plugin.enabled, params: plugin.params }));
+        state.ws.send(JSON.stringify({ type: 'add_plugin', channel: channelId, uri: plugin.uri, name: plugin.name, enabled: plugin.enabled, params: plugin.params }));
       }
       return { channels: { ...state.channels, [channelId]: { ...state.channels[channelId], plugins: [...state.channels[channelId].plugins, plugin] } } };
     });
@@ -321,7 +403,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
 
       const pluginIndex = channel.plugins.findIndex(p => p.id === pluginId);
       if (state.ws && state.ws.readyState === WebSocket.OPEN && pluginIndex !== -1) {
-        state.ws.send(JSON.stringify({ type: 'replace_plugin', channel: channelId, pluginIndex, uri: entry.uri, params: entry.defaultParams }));
+        state.ws.send(JSON.stringify({ type: 'replace_plugin', channel: channelId, pluginIndex, uri: entry.uri, name: entry.name.split(' ')[1] || entry.name, params: entry.defaultParams }));
       }
 
       const plugins = channel.plugins.map(p => {
@@ -372,6 +454,12 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     const ws = get().ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ type: 'delete_rack_preset', name }));
+  },
+
+  deleteScene: (name) => {
+    const ws = get().ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !name) return;
+    ws.send(JSON.stringify({ type: 'delete_scene', name }));
   },
 
   listRackPresets: () => {
@@ -448,7 +536,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       ws.send(JSON.stringify({
         type: 'load_rack',
         channel: channelId,
-        plugins: nodes.map(p => ({ uri: p.uri, enabled: p.enabled, params: p.params })),
+        plugins: nodes.map(p => ({ uri: p.uri, name: p.name, enabled: p.enabled, params: p.params })),
       }));
     }
   },
@@ -500,6 +588,17 @@ export const useMixerStore = create<MixerState>((set, get) => ({
     set({ ws });
     setWs(ws);
 
+    ws.onopen = () => {
+      // The server pushes most state on connect, but re-request the lists and
+      // re-assert transient engine state here too so a reconnect (or a race
+      // where a component's effect fired before the socket opened) converges.
+      ws.send(JSON.stringify({ type: 'list_scenes' }));
+      ws.send(JSON.stringify({ type: 'list_recording_projects' }));
+      ws.send(JSON.stringify({ type: 'list_rack_presets' }));
+      const mask = get().monitorInputMask;
+      if (mask !== 0) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask }));
+    };
+
     // Metering arrives faster than the screen refreshes and the pure-viz
     // parts (channel meters, FX in/out + RTA, LUFS, Master analyser) are
     // last-value-wins — coalesce them onto one animation frame so a burst
@@ -547,7 +646,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           // Server sends this on connect with the full persisted mixer state.
           // Apply it to all known channels without sending back to WS or engine.
           const incoming = data.state as Record<string, {
-            fader?: number; pan?: number; mute?: boolean; solo?: boolean;
+            fader?: number; pan?: number; mute?: boolean; solo?: boolean; arm?: boolean; phase?: boolean;
             auxSends?: Record<string, number>;
           }>;
           set(state => {
@@ -560,6 +659,8 @@ export const useMixerStore = create<MixerState>((set, get) => ({
               if (typeof ch.pan   === 'number') updated.pan   = ch.pan;
               if (typeof ch.mute  === 'boolean') updated.mute  = ch.mute;
               if (typeof ch.solo  === 'boolean') updated.solo  = ch.solo;
+              if (typeof ch.arm   === 'boolean') updated.arm   = ch.arm;
+              if (typeof ch.phase === 'boolean') updated.phase = ch.phase;
               if (ch.auxSends) {
                 const sends = { ...updated.auxSends };
                 for (const [busId, val] of Object.entries(ch.auxSends)) {
@@ -574,41 +675,60 @@ export const useMixerStore = create<MixerState>((set, get) => ({
         } else if (data.type === 'scenes_list') {
           set({ scenes: data.scenes });
         } else if (data.type === 'scene_data') {
-          const { mixer, patchbay } = data.state;
-          set({ channels: mixer.channels });
-          
+          const { mixer, patchbay } = data.state || {};
+          if (!mixer || !mixer.channels) {
+            console.warn('scene_data: malformed scene, ignoring', data.name);
+          } else {
+          // Normalise the persisted channel map (JSON keys are strings) back
+          // onto the live channel objects, keeping current meter values.
+          set((state) => {
+            const channels = { ...state.channels };
+            for (const raw of Object.values(mixer.channels as Record<string, Channel>)) {
+              const cid = Number(raw.id);
+              if (!channels[cid]) continue;
+              channels[cid] = {
+                ...channels[cid], ...raw,
+                meterL: channels[cid].meterL, meterR: channels[cid].meterR,
+              };
+            }
+            return { channels };
+          });
+
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
-            usePatchbayStore.setState({ mappings: patchbay.mappings });
-            if (get().ws && get().ws?.readyState === WebSocket.OPEN) {
-               get().ws?.send(JSON.stringify({ type: 'sync_patchbay_matrix', mappings: patchbay.mappings }));
-               
-               // Apply mixer states — persisted by save_scene from this
-               // app's own Channel objects, so the shape is trusted here
-               // rather than re-validated at load time. Field names below
-               // must match the engine's actual IPC protocol (channel +
-               // pluginIndex, not channelId/pluginId — see setChannelValue
-               // and setPluginParam/setPluginEnabled above for the same
-               // shapes in normal, already-working operation).
-               Object.values(mixer.channels as Record<number, Channel>).forEach((ch) => {
-                 get().ws?.send(JSON.stringify({ type: 'set_fader', channel: ch.id, value: ch.fader }));
-                 get().ws?.send(JSON.stringify({ type: 'set_pan', channel: ch.id, value: ch.pan }));
-                 get().ws?.send(JSON.stringify({ type: 'set_mute', channel: ch.id, value: ch.mute ? 1 : 0 }));
-                 get().ws?.send(JSON.stringify({ type: 'set_solo', channel: ch.id, value: ch.solo ? 1 : 0 }));
+            if (patchbay?.mappings) usePatchbayStore.setState({ mappings: patchbay.mappings });
+            const ws = get().ws;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+               if (patchbay?.mappings) ws.send(JSON.stringify({ type: 'sync_patchbay_matrix', mappings: patchbay.mappings }));
+
+               // Push levels to the engine the same way setChannelValue does:
+               // set_fader wants amplitude/2, not the 0..1 fader position.
+               Object.values(mixer.channels as Record<string, Channel>).forEach((ch) => {
+                 const id = Number(ch.id);
+                 const gain = positionToAmplitude(ch.fader ?? 0.75);
+                 ws.send(JSON.stringify({ type: 'set_fader', channel: id, value: gain / 2.0, faderPosition: ch.fader }));
+                 ws.send(JSON.stringify({ type: 'set_pan', channel: id, value: ch.pan ?? 0 }));
+                 ws.send(JSON.stringify({ type: 'set_mute', channel: id, value: ch.mute ? 1 : 0 }));
+                 ws.send(JSON.stringify({ type: 'set_solo', channel: id, value: ch.solo ? 1 : 0 }));
+                 if (typeof ch.arm === 'boolean') ws.send(JSON.stringify({ type: 'set_arm', channel: id, value: ch.arm ? 1 : 0 }));
+                 for (const [busId, level] of Object.entries(ch.auxSends || {})) {
+                   ws.send(JSON.stringify({ type: 'set_aux_send', channel: id, busId: Number(busId), value: level }));
+                 }
 
                  // load_rack actually instantiates each plugin in the live
                  // engine (see engine/src/main.cpp's PluginCmd) — sending
                  // per-index set_plugin_bypass/set_plugin_param here instead
                  // would silently no-op, since the engine wouldn't have any
                  // plugin slots at those indices yet.
-                 get().ws?.send(JSON.stringify({
+                 ws.send(JSON.stringify({
                    type: 'load_rack',
-                   channel: ch.id,
-                   plugins: (ch.plugins || []).map(p => ({ uri: p.uri, enabled: p.enabled, params: p.params }))
+                   channel: id,
+                   plugins: (ch.plugins || []).map(p => ({ uri: p.uri, name: p.name, enabled: p.enabled, params: p.params }))
                  }));
                });
             }
           });
           console.log(`Scene ${data.name} loaded and applied.`);
+          }
         } else if (data.type === 'rack_presets_list') {
           set({ rackPresets: data.presets || [] });
         } else if (data.type === 'rack_preset_data') {
@@ -636,10 +756,39 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             ws.send(JSON.stringify({
               type: 'load_rack',
               channel: targetChannelId,
-              plugins: plugins.map(p => ({ uri: p.uri, enabled: p.enabled, params: p.params }))
+              plugins: plugins.map(p => ({ uri: p.uri, name: p.name, enabled: p.enabled, params: p.params }))
             }));
           }
           console.log(`Rack preset "${data.name}" loaded onto channel ${targetChannelId}.`);
+        } else if (data.type === 'fx_racks_loaded') {
+          // Server-persisted insert chains — restore the rack UI on reload.
+          // The engine already holds these (or is fed them on its own
+          // reconnect), so this only repopulates the store — nothing is sent.
+          const racks = (data.racks || {}) as Record<string, Partial<PluginNode>[]>;
+          const avail = get().availablePlugins;
+          set((state) => {
+            const channels = { ...state.channels };
+            for (const [chId, list] of Object.entries(racks)) {
+              const cid = Number(chId);
+              if (!channels[cid] || !Array.isArray(list)) continue;
+              channels[cid] = {
+                ...channels[cid],
+                plugins: list
+                  .filter((p): p is Partial<PluginNode> & { uri: string } => typeof p.uri === 'string')
+                  .map((p) => ({
+                    id: uuid(),
+                    name: p.name
+                      || PLUGIN_REGISTRY.find((e) => e.uri === p.uri)?.name
+                      || avail.find((e) => e.uri === p.uri)?.name
+                      || 'Plugin',
+                    uri: p.uri,
+                    enabled: p.enabled !== false,
+                    params: (p.params && typeof p.params === 'object') ? p.params : {},
+                  })),
+              };
+            }
+            return { channels };
+          });
         } else if (data.type === 'patchbay_config_loaded') {
           import('./usePatchbayStore').then(({ usePatchbayStore }) => {
              usePatchbayStore.setState({ mappings: data.mappings });
@@ -720,6 +869,38 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             if (!state.channels[data.channel]) return state;
             return { channels: { ...state.channels, [data.channel]: { ...state.channels[data.channel], solo: !!data.value } } };
           });
+        } else if (data.type === 'set_arm' && typeof data.channel === 'number') {
+          set(state => {
+            if (!state.channels[data.channel]) return state;
+            return { channels: { ...state.channels, [data.channel]: { ...state.channels[data.channel], arm: !!data.value } } };
+          });
+        } else if (data.type === 'set_monitor_input_mask' && typeof data.mask === 'number') {
+          set({ monitorInputMask: data.mask >>> 0 });
+        } else if (data.type === 'vsc_config_loaded' && data.config) {
+          set({ vscConfig: {
+            autoRecord: !!data.config.autoRecord,
+            splitOnMarker: !!data.config.splitOnMarker,
+            minFreeGb: Number(data.config.minFreeGb) || 0,
+            schedule: {
+              enabled: !!data.config.schedule?.enabled,
+              at: typeof data.config.schedule?.at === 'string' ? data.config.schedule.at : '19:00',
+            },
+          } });
+        } else if (data.type === 'vsc_status') {
+          set(state => ({ vscStatus: {
+            diskLow: typeof data.diskLow === 'boolean' ? data.diskLow : state.vscStatus.diskLow,
+            freeGb: typeof data.freeGb === 'number' ? data.freeGb : state.vscStatus.freeGb,
+            message:
+              data.autoStopped ? 'Recording stopped — disk full'
+              : data.scheduleError ? `Scheduled start failed: ${data.scheduleError}`
+              : data.autoRecordError ? `Auto-record failed: ${data.autoRecordError}`
+              : data.splitError ? `Split failed: ${data.splitError}`
+              : data.diskLow ? `Disk low${typeof data.freeGb === 'number' ? ` — ${data.freeGb} GB free` : ''}`
+              : data.scheduledStarted ? 'Scheduled recording started'
+              : data.autoRecordStarted ? 'Auto-record started'
+              : data.splitDone ? 'Take split'
+              : null,
+          } }));
         } else if (data.type === 'set_aux_send' && typeof data.channel === 'number' && typeof data.busId === 'number') {
           set(state => {
             const ch = state.channels[data.channel];
@@ -743,6 +924,12 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             if (t.pbUnderrun) useDawStore.getState().flagPlaybackUnderrun();
             const st = t.state === 2 ? 'recording' : t.state === 1 ? 'playing' : 'stopped';
             if (get().transportState !== st) set({ transportState: st });
+            // Engine restarts back to mask 0; re-assert our VSC monitor override
+            // so per-channel live/timeline choices survive an engine recovery.
+            const want = get().monitorInputMask;
+            if (want !== 0 && typeof t.monInMask === 'number' && (t.monInMask >>> 0) !== want) {
+              get().ws?.send(JSON.stringify({ type: 'set_monitor_input_mask', mask: want }));
+            }
           }
         } else if (data.type === 'aes67_discovery') {
           const { upsertStream } = usePatchbayStore.getState();

@@ -9,6 +9,8 @@ export function TrackPanel({ width }: { width: number }) {
   const channels = useMixerStore((s) => s.channels);
   const setChannelValue = useMixerStore((s) => s.setChannelValue);
   const renameChannel = useMixerStore((s) => s.renameChannel);
+  const monitorInputMask = useMixerStore((s) => s.monitorInputMask);
+  const setChannelMonitorInput = useMixerStore((s) => s.setChannelMonitorInput);
   const scrollY = useDawStore((s) => s.scrollY);
   const heights = useDawStore((s) => s.trackHeights);
   const setTrackHeight = useDawStore((s) => s.setTrackHeight);
@@ -52,6 +54,18 @@ export function TrackPanel({ width }: { width: number }) {
                     </button>
                   );
                 })}
+                {(() => {
+                  const live = (monitorInputMask & (1 << (t.id - 1))) !== 0;
+                  return (
+                    <button
+                      onClick={() => setChannelMonitorInput(t.id, !live)}
+                      title={live ? 'Monitoring live input (click for timeline)' : 'Following the timeline (click to pin live input)'}
+                      className={`w-6 h-5 rounded text-[8px] font-bold flex items-center justify-center transition-colors ml-auto ${live ? 'bg-amber-500 text-black' : 'bg-[#2a2c33] text-gray-500 hover:bg-[#333]'}`}
+                    >
+                      {live ? 'IN' : 'TL'}
+                    </button>
+                  );
+                })()}
               </div>
               {!compact && (
                 <div className="mt-1 h-1.5 bg-black rounded-sm overflow-hidden flex flex-col justify-end gap-px">

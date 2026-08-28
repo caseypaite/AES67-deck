@@ -38,6 +38,7 @@ struct ChannelState {
     float pan = 0.0f;
     bool mute = false;
     bool solo = false;
+    bool phase = false;   // polarity invert (the "ø" button)
 
     float current_peak_l = 0.0f;
     float current_peak_r = 0.0f;
@@ -267,6 +268,12 @@ struct Transport {
 };
 static Transport g_transport;
 
+// Virtual-soundcheck per-channel monitor source override. Bit (i-1) set => input
+// channel i monitors its LIVE JACK input even while the timeline is playing
+// (state 1); clear => it follows the transport like normal. Written from the IPC
+// thread, read once per channel per audio block — relaxed is fine.
+static std::atomic<uint32_t> g_monitor_input_mask{0};
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -415,6 +422,8 @@ int main(int argc, char** argv) {
                 channels[channel_id].mute = (value > 0.5f);
             } else if (type == "set_solo") {
                 channels[channel_id].solo = (value > 0.5f);
+            } else if (type == "set_phase") {
+                channels[channel_id].phase = (value > 0.5f);
             } else if (type == "set_aux_send") {
                 channels[channel_id].aux_sends[bus_id] = value; std::cout << "Set AUX SEND CH " << channel_id << " BUS " << bus_id << " to " << value << std::endl;
             }
@@ -500,6 +509,9 @@ int main(int argc, char** argv) {
             int64_t f = j.value("frame", (int64_t)0);
             if (f < 0) f = 0;
             g_transport.locate_to.store(f, std::memory_order_relaxed);
+
+        } else if (type == "set_monitor_input_mask") {
+            g_monitor_input_mask.store(j.value("mask", (uint32_t)0), std::memory_order_relaxed);
 
         } else if (type == "transport_set_loop") {
             uint64_t s = j.value("start", (uint64_t)0);
@@ -818,8 +830,21 @@ int main(int argc, char** argv) {
             // render() overwrites tmp_L/tmp_R with this track's clip audio
             // (silence in gaps). Everything downstream — inserts, fader, pan,
             // sends, metering, routing — then applies unchanged.
-            if (transport_state == 1) {
+            //
+            // Virtual soundcheck: a channel whose bit is set in
+            // g_monitor_input_mask stays on its live input even while the
+            // timeline plays, so the operator can A/B one source (or a
+            // talkback mic) against the recorded mix.
+            const bool force_live =
+                g_monitor_input_mask.load(std::memory_order_relaxed) & (1u << (i - 1));
+            if (transport_state == 1 && !force_live) {
                 player.render(i, tmp_L.data(), tmp_R.data(), nframes);
+            }
+
+            // Polarity invert ("ø") — applied to whatever the channel source is
+            // (live input or timeline playback), ahead of the insert chain.
+            if (st.phase) {
+                for (uint32_t s = 0; s < nframes; ++s) { tmp_L[s] = -tmp_L[s]; tmp_R[s] = -tmp_R[s]; }
             }
 
             // 2. Process LV2 Insert Chain
@@ -1251,12 +1276,13 @@ int main(int argc, char** argv) {
             // ── Transport position (engine-owned clock; UI/server follow).
             //    `buf` = the process block size, for the toolbar latency readout.
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
-                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d}",
+                ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d,\"monInMask\":%u}",
                 static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
                 g_transport.state.load(std::memory_order_relaxed),
                 static_cast<int>(jack.get_sample_rate()),
                 static_cast<unsigned>(nframes),
-                player.take_underrun() ? 1 : 0);
+                player.take_underrun() ? 1 : 0,
+                g_monitor_input_mask.load(std::memory_order_relaxed));
 
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 

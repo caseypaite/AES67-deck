@@ -10,13 +10,14 @@ import { Screw } from '../components/analog/Screw';
 import { LufsPanel } from '../components/mixer/LufsPanel';
 import { MasteringPanel } from '../components/mixer/MasteringPanel';
 import { SaveDialog, ConfirmDialog } from '../components/common/SaveDialog';
+import { VscToolbar } from '../components/daw/VscToolbar';
 
 // Compact box/engine telemetry for the right end of the toolbar:
 // CPU load and RAM from the server, audio round-trip latency from the engine.
 const StatCell = ({ label, value, tone }: { label: string; value: string; tone: string }) => (
   <div className="flex flex-col items-end leading-none">
-    <span className="text-[8px] font-black tracking-widest text-gray-600">{label}</span>
-    <span className={`text-[11px] font-mono font-bold ${tone}`}>{value}</span>
+    <span className="text-[10px] font-black tracking-widest text-gray-500">{label}</span>
+    <span className={`text-[12px] font-mono font-bold ${tone}`}>{value}</span>
   </div>
 );
 const tone = (v: number | null, warn: number, bad: number) =>
@@ -31,7 +32,7 @@ const ServerStats = ({ stats, latencyMs }: {
   const total = stats?.memTotalMB ?? null;
   const memPct = used != null && total ? (used / total) * 100 : null;
   return (
-    <div className="flex items-center gap-3 bg-[#050608] px-3 py-1 rounded border border-gray-800 shadow-inner">
+    <div className="flex items-center gap-2 bg-[#050608] px-1.5 py-0.5 rounded border border-gray-800 shadow-inner">
       <StatCell label="CPU" value={cpu == null ? '—' : `${cpu.toFixed(0)}%`} tone={tone(cpu, 60, 85)} />
       <StatCell
         label="RAM"
@@ -364,13 +365,27 @@ export const LiveConsoleView = () => {
   // null = closed; 'scene' | 'project' selects which save dialog is open.
   const [saveDialog, setSaveDialog] = useState<null | 'scene' | 'project'>(null);
   const [pendingOpenProject, setPendingOpenProject] = useState<string | null>(null);
+  const [sceneSel, setSceneSel] = useState('');
+  const [pendingDeleteScene, setPendingDeleteScene] = useState<string | null>(null);
+  const deleteScene = useMixerStore(state => state.deleteScene);
+
+  // Keep the selection valid as the scene list changes (e.g. after a delete).
+  useEffect(() => {
+    if (sceneSel && !scenes.includes(sceneSel)) setSceneSel('');
+  }, [scenes, sceneSel]);
 
   const doSaveScene = (name: string) => {
-    const patchbayMappings = usePatchbayStore.getState().mappings;
-    const state = { mixer: { channels }, patchbay: { mappings: patchbayMappings } };
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'save_scene', name, state }));
+    if (!name.trim() || !ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn('save scene: no name or socket not open');
+      return;
     }
+    const patchbayMappings = usePatchbayStore.getState().mappings;
+    // Drop the transient meter readings so a scene file is just the settings.
+    const cleanChannels = Object.fromEntries(
+      Object.values(channels).map((c) => [c.id, { ...c, meterL: -100, meterR: -100 }]),
+    );
+    const state = { mixer: { channels: cleanChannels }, patchbay: { mappings: patchbayMappings } };
+    ws.send(JSON.stringify({ type: 'save_scene', name: name.trim(), state }));
   };
 
   const handleLoadScene = (name: string) => {
@@ -414,6 +429,16 @@ export const LiveConsoleView = () => {
           onClose={() => setSaveDialog(null)}
         />
       )}
+      {pendingDeleteScene && (
+        <ConfirmDialog
+          title="Delete scene"
+          message={`Delete scene "${pendingDeleteScene}"? This cannot be undone.`}
+          confirmLabel="Delete"
+          danger
+          onConfirm={() => { deleteScene(pendingDeleteScene); setSceneSel(''); }}
+          onClose={() => setPendingDeleteScene(null)}
+        />
+      )}
       {pendingOpenProject && (
         <ConfirmDialog
           title="Open recording project"
@@ -449,6 +474,7 @@ export const LiveConsoleView = () => {
         <div className="flex gap-2 items-center">
           {activeView === 'daw' ? (
             <>
+              <VscToolbar />
               <button
                 onClick={() => setSaveDialog('project')}
                 title={activeRecordingProject ? `Saving to records/${activeRecordingProject}/` : 'Consolidate takes into a REAPER project'}
@@ -469,10 +495,22 @@ export const LiveConsoleView = () => {
           ) : (
             <>
               <button onClick={() => setSaveDialog('scene')} className="px-3 py-1.5 bg-[#1a1c22] hover:bg-green-700 text-white text-[10px] font-bold rounded shadow-sm border border-[#222]">SAVE SCENE</button>
-              <select onChange={e => { handleLoadScene(e.target.value); e.target.value = ''; }} className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-32 cursor-pointer shadow-sm">
+              <select
+                value={sceneSel}
+                onChange={e => { const v = e.target.value; setSceneSel(v); handleLoadScene(v); }}
+                className="px-2 py-1.5 bg-[#1a1c22] text-white text-[10px] font-bold rounded outline-none border border-[#333] w-32 cursor-pointer shadow-sm"
+              >
                  <option value="">LOAD SCENE...</option>
                  {scenes.map((s: string) => <option key={s} value={s}>{s}</option>)}
               </select>
+              <button
+                onClick={() => sceneSel && setPendingDeleteScene(sceneSel)}
+                disabled={!sceneSel}
+                title={sceneSel ? `Delete scene "${sceneSel}"` : 'Select a scene to delete'}
+                className="px-2 py-1.5 bg-[#1a1c22] text-gray-400 text-[10px] font-bold rounded shadow-sm border border-[#333] enabled:hover:bg-red-700 enabled:hover:text-white disabled:opacity-40"
+              >
+                🗑
+              </button>
             </>
           )}
         </div>

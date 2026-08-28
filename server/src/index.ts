@@ -193,6 +193,14 @@ function ensureProject(name: string): void {
   }
 }
 
+function listScenes(): string[] {
+  try {
+    return fs.readdirSync(SCENES_DIR).filter(f => f.endsWith('.json')).map(f => f.replace(/\.json$/, '')).sort();
+  } catch {
+    return [];
+  }
+}
+
 function listProjects(): string[] {
   try {
     return fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
@@ -339,12 +347,125 @@ interface ChannelMixerState {
   pan?: number;
   mute?: boolean;
   solo?: boolean;
+  arm?: boolean;    // record-armed for multitrack capture (plan Phase 3a)
+  phase?: boolean;  // polarity invert ("ø")
   auxSends?: Record<string, number>;
 }
 type MixerStateMap = Record<string, ChannelMixerState>;
 
 let mixerState: MixerStateMap = {};
 let mixerStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+// --- FX rack persistence -------------------------------------------------
+// The engine's per-channel insert chains are runtime-only. The server mirrors
+// them here by observing the same add/remove/reorder/replace/param/bypass/
+// load_rack messages it already forwards, persists the result, and replays it:
+// to a reconnecting engine (load_rack per channel) and to a connecting UI
+// (fx_racks_loaded). Same self-heal contract as routing / mixer_state.
+const FX_RACKS_PATH = 'fx_racks.json';
+interface FxNode { uri: string; name?: string; enabled: boolean; params: Record<string, number>; }
+type FxRacks = Record<string, FxNode[]>; // channel id -> ordered insert chain
+
+let fxRacks: FxRacks = {};
+let fxRacksSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function loadFxRacks() {
+  try {
+    if (fs.existsSync(FX_RACKS_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(FX_RACKS_PATH, 'utf8'));
+      if (raw && typeof raw === 'object') fxRacks = raw;
+      console.log(`Loaded FX racks for ${Object.keys(fxRacks).length} channels from disk.`);
+    }
+  } catch (e) {
+    console.error('Error loading fx_racks.json, starting fresh', e);
+  }
+}
+
+function saveFxRacks() {
+  if (fxRacksSaveTimer) clearTimeout(fxRacksSaveTimer);
+  fxRacksSaveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(FX_RACKS_PATH, JSON.stringify(fxRacks, null, 2));
+    } catch (e) {
+      console.error('Error saving fx_racks.json', e);
+    }
+  }, 500);
+}
+
+function normalizeFxNode(p: any): FxNode {
+  return {
+    uri: String(p?.uri || ''),
+    name: typeof p?.name === 'string' ? p.name : undefined,
+    enabled: p?.enabled !== false,
+    params: (p?.params && typeof p.params === 'object') ? p.params : {},
+  };
+}
+
+// Apply one UI plugin message to the mirrored fxRacks[ch]. Mirrors the array
+// maths in the UI store's plugin actions and the engine's PluginCmd handling.
+// Only touches (or creates) fxRacks[ch] on a real mutation — no empty-array
+// cruft for channels that never had an insert chain. Empty chains are pruned.
+function applyFxRackMessage(data: any): boolean {
+  if (typeof data.channel !== 'number') return false;
+  const ch = String(data.channel);
+
+  if (data.type === 'load_rack') {
+    const next = Array.isArray(data.plugins) ? data.plugins.map(normalizeFxNode).filter((p: FxNode) => p.uri) : [];
+    if (next.length === 0) delete fxRacks[ch]; else fxRacks[ch] = next;
+    return true;
+  }
+
+  if (data.type === 'add_plugin') {
+    const node = normalizeFxNode(data);
+    if (!node.uri) return false;
+    const chain = fxRacks[ch] || (fxRacks[ch] = []);
+    const idx = Number.isInteger(data.index) && data.index >= 0 && data.index <= chain.length ? data.index : chain.length;
+    chain.splice(idx, 0, node);
+    return true;
+  }
+
+  const chain = fxRacks[ch];
+  if (!chain) return false; // nothing to edit yet
+  const i = data.pluginIndex;
+  const inRange = Number.isInteger(i) && i >= 0 && i < chain.length;
+  let changed = false;
+
+  switch (data.type) {
+    case 'remove_plugin':
+      if (inRange) { chain.splice(i, 1); changed = true; }
+      break;
+    case 'reorder_plugin': {
+      const { fromIndex: from, toIndex: to } = data;
+      if (Number.isInteger(from) && Number.isInteger(to) && from >= 0 && from < chain.length && to >= 0 && to < chain.length) {
+        const [m] = chain.splice(from, 1);
+        chain.splice(to, 0, m);
+        changed = true;
+      }
+      break;
+    }
+    case 'replace_plugin':
+      if (inRange && typeof data.uri === 'string') {
+        chain[i] = {
+          uri: data.uri, name: typeof data.name === 'string' ? data.name : undefined,
+          enabled: true, params: (data.params && typeof data.params === 'object') ? data.params : {},
+        };
+        changed = true;
+      }
+      break;
+    case 'set_plugin_param':
+      if (inRange && typeof data.paramId === 'string') {
+        chain[i].params = { ...chain[i].params, [data.paramId]: data.value };
+        changed = true;
+      }
+      break;
+    case 'set_plugin_bypass':
+      if (inRange) { chain[i].enabled = Number(data.value) < 0.5; changed = true; }
+      break;
+  }
+
+  if (changed && chain.length === 0) delete fxRacks[ch];
+  return changed;
+}
 
 function loadMixerState() {
   try {
@@ -396,6 +517,8 @@ function buildEngineRestoreCommands(): string[] {
       lines.push(JSON.stringify({ type: 'set_mute', channel, value: ch.mute ? 1 : 0 }));
     if (typeof ch.solo === 'boolean')
       lines.push(JSON.stringify({ type: 'set_solo', channel, value: ch.solo ? 1 : 0 }));
+    if (typeof ch.phase === 'boolean')
+      lines.push(JSON.stringify({ type: 'set_phase', channel, value: ch.phase ? 1 : 0 }));
     if (ch.auxSends)
       for (const [busId, level] of Object.entries(ch.auxSends))
         lines.push(JSON.stringify({ type: 'set_aux_send', channel, busId: Number(busId), value: level }));
@@ -404,6 +527,7 @@ function buildEngineRestoreCommands(): string[] {
 }
 
 loadMixerState();
+loadFxRacks();
 
 // Fixed console topology (mirrors engine/src/main.cpp's constants exactly —
 // this is not runtime-configurable, since the engine only registers JACK
@@ -477,6 +601,182 @@ function getTalkbackConfig(): TalkbackConfig {
   return { sourcePorts, destBusIds, micSourceName, micAlsaPortName };
 }
 
+// --- Virtual soundcheck (plan/daw-timeline-roadmap.md Phase 3a) ------------
+// Unattended multitrack capture of a live show: auto-start on first play,
+// split the take at each marker, guard the disk, and optionally start on a
+// daily schedule. Config is a small JSON file next to the others.
+const VSC_CONFIG_PATH = 'vsc_config.json';
+
+interface VscConfig {
+  autoRecord: boolean;        // open a take automatically on the first transport_play
+  splitOnMarker: boolean;     // a marker drop while recording splits into a new take
+  minFreeGb: number;          // warn below this much free space in RECORDS_DIR
+  schedule: { enabled: boolean; at: string /* "HH:MM", local time */ };
+}
+
+const VSC_DEFAULTS: VscConfig = {
+  autoRecord: false, splitOnMarker: true, minFreeGb: 5,
+  schedule: { enabled: false, at: '19:00' },
+};
+
+function getVscConfig(): VscConfig {
+  try {
+    if (fs.existsSync(VSC_CONFIG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(VSC_CONFIG_PATH, 'utf8'));
+      return {
+        autoRecord: typeof raw.autoRecord === 'boolean' ? raw.autoRecord : VSC_DEFAULTS.autoRecord,
+        splitOnMarker: typeof raw.splitOnMarker === 'boolean' ? raw.splitOnMarker : VSC_DEFAULTS.splitOnMarker,
+        minFreeGb: Number.isFinite(raw.minFreeGb) && raw.minFreeGb >= 0 ? Number(raw.minFreeGb) : VSC_DEFAULTS.minFreeGb,
+        schedule: {
+          enabled: typeof raw?.schedule?.enabled === 'boolean' ? raw.schedule.enabled : VSC_DEFAULTS.schedule.enabled,
+          at: /^\d{1,2}:\d{2}$/.test(raw?.schedule?.at || '') ? raw.schedule.at : VSC_DEFAULTS.schedule.at,
+        },
+      };
+    }
+  } catch (e) {
+    console.error('Error reading vsc_config.json, using defaults', e);
+  }
+  return { ...VSC_DEFAULTS, schedule: { ...VSC_DEFAULTS.schedule } };
+}
+
+function writeVscConfig(patch: Partial<VscConfig>): VscConfig {
+  const cur = getVscConfig();
+  const next: VscConfig = { ...cur, schedule: { ...cur.schedule } };
+  if (typeof patch.autoRecord === 'boolean') next.autoRecord = patch.autoRecord;
+  if (typeof patch.splitOnMarker === 'boolean') next.splitOnMarker = patch.splitOnMarker;
+  if (Number.isFinite(patch.minFreeGb) && (patch.minFreeGb as number) >= 0) next.minFreeGb = Number(patch.minFreeGb);
+  if (patch.schedule && typeof patch.schedule === 'object') {
+    if (typeof patch.schedule.enabled === 'boolean') next.schedule.enabled = patch.schedule.enabled;
+    if (/^\d{1,2}:\d{2}$/.test(patch.schedule.at || '')) next.schedule.at = patch.schedule.at;
+  }
+  try {
+    fs.writeFileSync(VSC_CONFIG_PATH, JSON.stringify(next, null, 2));
+  } catch (e) {
+    console.error('Error writing vsc_config.json', e);
+  }
+  return next;
+}
+
+// Input channel ids the operator has record-armed (persisted in mixerState).
+function armedChannels(): number[] {
+  const out: number[] = [];
+  for (let ch = 1; ch <= NUM_CHANNELS; ch++) {
+    if (mixerState[String(ch)]?.arm) out.push(ch);
+  }
+  return out;
+}
+
+// The armed set of the take currently open (for split — a split reopens with
+// the same channels).
+let lastArmed: number[] = [];
+
+// Set by vsc_split: the channels to immediately re-arm once the engine confirms
+// the current take has closed (handleTakeFinished consumes it).
+let pendingSplitArmed: number[] | null = null;
+
+// Open a multitrack take: make the take dir, remember it, tell the engine.
+// Shared by the manual start_multitrack_record path, auto-record, split and
+// the scheduler. Returns an error string, or null on success.
+function startTake(armed: number[]): string | null {
+  const valid = armed.filter((n) => Number.isInteger(n) && n >= 1 && n <= NUM_CHANNELS);
+  if (valid.length === 0) return 'no armed tracks';
+  if (!engineSocket) return 'engine not connected';
+  if (activeTakeDir) return 'already recording';
+  ensureProject(activeProjectName);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
+  activeTakeDir = path.join(projectDir(activeProjectName), 'takes', ts);
+  fs.mkdirSync(activeTakeDir, { recursive: true });
+  lastArmed = valid;
+  engineSocket.write(JSON.stringify({
+    type: 'start_multitrack_record', dir: path.resolve(activeTakeDir), armed: valid,
+  }) + '\n');
+  startDiskGuard();
+  return null;
+}
+
+function stopTake(): void {
+  if (engineSocket && activeTakeDir) {
+    engineSocket.write(JSON.stringify({ type: 'stop_multitrack_record' }) + '\n');
+  }
+}
+
+// --- disk-space guard: poll RECORDS_DIR free space while a take is open ---
+let diskGuardTimer: ReturnType<typeof setInterval> | null = null;
+let diskWasLow = false;
+
+function diskFreeGb(): number {
+  try {
+    const s = fs.statfsSync(RECORDS_DIR);
+    return (Number(s.bsize) * Number(s.bavail)) / 1e9;
+  } catch {
+    return Infinity;
+  }
+}
+
+function startDiskGuard(): void {
+  if (diskGuardTimer) return;
+  diskWasLow = false;
+  const check = () => {
+    if (!activeTakeDir) { stopDiskGuard(); return; }
+    const freeGb = Math.round(diskFreeGb() * 10) / 10;
+    const min = getVscConfig().minFreeGb;
+    if (freeGb < 1) {
+      stopTake();
+      broadcastToClients(JSON.stringify({ type: 'vsc_status', diskLow: true, autoStopped: true, freeGb }));
+      diskWasLow = true;
+    } else if (freeGb < min) {
+      broadcastToClients(JSON.stringify({ type: 'vsc_status', diskLow: true, freeGb }));
+      diskWasLow = true;
+    } else if (diskWasLow) {
+      broadcastToClients(JSON.stringify({ type: 'vsc_status', diskLow: false, freeGb }));
+      diskWasLow = false;
+    }
+  };
+  diskGuardTimer = setInterval(check, 10_000);
+  check();
+}
+
+function stopDiskGuard(): void {
+  if (diskGuardTimer) { clearInterval(diskGuardTimer); diskGuardTimer = null; }
+  if (diskWasLow) {
+    broadcastToClients(JSON.stringify({ type: 'vsc_status', diskLow: false }));
+    diskWasLow = false;
+  }
+}
+
+// --- scheduled start: one daily HH:MM timer -------------------------------
+let vscScheduleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function rearmVscSchedule(): void {
+  if (vscScheduleTimer) { clearTimeout(vscScheduleTimer); vscScheduleTimer = null; }
+  const cfg = getVscConfig();
+  if (!cfg.schedule.enabled) return;
+  const [h, m] = cfg.schedule.at.split(':').map(Number);
+  const now = new Date();
+  const fire = new Date(now);
+  fire.setHours(h, m, 0, 0);
+  if (fire.getTime() <= now.getTime()) fire.setDate(fire.getDate() + 1);
+  const delay = fire.getTime() - now.getTime();
+  vscScheduleTimer = setTimeout(() => {
+    vscScheduleTimer = null;
+    const armed = armedChannels();
+    if (engineSocket && armed.length > 0 && !activeTakeDir) {
+      const err = startTake(armed);
+      if (!err) {
+        engineSocket.write(JSON.stringify({ type: 'transport_play' }) + '\n');
+        broadcastToClients(JSON.stringify({ type: 'vsc_status', scheduledStarted: true, armed }));
+      } else {
+        broadcastToClients(JSON.stringify({ type: 'vsc_status', scheduleError: err }));
+      }
+    } else {
+      broadcastToClients(JSON.stringify({ type: 'vsc_status', scheduleError: 'no armed tracks or engine offline' }));
+    }
+    rearmVscSchedule(); // next day
+  }, delay);
+}
+
+rearmVscSchedule();
+
 // Set up WebSocket server
 const wss = new WebSocketServer({ port: WSS_PORT });
 console.log(`WebSocket Server listening on ws://localhost:${WSS_PORT}`);
@@ -497,6 +797,7 @@ wss.on('connection', (ws) => {
 
   ws.send(JSON.stringify({ type: 'output_routing_loaded', outputs: getOutputRouting() }));
   ws.send(JSON.stringify({ type: 'talkback_config_loaded', ...getTalkbackConfig() }));
+  ws.send(JSON.stringify({ type: 'vsc_config_loaded', config: getVscConfig() }));
   ws.send(JSON.stringify({ type: 'daemon_destinations_loaded', destinations: lastDaemonDestinations, daemonReachable }));
   ws.send(JSON.stringify(daemonStateMessage()));
   ws.send(JSON.stringify({ type: 'mic_devices_loaded', devices: lastMicDevices }));
@@ -509,8 +810,14 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ type: 'mixer_state_loaded', state: mixerState }));
   }
 
+  // Send the persisted FX insert chains so the rack UI restores on reload.
+  if (Object.keys(fxRacks).length > 0) {
+    ws.send(JSON.stringify({ type: 'fx_racks_loaded', racks: fxRacks }));
+  }
+
   // DAW: the active project (arrangement) and the available projects. A
   // REAPER recording project takes precedence over the scratch session.
+  ws.send(JSON.stringify({ type: 'scenes_list', scenes: listScenes() }));
   ws.send(JSON.stringify({ type: 'projects_list', projects: listProjects(), active: activeProjectName }));
   ws.send(JSON.stringify({ type: 'recording_projects_list', projects: listRecordingProjects(), active: activeRecordingProject }));
   if (activeRecordingProject && fs.existsSync(rppPath(activeRecordingProject))) {
@@ -538,7 +845,7 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(payloadStr);
       // Only forward allowed types to prevent arbitrary data injection
       const allowedTypes = [
-        'set_fader', 'set_pan', 'set_mute', 'set_solo', 'set_aux_send', 'start_record', 'stop_record',
+        'set_fader', 'set_pan', 'set_mute', 'set_solo', 'set_arm', 'set_phase', 'set_aux_send', 'start_record', 'stop_record',
         'set_plugin_param', 'set_plugin_bypass', 'set_talkback_active',
         // Which plugin editor the UI has open — drives the engine's
         // per-plugin in/out metering (the `fx` key on `metering`).
@@ -552,18 +859,37 @@ wss.on('connection', (ws) => {
         // Transport control — engine owns the clock; plain forward + fan-out
         // to other clients (start/stop_multitrack_record are handled
         // explicitly below because the server injects the take directory).
-        'transport_play', 'transport_stop', 'transport_locate', 'transport_set_loop'
+        'transport_play', 'transport_stop', 'transport_locate', 'transport_set_loop',
+        // Virtual soundcheck: per-channel live/timeline monitor override mask
+        // (engine reads it every block); plain forward + fan-out.
+        'set_monitor_input_mask'
       ];
+
+      // Virtual soundcheck auto-record: opening the transport for the first
+      // time also opens a take, if armed. Non-terminating — transport_play
+      // still falls through to the generic forward + fan-out below.
+      if (data.type === 'transport_play' && getVscConfig().autoRecord && !activeTakeDir) {
+        const armed = armedChannels();
+        if (armed.length > 0) {
+          const err = startTake(armed);
+          broadcastToClients(JSON.stringify(
+            err ? { type: 'vsc_status', autoRecordError: err }
+                : { type: 'vsc_status', autoRecordStarted: true, armed }));
+        }
+      }
       if (data.type === 'save_scene') {
         const safeName = data.name.replace(/[^a-zA-Z0-9_-]/g, '_');
         fs.writeFileSync(path.join(SCENES_DIR, `${safeName}.json`), JSON.stringify(data.state, null, 2));
-        const scenes = fs.readdirSync(SCENES_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-        connectedWsClients.forEach(c => {
-           if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'scenes_list', scenes }));
-        });
+        broadcastToClients(JSON.stringify({ type: 'scenes_list', scenes: listScenes() }));
       } else if (data.type === 'list_scenes') {
-        const scenes = fs.readdirSync(SCENES_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-        ws.send(JSON.stringify({ type: 'scenes_list', scenes }));
+        ws.send(JSON.stringify({ type: 'scenes_list', scenes: listScenes() }));
+      } else if (data.type === 'delete_scene') {
+        const safeName = String(data.name || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const p = path.join(SCENES_DIR, `${safeName}.json`);
+        if (safeName && fs.existsSync(p)) {
+          try { fs.unlinkSync(p); } catch (e) { console.error('delete_scene failed', e); }
+        }
+        broadcastToClients(JSON.stringify({ type: 'scenes_list', scenes: listScenes() }));
       } else if (data.type === 'load_scene') {
         const safeName = data.name.replace(/[^a-zA-Z0-9_-]/g, '_');
         const p = path.join(SCENES_DIR, `${safeName}.json`);
@@ -868,26 +1194,27 @@ wss.on('connection', (ws) => {
           }
         });
       } else if (data.type === 'start_multitrack_record') {
-        const armed: number[] = Array.isArray(data.armed)
-          ? data.armed.filter((n: any) => Number.isInteger(n) && n >= 1 && n <= NUM_CHANNELS)
-          : [];
-        if (armed.length === 0) {
-          ws.send(JSON.stringify({ type: 'take_failed', reason: 'no armed tracks' }));
-        } else if (!engineSocket) {
-          ws.send(JSON.stringify({ type: 'take_failed', reason: 'engine not connected' }));
-        } else {
-          ensureProject(activeProjectName);
-          const ts = new Date().toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
-          activeTakeDir = path.join(projectDir(activeProjectName), 'takes', ts);
-          fs.mkdirSync(activeTakeDir, { recursive: true });
-          engineSocket.write(JSON.stringify({
-            type: 'start_multitrack_record',
-            dir: path.resolve(activeTakeDir),
-            armed,
-          }) + '\n');
-        }
+        const armed: number[] = Array.isArray(data.armed) ? data.armed : [];
+        const err = startTake(armed);
+        if (err) ws.send(JSON.stringify({ type: 'take_failed', reason: err }));
       } else if (data.type === 'stop_multitrack_record') {
-        if (engineSocket) engineSocket.write(JSON.stringify({ type: 'stop_multitrack_record' }) + '\n');
+        stopTake();
+      } else if (data.type === 'vsc_split') {
+        // Split the running take: close it and reopen with the same channels.
+        // The engine keeps the transport rolling across stop_multitrack_record,
+        // so the new take's origin frame is contiguous with the old one's end.
+        // handleTakeFinished reopens once the engine confirms the close.
+        if (activeTakeDir && engineSocket) {
+          pendingSplitArmed = lastArmed.slice();
+          stopTake();
+        }
+      } else if (data.type === 'vsc_set_config') {
+        const next = writeVscConfig({
+          autoRecord: data.autoRecord, splitOnMarker: data.splitOnMarker,
+          minFreeGb: data.minFreeGb, schedule: data.schedule,
+        });
+        rearmVscSchedule();
+        broadcastToClients(JSON.stringify({ type: 'vsc_config_loaded', config: next }));
       } else if (data.type === 'get_clip_peaks') {
         // Lazy waveform data: compute (and cache) min/max peaks for one take
         // file on first request, then serve from disk.
@@ -926,6 +1253,21 @@ wss.on('connection', (ws) => {
           if (!mixerState[ch]) mixerState[ch] = {};
           mixerState[ch].solo = !!data.value;
           saveMixerState();
+        } else if (data.type === 'set_arm' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          mixerState[ch].arm = !!data.value;
+          saveMixerState();
+        } else if (data.type === 'set_phase' && typeof data.channel === 'number') {
+          if (!mixerState[ch]) mixerState[ch] = {};
+          mixerState[ch].phase = !!data.value;
+          saveMixerState();
+        } else if (
+          data.type === 'add_plugin' || data.type === 'remove_plugin' ||
+          data.type === 'reorder_plugin' || data.type === 'replace_plugin' ||
+          data.type === 'load_rack' || data.type === 'set_plugin_param' ||
+          data.type === 'set_plugin_bypass'
+        ) {
+          if (applyFxRackMessage(data)) saveFxRacks();
         } else if (data.type === 'set_aux_send' && typeof data.channel === 'number') {
           if (!mixerState[ch]) mixerState[ch] = {};
           if (!mixerState[ch].auxSends) mixerState[ch].auxSends = {};
@@ -982,8 +1324,21 @@ function handleTakeStarted(msg: any): boolean {
 function handleTakeFinished(msg: any): boolean {
   const takeDir = activeTakeDir;
   activeTakeDir = null;
+  const splitArmed = pendingSplitArmed;
+  pendingSplitArmed = null;
+  if (!splitArmed) stopDiskGuard();
   if (!takeDir) return false;
   const takeName = path.basename(takeDir);
+
+  // A split: the current take just closed; reopen immediately with the same
+  // channels so capture is continuous. The engine kept the transport rolling,
+  // so this take's origin frame abuts the one that just finished.
+  const reopenForSplit = () => {
+    if (!splitArmed) return;
+    const err = startTake(splitArmed);
+    broadcastToClients(JSON.stringify(
+      err ? { type: 'vsc_status', splitError: err } : { type: 'vsc_status', splitDone: true }));
+  };
 
   const manifest = {
     originFrame: Number(msg.originFrame) || 0,
@@ -1044,6 +1399,7 @@ function handleTakeFinished(msg: any): boolean {
       type: 'take_committed', project: recName, takeDir: recName, overrun: !!msg.overrun, clips,
     }));
     pushTimelineToEngine(recName, merged);
+    reopenForSplit();
     return true;
   }
 
@@ -1057,6 +1413,7 @@ function handleTakeFinished(msg: any): boolean {
   // The committed clips aren't in project.json yet (the UI persists them via
   // save_project), so fold them into the engine schedule now.
   pushTimelineToEngine(activeProjectName, undefined, clips);
+  reopenForSplit();
   return true;
 }
 
@@ -1141,6 +1498,17 @@ const ipcServer = net.createServer((socket) => {
     if (restoreLines.length > 0) {
       console.log(`Mixer state restored to engine: ${restoreLines.length} commands sent.`);
     }
+    // Rebuild each channel's FX insert chain from the persisted snapshot.
+    let rackCount = 0;
+    for (const [chId, chain] of Object.entries(fxRacks)) {
+      if (!engineSocket || !Array.isArray(chain) || chain.length === 0) continue;
+      engineSocket.write(JSON.stringify({
+        type: 'load_rack', channel: Number(chId),
+        plugins: chain.map((p) => ({ uri: p.uri, enabled: p.enabled, params: p.params })),
+      }) + '\n');
+      rackCount++;
+    }
+    if (rackCount > 0) console.log(`FX racks restored to engine: ${rackCount} channels.`);
     // Replay the active project's timeline so playback works after an engine
     // restart, same self-heal contract as routing.
     pushTimelineToEngine(activeProjectName);
@@ -1171,6 +1539,7 @@ const ipcServer = net.createServer((socket) => {
               try { fs.rmSync(activeTakeDir, { recursive: true, force: true }); } catch { /* ignore */ }
             }
             activeTakeDir = null;
+            stopDiskGuard();
           }
         } catch {
           // Not JSON or not a message we care about caching; still forward below.

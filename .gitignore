@@ -10,6 +10,8 @@ server/patchbay_config.json
 server/output_routing.json
 server/talkback_config.json
 server/mixer_state.json
+server/fx_racks.json
+server/vsc_config.json
 
 # Saved DAW scenes (user session data)
 scenes/*.json
@@ -24,3 +26,7 @@ records/
 .DS_Store
 *.swp
 server/tx_sources.json
+server/rx_sinks.json
+
+# TS incremental build info
+*.tsbuildinfo

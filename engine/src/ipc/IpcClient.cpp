@@ -163,7 +163,7 @@ void IpcClient::run() {
                     } else if (type == "transport_play" || type == "transport_stop" ||
                                type == "transport_locate" || type == "transport_set_loop" ||
                                type == "start_multitrack_record" || type == "stop_multitrack_record" ||
-                               type == "set_timeline") {
+                               type == "set_timeline" || type == "set_monitor_input_mask") {
                         if (transport_callback_) transport_callback_(j);
                     } else {
                         int channel = j.value("channel", -1);

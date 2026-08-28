@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useDawStore } from '../stores/useDawStore';
+import { useMixerStore } from '../stores/useMixerStore';
 import { ArrangeSurface } from '../daw/ArrangeSurface';
 import { TrackPanel } from '../daw/TrackPanel';
 
@@ -14,6 +15,8 @@ export const DawView = () => {
   const setFps = useDawStore((s) => s.setFps);
   const lastOverrun = useDawStore((s) => s.lastOverrun);
   const playbackUnderrun = useDawStore((s) => s.playbackUnderrun);
+  const vscMessage = useMixerStore((s) => s.vscStatus.message);
+  const vscDiskLow = useMixerStore((s) => s.vscStatus.diskLow);
 
   const deleteSelected = useDawStore((s) => s.deleteSelected);
   const copySelected = useDawStore((s) => s.copySelected);
@@ -32,6 +35,20 @@ export const DawView = () => {
       else if ((e.ctrlKey || e.metaKey) && e.key === 'c') copySelected();
       else if ((e.ctrlKey || e.metaKey) && e.key === 'v') pasteClipboard();
       else if (e.key.toLowerCase() === 's' && !e.ctrlKey && !e.metaKey) sliceSelectedAtPlayhead();
+      else if (e.key.toLowerCase() === 'm' && !e.ctrlKey && !e.metaKey) {
+        const daw = useDawStore.getState();
+        daw.addMarker(daw.playheadPosition);
+        const mix = useMixerStore.getState();
+        if (mix.transportState === 'recording' && mix.vscConfig.splitOnMarker) mix.vscSplit();
+      } else if (e.key === ',' || e.key === '.') {
+        const daw = useDawStore.getState();
+        const times = Object.values(daw.markers).map((m) => m.time).sort((a, b) => a - b);
+        const pos = daw.playheadPosition;
+        const target = e.key === ','
+          ? [...times].reverse().find((t) => t < pos - 1e-3)
+          : times.find((t) => t > pos + 1e-3);
+        if (target !== undefined) daw.locate(target);
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -47,6 +64,12 @@ export const DawView = () => {
       {(lastOverrun || playbackUnderrun) && (
         <div className="absolute bottom-6 left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400">
           ⚠ {lastOverrun ? 'Last take dropped audio — disk could not keep up' : 'Playback dropout — disk could not keep up'}
+        </div>
+      )}
+
+      {(vscMessage || vscDiskLow) && (
+        <div className={`absolute bottom-16 left-8 z-40 px-3 py-1.5 rounded text-white text-xs font-bold shadow-xl border ${vscDiskLow ? 'bg-red-700 border-red-400' : 'bg-blue-700 border-blue-400'}`}>
+          {vscDiskLow ? '⚠ ' : ''}{vscMessage || 'Disk space low'}
         </div>
       )}
 

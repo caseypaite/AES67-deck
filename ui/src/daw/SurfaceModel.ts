@@ -19,9 +19,10 @@ export interface HitResult {
   kind:
     | 'clip' | 'clip-left' | 'clip-right'
     | 'clip-fade-in' | 'clip-fade-out' | 'clip-gain'
-    | 'lane' | 'ruler' | 'empty';
+    | 'lane' | 'ruler' | 'marker' | 'empty';
   clipId?: string;
   trackId?: number;
+  markerId?: string;
   time: number;
   cursor: string;
 }
@@ -131,7 +132,17 @@ export class SurfaceModel {
 
   hitTest(px: number, py: number): HitResult {
     const time = Math.max(0, this.xToTime(px));
-    if (py < RULER_H) return { kind: 'ruler', time, cursor: 'ew-resize' };
+    if (py < RULER_H) {
+      // Marker heads sit in the bottom half of the ruler.
+      if (py >= RULER_H - 12) {
+        const markers = Object.values(useDawStore.getState().markers);
+        for (const m of markers) {
+          if (Math.abs(this.timeToX(m.time) - px) <= 6)
+            return { kind: 'marker', markerId: m.id, time, cursor: 'ew-resize' };
+        }
+      }
+      return { kind: 'ruler', time, cursor: 'ew-resize' };
+    }
 
     const track = this.trackAtY(py);
     if (!track) return { kind: 'empty', time, cursor: 'default' };
@@ -229,6 +240,7 @@ export class SurfaceModel {
       ctx.strokeRect(rx + 0.5, ry + 0.5, rw, rh);
     }
 
+    this.drawMarkerLines(ctx);
     this.drawRuler(ctx, tStart, tEnd, major, minor);
 
     // playhead
@@ -491,6 +503,42 @@ export class SurfaceModel {
     for (let t = Math.floor(tStart / minor) * minor; t < tEnd; t += minor) {
       const x = this.timeToX(t);
       ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H - 4); ctx.lineTo(x + 0.5, RULER_H); ctx.stroke();
+    }
+
+    // markers — a small flag + label in the lower ruler band, a hairline down
+    // the surface handled by draw() below via drawMarkerLines().
+    const markers = Object.values(useDawStore.getState().markers);
+    for (const m of markers) {
+      const x = this.timeToX(m.time);
+      if (x < -40 || x > w + 4) continue;
+      const col = m.color || '#f4b23e';
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(x, RULER_H - 12);
+      ctx.lineTo(x + 8, RULER_H - 12);
+      ctx.lineTo(x + 8, RULER_H - 6);
+      ctx.lineTo(x + 2, RULER_H - 6);
+      ctx.lineTo(x + 2, RULER_H);
+      ctx.lineTo(x, RULER_H);
+      ctx.closePath();
+      ctx.fill();
+      if (m.name) {
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText(m.name, x + 11, RULER_H - 4);
+      }
+    }
+  }
+
+  // Vertical marker guide lines across the lane area (called from draw()).
+  private drawMarkerLines(ctx: CanvasRenderingContext2D) {
+    const markers = Object.values(useDawStore.getState().markers);
+    for (const m of markers) {
+      const x = this.timeToX(m.time);
+      if (x < 0 || x > this.width) continue;
+      ctx.strokeStyle = 'rgba(244,178,62,0.25)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x + 0.5, RULER_H); ctx.lineTo(x + 0.5, this.height); ctx.stroke();
     }
   }
 }

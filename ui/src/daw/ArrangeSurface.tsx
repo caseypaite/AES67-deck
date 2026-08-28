@@ -104,7 +104,18 @@ export function ArrangeSurface() {
       const hit = model.hitTest(px, py);
       const s = daw.getState();
 
+      if (hit.kind === 'marker' && hit.markerId) {
+        const id = hit.markerId;
+        let movedM = false;
+        drag(
+          (ev) => { movedM = true; daw.getState().updateMarker(id, { time: snap(Math.max(0, model.xToTime(ev.clientX - rect.left))) }); },
+          () => { if (!movedM) { const m = daw.getState().markers[id]; if (m) s.locate(m.time); } },
+        );
+        return;
+      }
+
       if (hit.kind === 'ruler') {
+        if (e.shiftKey) { s.addMarker(snap(Math.max(0, model.xToTime(e.clientX - rect.left)))); return; }
         const scrub = (cx: number) => s.locate(snap(Math.max(0, model.xToTime(cx - rect.left))));
         scrub(e.clientX);
         drag((ev) => scrub(ev.clientX));
@@ -235,6 +246,11 @@ export function ArrangeSurface() {
       e.preventDefault();
       const { px, py } = pt(e);
       const hit = model.hitTest(px, py);
+      if (hit.kind === 'marker' && hit.markerId) {
+        daw.getState().removeMarker(hit.markerId);
+        setMenu(null);
+        return;
+      }
       if (hit.clipId) {
         if (!daw.getState().selectedClipIds.includes(hit.clipId)) daw.getState().setSelectedClips([hit.clipId]);
         setMenu({ x: e.clientX, y: e.clientY, clipId: hit.clipId, time: hit.time });

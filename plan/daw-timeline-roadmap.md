@@ -195,19 +195,29 @@ as DOM-per-clip. In short:
 
 ## Phase 3 — Broadcast / live features (the reason this box exists)
 
-### 3a. Virtual soundcheck  ★ headline feature
+### 3a. Virtual soundcheck  ★ headline feature — DONE 2026-08-28
 
 Record every AES67 network input during a live show, then rehearse or train the
 mix against the recording with the band gone. This is the single highest-value
 DAW feature for this hardware and it composes directly with the AES67 receive
 work in `plan/unified-aes67-network-control.md`.
 
-- "VSC ARM ALL" — arm every mapped input, one-button.
-- "VSC" monitor mode — swaps all channels from live input to timeline playback
-  at once, transport-controlled, mixer untouched.
-- Unattended whole-show record: auto-start on first transport / on a schedule,
-  auto-split on marker, disk-space guard (`transport.diskOverrun` already
-  wired in 1b).
+- [x] "VSC ARM ALL" — arms every input with an AES67 source mapped in the
+  patchbay (`useMixerStore.armAllMappedInputs`); arm state is now persisted
+  server-side (`mixer_state.json`, `set_arm`) so the server knows the armed set.
+- [x] Per-channel monitor override — engine `g_monitor_input_mask`
+  (`set_monitor_input_mask` IPC, `monInMask` on the metering frame). TrackPanel
+  IN/TL toggle per track, `MON: TIMELINE⇄LIVE` master button in the VSC toolbar.
+  The old global play/stop swap still applies to channels not pinned live.
+- [x] Unattended whole-show record (server `vsc_config.json`): auto-record on
+  first `transport_play`, `vsc_split` (button + auto on marker drop while
+  recording — reopens contiguously in `handleTakeFinished`), disk-space guard
+  (`fs.statfsSync` on `RECORDS_DIR`, `vsc_status` broadcasts, hard-floor
+  auto-stop at 1 GB), and a single daily scheduled start.
+- Markers: minimal ruler rendering + `M` / `,` / `.` keys landed here (full cue
+  list still Phase 3b).
+- Not done: recurring/calendar schedules (daily HH:MM only); post-insert VSC
+  capture tap (open question 4).
 
 ### 3b. Markers & cue list
 
