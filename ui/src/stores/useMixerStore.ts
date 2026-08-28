@@ -621,6 +621,8 @@ export const useMixerStore = create<MixerState>((set, get) => ({
       ws.send(JSON.stringify({ type: 'get_loudness_config' }));
       ws.send(JSON.stringify({ type: 'get_loudness_history' }));
       ws.send(JSON.stringify({ type: 'list_bounces' }));
+      const daw = useDawStore.getState();
+      ws.send(JSON.stringify({ type: 'set_metronome', enabled: daw.metronomeOn, bpm: daw.tempo, sigNum: daw.timeSig.num, sigDen: daw.timeSig.den, dest: daw.metroDest }));
       const mask = get().monitorInputMask;
       if (mask !== 0) ws.send(JSON.stringify({ type: 'set_monitor_input_mask', mask }));
     };

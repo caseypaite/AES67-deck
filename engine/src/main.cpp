@@ -282,6 +282,13 @@ static Transport g_transport;
 static std::atomic<int> g_bounce_state{0};
 static std::atomic<uint64_t> g_bounce_end{0};
 
+// Metronome (plan Phase 5) — a click summed post-fader onto the monitor bus on
+// each beat while the transport rolls. Written from the IPC thread.
+static std::atomic<int>    g_metro_enabled{0};
+static std::atomic<double> g_metro_fpb{24000.0};   // frames per beat = sr*60/bpm
+static std::atomic<int>    g_metro_signum{4};
+static std::atomic<int>    g_metro_dest{0};        // 0 monitor, 1 master, 2 both
+
 // Virtual-soundcheck per-channel monitor source override. Bit (i-1) set => input
 // channel i monitors its LIVE JACK input even while the timeline is playing
 // (state 1); clear => it follows the transport like normal. Written from the IPC
@@ -570,6 +577,19 @@ int main(int argc, char** argv) {
                           << ")  " << bits << "-bit" << std::endl;
             }
 
+        } else if (type == "set_metronome") {
+            const bool en = j.value("enabled", false);
+            const double bpm = j.value("bpm", 120.0);
+            const int signum = j.value("sigNum", 4);
+            const std::string dest = j.value("dest", std::string("monitor"));
+            const double sr = static_cast<double>(jack.get_sample_rate());
+            g_metro_fpb.store(bpm > 0 ? sr * 60.0 / bpm : sr * 0.5, std::memory_order_relaxed);
+            g_metro_signum.store(signum > 0 ? signum : 4, std::memory_order_relaxed);
+            g_metro_dest.store(dest == "master" ? 1 : dest == "both" ? 2 : 0, std::memory_order_relaxed);
+            g_metro_enabled.store(en ? 1 : 0, std::memory_order_relaxed);
+            std::cout << "Metronome " << (en ? "on" : "off") << "  " << bpm
+                      << " bpm  " << signum << "/x  -> " << dest << std::endl;
+
         } else if (type == "bounce_abort") {
             recorder.stop_recording();
             g_bounce_state.store(0, std::memory_order_relaxed);
@@ -717,6 +737,9 @@ int main(int argc, char** argv) {
     // (a small quantum was pushing this to ~125 Hz and swamping the UI).
     const int meter_interval_frames = std::max<int>(1, static_cast<int>(sr / 40.0));
     int frame_counter = 0;   // frames accumulated since the last metering emit
+    // Metronome click voice (audio thread only).
+    double metro_remain = 0.0, metro_phase = 0.0, metro_freq = 1000.0, metro_amp = 0.0;
+    long long metro_last_beat = -1;
     std::vector<float> tmp_L(8192, 0.0f);
     std::vector<float> tmp_R(8192, 0.0f);
     std::vector<float> tmp_out_L(8192, 0.0f);
@@ -1130,6 +1153,40 @@ int main(int argc, char** argv) {
 
             m_st.current_peak_l = std::max(m_st.current_peak_l, m_peak_l);
             m_st.current_peak_r = std::max(m_st.current_peak_r, m_peak_r);
+        }
+
+        // ── Metronome ── a short click on each beat while the transport rolls,
+        // summed post-fader onto the monitor bus (and/or master) at a fixed
+        // reference level.
+        if (g_metro_enabled.load(std::memory_order_relaxed) && transport_state != 0) {
+            const double fpb = g_metro_fpb.load(std::memory_order_relaxed);
+            const int signum = std::max(1, g_metro_signum.load(std::memory_order_relaxed));
+            const int dest = g_metro_dest.load(std::memory_order_relaxed);
+            const bool to_mon = (dest == 0 || dest == 2) && monitor_L && monitor_R;
+            const bool to_mst = (dest == 1 || dest == 2);
+            const double click_len = static_cast<double>(sr) * 0.035;   // 35 ms
+            for (jack_nframes_t s = 0; s < nframes; ++s) {
+                const uint64_t pos = block_start_frame + s;
+                const long long beat = fpb > 0.0 ? static_cast<long long>(static_cast<double>(pos) / fpb) : 0;
+                if (beat != metro_last_beat) {
+                    metro_last_beat = beat;
+                    const bool down = (beat % signum) == 0;
+                    metro_freq = down ? 1760.0 : 1245.0;
+                    metro_amp  = down ? 0.45 : 0.28;
+                    metro_remain = click_len;
+                    metro_phase = 0.0;
+                }
+                if (metro_remain > 0.0) {
+                    const double env = metro_remain / click_len;      // 1 → 0
+                    const float smp = static_cast<float>(std::sin(metro_phase) * metro_amp * env * env);
+                    if (to_mon) { monitor_L[s] += smp; monitor_R[s] += smp; }
+                    if (to_mst) { out_L[s] += smp; out_R[s] += smp; }
+                    metro_phase += 2.0 * M_PI * metro_freq / static_cast<double>(sr);
+                    metro_remain -= 1.0;
+                }
+            }
+        } else {
+            metro_last_beat = -1;   // re-arm the first beat on the next roll
         }
 
         const float* master_bufs[2] = { out_L, out_R };

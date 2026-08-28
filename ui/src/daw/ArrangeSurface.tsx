@@ -88,6 +88,7 @@ export function ArrangeSurface() {
         s.region, s.loopEnabled, s.punchEnabled, s.scrollX, s.scrollY, s.zoom,
         s.marquee, s.dragOverTrackId, s.dragOverLane, s.compPreview, s.peaks,
         s.snapToGrid, s.gridSize, s.fps, s.recordingClips, s.livePeaks,
+        s.tempo, s.timeSig, s.gridMode,
       ];
     };
     let prevSig = sceneSig();
@@ -104,10 +105,7 @@ export function ArrangeSurface() {
     const canvas = overlayRef.current!;   // top-most; receives the events
     const daw = useDawStore;
 
-    const snap = (t: number) => {
-      const s = daw.getState();
-      return s.snapToGrid ? Math.round(t / s.gridSize) * s.gridSize : t;
-    };
+    const snap = (t: number) => daw.getState().snapTime(t);
     const pt = (e: PointerEvent | MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
       return { px: e.clientX - rect.left, py: e.clientY - rect.top, rect };

@@ -16,6 +16,16 @@ export const DawView = () => {
   const setSnapToGrid = useDawStore((s) => s.setSnapToGrid);
   const fps = useDawStore((s) => s.fps);
   const setFps = useDawStore((s) => s.setFps);
+  const tempo = useDawStore((s) => s.tempo);
+  const setTempo = useDawStore((s) => s.setTempo);
+  const timeSig = useDawStore((s) => s.timeSig);
+  const setTimeSig = useDawStore((s) => s.setTimeSig);
+  const gridMode = useDawStore((s) => s.gridMode);
+  const setGridMode = useDawStore((s) => s.setGridMode);
+  const metronomeOn = useDawStore((s) => s.metronomeOn);
+  const setMetronomeOn = useDawStore((s) => s.setMetronomeOn);
+  const metroDest = useDawStore((s) => s.metroDest);
+  const setMetroDest = useDawStore((s) => s.setMetroDest);
   const lastOverrun = useDawStore((s) => s.lastOverrun);
   const playbackUnderrun = useDawStore((s) => s.playbackUnderrun);
   const cuesOpen = useDawStore((s) => s.cuesOpen);
@@ -178,9 +188,40 @@ export const DawView = () => {
         <button onClick={() => setBounceOpen(true)} title="Bounce a region (or the whole project) through the master chain to a WAV"
           className={`shrink-0 ${tBtn(bounceState === 'running')} ${bounceState === 'running' ? 'animate-pulse' : ''}`}>BOUNCE</button>
         <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
-        <button onClick={() => setSnapToGrid(!snapToGrid)} className={`shrink-0 ${tBtn(snapToGrid)}`}>SNAP</button>
-        <button onClick={() => setFps(fps === 30 ? 25 : 30)} title="Timecode frame rate"
-          className="px-2 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white">{fps} fps</button>
+        <button onClick={() => setSnapToGrid(!snapToGrid)} title="Snap to grid" className={`shrink-0 ${tBtn(snapToGrid)}`}>SNAP</button>
+        <button
+          onClick={() => setGridMode(gridMode === 'bars' ? 'time' : 'bars')}
+          title="Ruler / grid: bars+beats or timecode"
+          className={`shrink-0 ${tBtn(gridMode === 'bars')}`}
+        >{gridMode === 'bars' ? 'BARS' : 'TIME'}</button>
+        {gridMode === 'bars' ? (
+          <>
+            <label className="flex items-center gap-1 text-[10px] font-bold text-gray-500 pl-1 shrink-0" title="Tempo (BPM)">
+              ♩
+              <input type="number" min={20} max={300} step={1} value={tempo}
+                onChange={(e) => setTempo(Number(e.target.value))}
+                className="w-11 bg-[#0d0f13] border border-[#333] rounded px-1 py-0.5 text-right text-gray-300 outline-none" />
+            </label>
+            <button
+              onClick={() => setTimeSig(timeSig.num === 4 ? 3 : timeSig.num === 3 ? 6 : 4, timeSig.den)}
+              title="Time signature (beats per bar)"
+              className="px-1.5 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white font-mono"
+            >{timeSig.num}/{timeSig.den}</button>
+            <button
+              onClick={() => setMetronomeOn(!metronomeOn)}
+              title="Metronome click while the transport rolls"
+              className={`shrink-0 ${tBtn(metronomeOn, 'bg-emerald-600 text-white')}`}
+            >METRO</button>
+            <button
+              onClick={() => setMetroDest(metroDest === 'monitor' ? 'master' : metroDest === 'master' ? 'both' : 'monitor')}
+              title="Metronome routing: monitor bus, master, or both"
+              className="px-1.5 py-1 shrink-0 text-[10px] font-bold rounded bg-[#222] text-gray-400 hover:text-white font-mono"
+            >{metroDest === 'monitor' ? 'MON' : metroDest === 'master' ? 'MST' : 'M+M'}</button>
+          </>
+        ) : (
+          <button onClick={() => setFps(fps === 30 ? 25 : 30)} title="Timecode frame rate"
+            className="px-2 py-1 shrink-0 text-xs font-bold rounded bg-[#222] text-gray-400 hover:text-white">{fps} fps</button>
+        )}
         <div className="w-px h-6 bg-[#333] mx-1 shrink-0" />
         <button className="w-7 h-7 shrink-0 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom / 1.3)}>−</button>
         <button className="w-7 h-7 shrink-0 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#222] rounded" onClick={() => setZoom(zoom * 1.3)}>+</button>
