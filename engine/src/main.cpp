@@ -292,11 +292,19 @@ int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
+    // Socket + JACK client name are overridable so an isolated test stack can
+    // run its own engine alongside a production deck (server honours the same
+    // AES67_SOCKET_PATH).
+    const char* sock_env = std::getenv("AES67_SOCKET_PATH");
+    const std::string sock_path = (sock_env && *sock_env) ? sock_env : "/tmp/aes67_deck.sock";
+    const char* jname_env = std::getenv("AES67_JACK_NAME");
+    const std::string jack_name = (jname_env && *jname_env) ? jname_env : "AES67_Deck";
+
     std::cout << "Starting AES67-Deck DSP & DAW Engine (" << NUM_CHANNELS
               << " inputs, " << NUM_AUX << " Aux buses, Master, Monitor, Talkback)..." << std::endl;
 
-    audio::JackClient jack("AES67_Deck");
-    ipc::IpcClient ipc("/tmp/aes67_deck.sock");
+    audio::JackClient jack(jack_name);
+    ipc::IpcClient ipc(sock_path);
     recorder::DiskWriter recorder;
     recorder::MultitrackRecorder mtr;
     plugins::Lv2Host lv2_host;
@@ -544,19 +552,22 @@ int main(int argc, char** argv) {
                                             std::memory_order_relaxed);
 
         } else if (type == "bounce_start") {
-            // Server has located the transport to the in-point already; open
-            // the writer here (IPC thread, never the audio thread) and roll.
+            // Server has located the transport to (beginFrame - preroll) and
+            // started playback so the timeline reader primes before the region;
+            // it trims the preroll off the file head once the render completes.
+            // Open the writer here (IPC thread, never the audio thread).
             const std::string path = j.value("path", "");
             const int bits = j.value("bits", 24);
+            const uint64_t beginF = j.value("beginFrame", (uint64_t)0);
             const uint64_t endF = j.value("endFrame", (uint64_t)0);
-            if (path.empty() || endF == 0 ||
+            if (path.empty() || endF <= beginF ||
                 !recorder.start_recording(path, 2, static_cast<int>(jack.get_sample_rate()), bits)) {
                 ipc.send_json(nlohmann::json{{"type", "bounce_failed"}, {"path", path}}.dump());
             } else {
                 g_bounce_end.store(endF, std::memory_order_relaxed);
                 g_bounce_state.store(1, std::memory_order_relaxed);
-                std::cout << "Bounce -> " << path << "  end frame " << endF
-                          << "  " << bits << "-bit" << std::endl;
+                std::cout << "Bounce -> " << path << "  [" << beginF << ", " << endF
+                          << ")  " << bits << "-bit" << std::endl;
             }
 
         } else if (type == "bounce_abort") {
@@ -1341,6 +1352,12 @@ int main(int argc, char** argv) {
 
             ipc.send_multichannel_metering(meter_json.data());
             frame_counter = 0;
+
+            // The bounce-finished pulse (state 2) is published exactly once,
+            // then drops back to idle so a stale 2 can't make the server treat
+            // the *next* bounce as instantly complete.
+            int finished = 2;
+            g_bounce_state.compare_exchange_strong(finished, 0, std::memory_order_relaxed);
         }
 
         // ── Transport ── advance the clock past the block just processed.
