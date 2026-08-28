@@ -178,6 +178,35 @@ try {
   await sleep(700);
   await shot('editor-comp', 'Compressor editor: transfer curve, live operating point, gain-reduction meter');
 
+  // Close-up: turn a knob slowly so the LED level ring sweeps on camera.
+  const knobBay = await page.evaluate(() => {
+    const ks = [...document.querySelectorAll('[role="slider"]')];
+    if (!ks.length) return null;
+    const r = ks.map((k) => k.getBoundingClientRect());
+    const x = Math.min(...r.map((b) => b.x)) - 24;
+    const y = Math.min(...r.map((b) => b.y)) - 40;
+    const w = Math.max(...r.map((b) => b.right)) + 24 - x;
+    const h = Math.max(...r.map((b) => b.bottom)) + 18 - y;
+    const first = r[0];
+    return { clip: { x, y, width: w, height: h }, knob: { x: first.x + first.width / 2, y: first.y + first.height / 2 } };
+  });
+  if (knobBay) {
+    const { x, y } = knobBay.knob;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    for (let d = 0; d <= 90; d += 6) { await page.mouse.move(x, y - d); await sleep(45); }   // wind up
+    for (let d = 90; d >= -70; d -= 6) { await page.mouse.move(x, y - d); await sleep(45); }  // sweep down
+    await sleep(250);
+    await page.screenshot({ path: path.join(OUT, `${String(shotN + 1).padStart(2, '0')}-knob-closeup.png`), clip: knobBay.clip });
+    await page.screenshot({ path: path.join(OUT, `${String(shotN + 1).padStart(2, '0')}-knob-closeup.jpg`), type: 'jpeg', quality: 88, clip: knobBay.clip });
+    shotN += 1;
+    shots.push({ file: `${String(shotN).padStart(2, '0')}-knob-closeup.png`, jpg: `${String(shotN).padStart(2, '0')}-knob-closeup.jpg`,
+      caption: 'Rotary knob close-up — LED level ring + chromed cap, accent per plugin category, readout floats while turning' });
+    log(`shot ${String(shotN).padStart(2, '0')}-knob-closeup.png — LED ring sweep`);
+    await page.mouse.up();
+    await sleep(200);
+  }
+
   log('7 — built-in FX chain library');
   await clickText('LOAD', true);             // FX rack LOAD → chain library
   await sleep(500);
@@ -236,7 +265,7 @@ fs.writeFileSync(path.join(OUT, 'shots.json'), JSON.stringify(shots, null, 2));
 let gifOk = false;
 if (frames.length > 4) {
   try {
-    const FPS = 4, MAXW = 560, MAX_FRAMES = 90;
+    const FPS = 4, MAXW = 600, MAX_FRAMES = 96;
     const t0 = frames[0].ts;
     let picked = [];
     let nextT = 0;
