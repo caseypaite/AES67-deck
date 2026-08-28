@@ -8,6 +8,7 @@ import { useMixerStore, type Channel } from '../stores/useMixerStore';
 export const RULER_H = 26;
 export const DEFAULT_TRACK_H = 96;
 const MIN_TRACK_H = 48;
+export const LANE_H = 60;   // height of one take lane on an expanded track
 
 const CLIP_HEADER_H = 14;   // label strip inside the clip
 const EDGE = 7;             // trim hit zone (px) — padded in hitTest for touch
@@ -20,15 +21,22 @@ export interface HitResult {
     | 'clip' | 'clip-left' | 'clip-right'
     | 'clip-fade-in' | 'clip-fade-out' | 'clip-gain'
     | 'lane' | 'ruler' | 'marker' | 'empty'
+    | 'take-lane'
     | 'region-in' | 'region-out' | 'region-body';
   clipId?: string;
   trackId?: number;
+  lane?: number;         // which lane within the track the hit landed in (0 = comp)
   markerId?: string;
   time: number;
   cursor: string;
 }
 
-interface Track { id: number; name: string; height: number; y: number; }
+interface Track {
+  id: number; name: string; height: number; y: number;
+  expanded: boolean;     // take lanes shown
+  lanes: number;         // number of take lanes (highest lane index in use)
+  compH: number;         // height of the comp band (row 0); take lanes are LANE_H each
+}
 
 const CLIP_FILL: Record<string, string> = {
   'bg-red-600': '#b23b3b', 'bg-blue-600': '#3b5bb2', 'bg-green-600': '#3b8f5a',
@@ -70,22 +78,50 @@ export class SurfaceModel {
     const chans = useMixerStore.getState().channels;
     const daw = useDawStore.getState();
     const heights = daw.trackHeights;
-    // Cheap memo — the inputs that matter are the channel ids, the heights map
-    // and scrollY. Rebuild only when one of those changes.
     const ids = Object.values(chans).filter((c: Channel) => c.type === 'input').map((c) => c.id).sort((a, b) => a - b);
-    const key = ids.join(',') + '|' + JSON.stringify(heights) + '|' + daw.scrollY;
+
+    // Take-lane count per track, derived from the clips.
+    const laneCounts: Record<number, number> = {};
+    for (const c of Object.values(daw.clips)) {
+      if (c.recording) continue;
+      const L = c.lane || 0;
+      if (L > (laneCounts[c.trackId] || 0)) laneCounts[c.trackId] = L;
+    }
+
+    // Cheap memo — rebuild only when the geometry inputs change.
+    const key = ids.join(',') + '|' + JSON.stringify(heights) + '|' + daw.scrollY
+      + '|' + JSON.stringify(daw.laneExpand) + '|' + JSON.stringify(laneCounts);
     if (this._tracksCache && this._tracksCache.key === key) return this._tracksCache.tracks;
 
     const byId = chans as Record<number, Channel>;
     let y = RULER_H - daw.scrollY;
     const tracks = ids.map((id) => {
-      const h = Math.max(MIN_TRACK_H, heights[id] || DEFAULT_TRACK_H);
-      const t = { id, name: byId[id]?.name ?? `IN ${id}`, height: h, y };
-      y += h;
+      const compH = Math.max(MIN_TRACK_H, heights[id] || DEFAULT_TRACK_H);
+      const lanes = laneCounts[id] || 0;
+      const expanded = !!daw.laneExpand[id] && lanes > 0;
+      const height = compH + (expanded ? LANE_H * lanes : 0);
+      const t = { id, name: byId[id]?.name ?? `IN ${id}`, height, y, expanded, lanes, compH };
+      y += height;
       return t;
     });
     this._tracksCache = { key, tracks };
     return tracks;
+  }
+
+  // y-bands for a track's lanes: index 0 = comp band, 1..lanes = take lanes.
+  laneRects(t: Track): Array<{ lane: number; y: number; h: number }> {
+    const out = [{ lane: 0, y: t.y, h: t.compH }];
+    if (t.expanded) {
+      for (let k = 1; k <= t.lanes; k++)
+        out.push({ lane: k, y: t.y + t.compH + LANE_H * (k - 1), h: LANE_H });
+    }
+    return out;
+  }
+
+  laneAtY(t: Track, py: number): { lane: number; y: number; h: number } {
+    const rects = this.laneRects(t);
+    for (const r of rects) if (py >= r.y && py < r.y + r.h) return r;
+    return rects[0];
   }
 
   contentHeight(): number {
@@ -109,7 +145,7 @@ export class SurfaceModel {
     for (const tr of this.tracks()) {
       if (tr.y + tr.height < y0 || tr.y > y1) continue;
       for (const c of Object.values(clips)) {
-        if (c.trackId !== tr.id) continue;
+        if (c.trackId !== tr.id || (c.lane || 0) !== 0) continue;  // comp lane only
         const cx0 = this.timeToX(c.start);
         const cx1 = this.timeToX(c.start + c.length);
         if (cx1 >= x0 && cx0 <= x1) out.push(c.id);
@@ -157,9 +193,11 @@ export class SurfaceModel {
     const track = this.trackAtY(py);
     if (!track) return { kind: 'empty', time, cursor: 'default' };
 
-    const clips = Object.values(useDawStore.getState().clips).filter((c) => c.trackId === track.id);
-    const y = track.y + 3;
-    const ch = track.height - 6;
+    const band = this.laneAtY(track, py);
+    const clips = Object.values(useDawStore.getState().clips)
+      .filter((c) => c.trackId === track.id && (c.lane || 0) === band.lane);
+    const y = band.y + 3;
+    const ch = band.h - 6;
     // Front-most clip first (last drawn wins visually).
     for (let i = clips.length - 1; i >= 0; i--) {
       const c = clips[i];
@@ -167,24 +205,29 @@ export class SurfaceModel {
       const x0 = this.timeToX(c.start);
       const x1 = this.timeToX(c.start + c.length);
       if (px < x0 - 1 || px > x1 + 1) continue;
+      const base = { clipId: c.id, trackId: track.id, lane: band.lane, time };
       const g = this.grips(c, x0, x1, y, ch);
 
-      // fade grips (top edge, near the ramp end-point)
-      if (py <= g.waveTop + HANDLE_R + 2) {
+      // fade grips (top edge, near the ramp end-point) — comp lane only
+      if (band.lane === 0 && py <= g.waveTop + HANDLE_R + 2) {
         if (Math.abs(px - g.fadeInX) <= HANDLE_R + 3)
-          return { kind: 'clip-fade-in', clipId: c.id, trackId: track.id, time, cursor: 'ew-resize' };
+          return { kind: 'clip-fade-in', ...base, cursor: 'ew-resize' };
         if (Math.abs(px - g.fadeOutX) <= HANDLE_R + 3)
-          return { kind: 'clip-fade-out', clipId: c.id, trackId: track.id, time, cursor: 'ew-resize' };
+          return { kind: 'clip-fade-out', ...base, cursor: 'ew-resize' };
       }
-      // gain line (mid clip, away from the edges)
-      if (px > x0 + EDGE + 4 && px < x1 - EDGE - 4 && Math.abs(py - g.gainY) <= HANDLE_R)
-        return { kind: 'clip-gain', clipId: c.id, trackId: track.id, time, cursor: 'ns-resize' };
+      // gain line (mid clip, away from the edges) — comp lane only
+      if (band.lane === 0 && px > x0 + EDGE + 4 && px < x1 - EDGE - 4 && Math.abs(py - g.gainY) <= HANDLE_R)
+        return { kind: 'clip-gain', ...base, cursor: 'ns-resize' };
 
-      if (px <= x0 + EDGE) return { kind: 'clip-left', clipId: c.id, trackId: track.id, time, cursor: 'ew-resize' };
-      if (px >= x1 - EDGE) return { kind: 'clip-right', clipId: c.id, trackId: track.id, time, cursor: 'ew-resize' };
-      return { kind: 'clip', clipId: c.id, trackId: track.id, time, cursor: 'grab' };
+      if (band.lane === 0 && px <= x0 + EDGE) return { kind: 'clip-left', ...base, cursor: 'ew-resize' };
+      if (band.lane === 0 && px >= x1 - EDGE) return { kind: 'clip-right', ...base, cursor: 'ew-resize' };
+      return { kind: 'clip', ...base, cursor: band.lane === 0 ? 'grab' : 'pointer' };
     }
-    return { kind: 'lane', trackId: track.id, time, cursor: 'default' };
+    return {
+      kind: band.lane === 0 ? 'lane' : 'take-lane',
+      trackId: track.id, lane: band.lane, time,
+      cursor: band.lane === 0 ? 'default' : 'crosshair',
+    };
   }
 
   // --- painting ---
@@ -229,23 +272,53 @@ export class SurfaceModel {
       ctx.strokeStyle = 'rgba(0,0,0,0.5)';
       ctx.beginPath(); ctx.moveTo(0, tr.y + tr.height - 0.5); ctx.lineTo(w, tr.y + tr.height - 0.5); ctx.stroke();
 
-      const clips = Object.values(daw.clips).filter((c) => c.trackId === tr.id);
-      for (const c of clips) {
-        const x0 = this.timeToX(c.start);
-        const x1 = this.timeToX(c.start + c.length);
-        if (x1 < 0 || x0 > w) continue;
-        this.drawClip(ctx, c, x0, x1, tr.y + 3, tr.height - 6, selected.has(c.id), daw.peaks);
+      const trackClips = Object.values(daw.clips).filter((c) => c.trackId === tr.id);
+      for (const band of this.laneRects(tr)) {
+        const laneClips = trackClips.filter((c) => (c.lane || 0) === band.lane);
+
+        if (band.lane > 0) {
+          // take lane: separator + a wash so the comp lane reads as primary
+          ctx.fillStyle = 'rgba(0,0,0,0.22)';
+          ctx.fillRect(0, band.y, w, band.h);
+          ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+          ctx.beginPath(); ctx.moveTo(0, band.y + 0.5); ctx.lineTo(w, band.y + 0.5); ctx.stroke();
+          ctx.fillStyle = 'rgba(255,255,255,0.28)';
+          ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+          ctx.textBaseline = 'top';
+          ctx.fillText(String(band.lane), 4, band.y + 3);
+          ctx.textBaseline = 'alphabetic';
+        }
+
+        for (const c of laneClips) {
+          const x0 = this.timeToX(c.start);
+          const x1 = this.timeToX(c.start + c.length);
+          if (x1 < 0 || x0 > w) continue;
+          this.drawClip(ctx, c, x0, x1, band.y + 3, band.h - 6, selected.has(c.id), daw.peaks);
+        }
+
+        // Crossfades: adjacent overlapping clips in this lane get the X marker.
+        const sorted = laneClips.filter((c) => !c.recording).sort((a, b) => a.start - b.start);
+        for (let i = 1; i < sorted.length; i++) {
+          const a = sorted[i - 1], b = sorted[i];
+          const ovEnd = Math.min(a.start + a.length, b.start + b.length);
+          if (ovEnd <= b.start) continue;
+          this.drawCrossfade(ctx, this.timeToX(b.start), this.timeToX(ovEnd), band.y + 3, band.h - 6);
+        }
       }
 
-      // Crossfades: adjacent clips that overlap in time get an equal-power
-      // crossfade (the engine mixes them); draw the X over the overlap span.
-      const sorted = clips.filter((c) => !c.recording).sort((a, b) => a.start - b.start);
-      for (let i = 1; i < sorted.length; i++) {
-        const a = sorted[i - 1], b = sorted[i];
-        const ovStart = b.start;
-        const ovEnd = Math.min(a.start + a.length, b.start + b.length);
-        if (ovEnd <= ovStart) continue;
-        this.drawCrossfade(ctx, this.timeToX(ovStart), this.timeToX(ovEnd), tr.y + 3, tr.height - 6);
+      // Comp swipe preview: highlight the span on the source lane + comp lane.
+      const cp = daw.compPreview;
+      if (cp && cp.trackId === tr.id && cp.toSec > cp.fromSec) {
+        const px0 = this.timeToX(cp.fromSec);
+        const pw = this.timeToX(cp.toSec) - px0;
+        for (const band of this.laneRects(tr)) {
+          if (band.lane !== 0 && band.lane !== cp.lane) continue;
+          ctx.fillStyle = band.lane === cp.lane ? 'rgba(120,200,120,0.30)' : 'rgba(120,200,120,0.14)';
+          ctx.fillRect(px0, band.y, pw, band.h);
+          ctx.strokeStyle = 'rgba(150,230,150,0.9)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(px0 + 0.5, band.y + 0.5, pw, band.h - 1);
+        }
       }
     }
 

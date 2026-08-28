@@ -164,6 +164,29 @@ export function ArrangeSurface() {
         return;
       }
 
+      // Phase 4 — take comping: swipe horizontally across a take lane (empty
+      // area or a take clip) to make that take the active one over the range.
+      if ((hit.kind === 'take-lane' || (hit.kind === 'clip' && (hit.lane ?? 0) > 0))
+          && hit.trackId != null && hit.lane) {
+        const trackId = hit.trackId, lane = hit.lane;
+        const t0 = model.xToTime(e.clientX - rect.left);
+        let a = t0, b = t0, swiped = false;
+        drag(
+          (ev) => {
+            swiped = true;
+            const t = Math.max(0, model.xToTime(ev.clientX - rect.left));
+            a = Math.min(t0, t); b = Math.max(t0, t);
+            daw.getState().setCompPreview({ trackId, lane, fromSec: a, toSec: b });
+          },
+          () => {
+            daw.getState().setCompPreview(null);
+            if (swiped && b - a > 0.03) daw.getState().compPick(trackId, a, b, lane);
+            else if (hit.clipId) s.setSelectedClips([hit.clipId]);
+          },
+        );
+        return;
+      }
+
       const clip = hit.clipId ? s.clips[hit.clipId] : undefined;
       if (!clip) return;
 
@@ -351,6 +374,14 @@ export function ArrangeSurface() {
               { label: 'Rename…', fn: () => setRename({ x: Math.max(model.timeToX(menuClip.start), 2), y: (model.tracks().find((t) => t.id === menuClip.trackId)?.y ?? 40), w: 160, clipId: menu.clipId, value: menuClip.name }) },
               { label: 'Reset gain', fn: () => useDawStore.getState().setClipGain(menu.clipId, 1) },
               { label: 'Clear fades', fn: () => { useDawStore.getState().setClipFade(menu.clipId, 'in', 0); useDawStore.getState().setClipFade(menu.clipId, 'out', 0); } },
+              ...((menuClip.lane ?? 0) > 0
+                ? [
+                    { label: 'Promote lane to comp', fn: () => useDawStore.getState().compPick(menuClip.trackId, menuClip.start, menuClip.start + menuClip.length, menuClip.lane || 0) },
+                    { label: 'Move to comp lane', fn: () => useDawStore.getState().moveClipToLane(menu.clipId, 0) },
+                  ]
+                : [
+                    { label: 'Send to new take lane', fn: () => useDawStore.getState().moveClipToLane(menu.clipId, useDawStore.getState().laneCountFor(menuClip.trackId) + 1) },
+                  ]),
               { label: 'Delete', fn: () => { useDawStore.getState().setSelectedClips([menu.clipId]); useDawStore.getState().deleteSelected(); }, danger: true },
             ].map((item) => (
               <button
