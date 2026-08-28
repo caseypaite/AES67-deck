@@ -188,7 +188,7 @@ export function ArrangeSurface() {
           if (mode === 'swipe') {
             const t = Math.max(0, model.xToTime(ev.clientX - rect.left));
             daw.getState().setCompPreview({ trackId, lane, fromSec: Math.min(t0, t), toSec: Math.max(t0, t) });
-          } else if (clipL) {
+          } else if (clipL && !clipL.locked) {
             daw.getState().updateClip(clipL.id, { start: Math.max(0, snap(clip0Start + dx / daw.getState().zoom)) });
             const p = pt(ev);
             const tgt = model.trackAtY(p.py);
@@ -224,6 +224,9 @@ export function ArrangeSurface() {
         s.setSelectedClips([clip.id]);
         sel = [clip.id];
       }
+
+      // Locked clips select but don't move / trim / fade / gain.
+      if (clip.locked) return;
 
       const startX = e.clientX;
       const startY = e.clientY;
@@ -412,6 +415,13 @@ export function ArrangeSurface() {
                 : [
                     { label: 'Send to new take lane', fn: () => useDawStore.getState().moveClipToLane(menu.clipId, useDawStore.getState().laneCountFor(menuClip.trackId) + 1) },
                   ]),
+              { label: menuClip.locked ? 'Unlock' : 'Lock', fn: () => useDawStore.getState().toggleLockSelected() },
+              ...(useDawStore.getState().selectedClipIds.length > 1
+                ? [{ label: 'Group', fn: () => useDawStore.getState().groupSelected() }]
+                : []),
+              ...(menuClip.group
+                ? [{ label: 'Ungroup', fn: () => useDawStore.getState().ungroupSelected() }]
+                : []),
               { label: 'Delete', fn: () => { useDawStore.getState().setSelectedClips([menu.clipId]); useDawStore.getState().deleteSelected(); }, danger: true },
             ].map((item) => (
               <button

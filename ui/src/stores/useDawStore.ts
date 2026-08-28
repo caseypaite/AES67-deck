@@ -25,6 +25,8 @@ export interface DawClip {
   // Phase 4 take comping. 0 / undefined = the comp lane (this is what plays and
   // persists to the engine); >= 1 = alternate take lanes stacked below, parked.
   lane?: number;
+  locked?: boolean;      // Phase 4 — no move / trim / delete
+  group?: string;        // Phase 4 — clips sharing a group id select + move together
 }
 
 export interface DawMarker {
@@ -114,6 +116,7 @@ interface DawState {
 
   snapToGrid: boolean;
   gridSize: number;               // seconds
+  rippleEdit: boolean;            // Phase 4 — delete/paste close/open the gap after
 
   fps: number;                    // timecode frame rate (25 | 30)
   timecode: string;               // hh:mm:ss:ff derived from the playhead — toolbar readout
@@ -200,6 +203,14 @@ interface DawState {
   toggleLaneExpand: (trackId: number) => void;
   moveClipToLane: (clipId: string, lane: number) => void;
   compPick: (trackId: number, fromSec: number, toSec: number, lane: number) => void;
+
+  // Phase 4 — nudge / ripple / group / lock.
+  setRippleEdit: (v: boolean) => void;
+  nudgeSelected: (dtSec: number) => void;
+  rippleDelete: () => void;
+  toggleLockSelected: () => void;
+  groupSelected: () => void;
+  ungroupSelected: () => void;
 
   // Server sync
   loadProjectData: (name: string, project: unknown) => void;
@@ -302,6 +313,16 @@ function pushHistory(force = false) {
   useDawStore.setState({ canUndo: true, canRedo: false });
 }
 
+// Phase 4 — group selection: pull in every clip sharing a group with one of `ids`.
+function expandGroups(clips: Record<string, DawClip>, ids: string[]): string[] {
+  const groups = new Set<string>();
+  for (const id of ids) { const g = clips[id]?.group; if (g) groups.add(g); }
+  if (!groups.size) return ids;
+  const out = new Set(ids);
+  for (const c of Object.values(clips)) if (c.group && groups.has(c.group)) out.add(c.id);
+  return [...out];
+}
+
 function toRecord<T extends { id: string }>(arr: unknown): Record<string, T> {
   const out: Record<string, T> = {};
   if (Array.isArray(arr)) {
@@ -368,6 +389,7 @@ export const useDawStore = create<DawState>()(
 
       snapToGrid: true,
       gridSize: 1.0,
+      rippleEdit: false,
       fps: 30,
       timecode: '00:00:00:00',
 
@@ -425,6 +447,103 @@ export const useDawStore = create<DawState>()(
         lastBounce: { name: msg.name, bytes: msg.bytes, durationSec: msg.durationSec, overrun: !!msg.overrun },
       }),
       setBounces: (list) => set({ bounces: Array.isArray(list) ? list : [] }),
+
+      // --- Phase 4: nudge / ripple / group / lock ---
+      setRippleEdit: (v) => set({ rippleEdit: v }),
+
+      nudgeSelected: (dtSec) => {
+        pushHistory();
+        set((state) => {
+          const next = { ...state.clips };
+          let any = false;
+          for (const id of state.selectedClipIds) {
+            const c = next[id];
+            if (!c || c.locked) continue;
+            next[id] = { ...c, start: Math.max(0, c.start + dtSec) };
+            any = true;
+          }
+          return any ? { clips: next } : state;
+        });
+        scheduleSave();
+      },
+
+      // Cut the region span out of every comp-lane track and close the gap
+      // (clips + markers after it shift left). The "remove this section" edit.
+      rippleDelete: () => {
+        const r = get().region;
+        if (!r) return;
+        const span = r.outSec - r.inSec;
+        if (span <= 0) return;
+        pushHistory(true);
+        set((state) => {
+          const next: Record<string, DawClip> = {};
+          for (const c of Object.values(state.clips)) {
+            if ((c.lane || 0) !== 0 || c.recording || c.locked) { next[c.id] = c; continue; }
+            const cs = c.start, ce = c.start + c.length;
+            if (ce <= r.inSec + 1e-6) { next[c.id] = c; continue; }
+            if (cs >= r.outSec - 1e-6) { next[c.id] = { ...c, start: Math.max(0, cs - span) }; continue; }
+            const keepLeft = cs < r.inSec - 1e-6;
+            const keepRight = ce > r.outSec + 1e-6;
+            if (keepLeft) next[c.id] = { ...c, length: r.inSec - cs, fadeOut: Math.min(c.fadeOut || 0, r.inSec - cs) };
+            if (keepRight) {
+              const id = keepLeft ? uuid() : c.id;
+              next[id] = {
+                ...c, id, start: r.inSec, length: ce - r.outSec,
+                sourceOffset: (c.sourceOffset || 0) + (r.outSec - cs),
+                fadeIn: Math.min(c.fadeIn || 0, ce - r.outSec),
+              };
+            }
+          }
+          const markers: Record<string, DawMarker> = {};
+          for (const m of Object.values(state.markers)) {
+            if (m.time <= r.inSec + 1e-6) markers[m.id] = m;
+            else if (m.time >= r.outSec - 1e-6) markers[m.id] = { ...m, time: m.time - span };
+            // markers strictly inside the region are removed
+          }
+          return { clips: next, markers, selectedClipIds: [], region: null, loopEnabled: false, punchEnabled: false };
+        });
+        syncRegionToEngine(get());
+        scheduleSave();
+      },
+
+      toggleLockSelected: () => {
+        pushHistory();
+        set((state) => {
+          const ids = state.selectedClipIds;
+          if (!ids.length) return state;
+          const lock = ids.some((id) => state.clips[id] && !state.clips[id].locked);
+          const next = { ...state.clips };
+          for (const id of ids) { const c = next[id]; if (c) next[id] = { ...c, locked: lock || undefined }; }
+          return { clips: next };
+        });
+        scheduleSave();
+      },
+
+      groupSelected: () => {
+        pushHistory();
+        set((state) => {
+          const ids = state.selectedClipIds;
+          if (ids.length < 2) return state;
+          const gid = uuid().slice(0, 8);
+          const next = { ...state.clips };
+          for (const id of ids) { const c = next[id]; if (c) next[id] = { ...c, group: gid }; }
+          return { clips: next };
+        });
+        scheduleSave();
+      },
+      ungroupSelected: () => {
+        pushHistory();
+        set((state) => {
+          const next = { ...state.clips };
+          let any = false;
+          for (const id of state.selectedClipIds) {
+            const c = next[id];
+            if (c?.group) { next[id] = { ...c, group: undefined }; any = true; }
+          }
+          return any ? { clips: next } : state;
+        });
+        scheduleSave();
+      },
 
       // --- Phase 4: undo / redo ---
       historyBegin: () => { if (txnDepth === 0) pushHistory(true); txnDepth += 1; },
@@ -625,20 +744,46 @@ export const useDawStore = create<DawState>()(
         scheduleSave();
       },
 
-      setSelectedClips: (ids) => set({ selectedClipIds: ids }),
+      setSelectedClips: (ids) => set((s) => ({ selectedClipIds: expandGroups(s.clips, ids) })),
       toggleClipSelection: (id) =>
-        set((state) => ({
-          selectedClipIds: state.selectedClipIds.includes(id)
-            ? state.selectedClipIds.filter((i) => i !== id)
-            : [...state.selectedClipIds, id],
-        })),
+        set((state) => {
+          const has = state.selectedClipIds.includes(id);
+          return {
+            selectedClipIds: has
+              ? state.selectedClipIds.filter((i) => i !== id)
+              : expandGroups(state.clips, [...state.selectedClipIds, id]),
+          };
+        }),
       clearSelection: () => set({ selectedClipIds: [] }),
 
       deleteSelected: () => {
         pushHistory();
         set((state) => {
           const nextClips = { ...state.clips };
-          state.selectedClipIds.forEach((id) => delete nextClips[id]);
+          const del = state.selectedClipIds
+            .map((id) => state.clips[id])
+            .filter((c): c is DawClip => !!c && !c.locked);
+          for (const c of del) delete nextClips[c.id];
+
+          if (state.rippleEdit) {
+            // close the gap on each affected comp-lane track
+            const byTrack = new Map<number, DawClip[]>();
+            for (const c of del) {
+              if ((c.lane || 0) !== 0) continue;
+              const a = byTrack.get(c.trackId) || []; a.push(c); byTrack.set(c.trackId, a);
+            }
+            for (const [tid, dels] of byTrack) {
+              dels.sort((a, b) => a.start - b.start);
+              for (const d of dels) {
+                for (const id of Object.keys(nextClips)) {
+                  const c = nextClips[id];
+                  if (c.trackId !== tid || (c.lane || 0) !== 0 || c.locked) continue;
+                  if (c.start >= d.start + d.length - 1e-6)
+                    nextClips[id] = { ...c, start: Math.max(0, c.start - d.length) };
+                }
+              }
+            }
+          }
           return { clips: nextClips, selectedClipIds: [] };
         });
         scheduleSave();
@@ -654,7 +799,7 @@ export const useDawStore = create<DawState>()(
 
           state.selectedClipIds.forEach((id) => {
             const clip = nextClips[id];
-            if (clip && pos > clip.start && pos < clip.start + clip.length) {
+            if (clip && !clip.locked && pos > clip.start && pos < clip.start + clip.length) {
               slicedAny = true;
               const length1 = pos - clip.start;
               const length2 = clip.start + clip.length - pos;
@@ -681,7 +826,7 @@ export const useDawStore = create<DawState>()(
         pushHistory();
         set((state) => {
           const clip = state.clips[clipId];
-          if (!clip || time <= clip.start + 0.01 || time >= clip.start + clip.length - 0.01) return state;
+          if (!clip || clip.locked || time <= clip.start + 0.01 || time >= clip.start + clip.length - 0.01) return state;
           const len1 = time - clip.start;
           const len2 = clip.start + clip.length - time;
           const newId = uuid();
@@ -746,12 +891,25 @@ export const useDawStore = create<DawState>()(
         set((state) => {
           if (state.clipboard.length === 0) return state;
           const earliestStart = Math.min(...state.clipboard.map((c) => c.start));
+          const latestEnd = Math.max(...state.clipboard.map((c) => c.start + c.length));
           const offset = state.playheadPosition - earliestStart;
+          const span = latestEnd - earliestStart;
+          const at = state.playheadPosition;
           const nextClips = { ...state.clips };
+
+          if (state.rippleEdit && span > 0) {
+            const tracks = new Set(state.clipboard.map((c) => c.trackId));
+            for (const id of Object.keys(nextClips)) {
+              const c = nextClips[id];
+              if (!tracks.has(c.trackId) || (c.lane || 0) !== 0 || c.locked) continue;
+              if (c.start >= at - 1e-6) nextClips[id] = { ...c, start: c.start + span };
+            }
+          }
+
           const newSelection: string[] = [];
           state.clipboard.forEach((clip) => {
             const newId = uuid();
-            nextClips[newId] = { ...clip, id: newId, start: Math.max(0, clip.start + offset) };
+            nextClips[newId] = { ...clip, id: newId, group: undefined, start: Math.max(0, clip.start + offset) };
             newSelection.push(newId);
           });
           return { clips: nextClips, selectedClipIds: newSelection };
@@ -937,6 +1095,7 @@ export const useDawStore = create<DawState>()(
         zoom: s.zoom,
         snapToGrid: s.snapToGrid,
         gridSize: s.gridSize,
+        rippleEdit: s.rippleEdit,
         fps: s.fps,
         cuesOpen: s.cuesOpen,
         loudnessOpen: s.loudnessOpen,

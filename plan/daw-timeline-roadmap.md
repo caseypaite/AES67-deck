@@ -339,7 +339,17 @@ ptp4l-aes67-gm.service`) — there is a disciplined clock on the box.
 - **Bounce / export** — render a timeline region through the master chain to a
   file. Realtime (route master to a `DiskWriter`, run transport over the region)
   first; offline/faster-than-realtime later. Stem export = the per-track taps.
-- **Clip fx / clip gain automation**, ripple edit, group/lock, nudge keys.
+- **Nudge / ripple / group / lock — DONE 2026-08-28.** Arrow keys nudge the
+  selection by the grid (Alt = one frame, Shift = ×5). `rippleEdit` toggle
+  (`RIPPLE` in the toolbar) makes delete close the gap and paste open one on
+  the affected tracks; `rippleDelete` (`✂ CUT`, region-gated) cuts the region
+  out of every comp-lane track and closes the gap (markers ripple too, locked
+  clips are left alone). `clip.locked` (context menu) blocks move / trim /
+  fade / gain / slice, with a hatch + padlock overlay. `clip.group` (context
+  menu, 2+ selected) — grouped clips select and move together;
+  `expandGroups` folds the group into every selection. Verified end to end
+  (`scratchpad/edit-test.mjs`, 12/12).
+- **Clip fx / clip gain automation** — deferred to a later pass.
 - Viewport virtualisation and canvas grid (the current repeating-gradient grid
   at `DawView.tsx:229-233` / `:265` is fine visually but everything mounts).
 
