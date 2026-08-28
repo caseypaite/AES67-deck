@@ -126,13 +126,26 @@ export function ArrangeSurface() {
     const onPointerMove = (e: PointerEvent) => {
       if (e.buttons) return;
       const { px, py } = pt(e);
-      canvas.style.cursor = model.hitTest(px, py).cursor;
+      canvas.style.cursor = model.scrollbarHit(px, py) ? 'default' : model.hitTest(px, py).cursor;
     };
 
     const onPointerDown = (e: PointerEvent) => {
       if (e.button === 2) return; // context menu handled separately
       setMenu(null);
       const { px, py, rect } = pt(e);
+
+      // vertical scrollbar — drag the thumb (or click the track to page toward)
+      const sbHit = model.scrollbarHit(px, py);
+      if (sbHit) {
+        const sb = model.scrollbar()!;
+        const grab = sbHit.onThumb ? py - sb.thumbY : sb.thumbH / 2;
+        const applyFromY = (clientY: number) =>
+          daw.getState().setScroll(daw.getState().scrollX, model.scrollYForThumbTop(clientY - rect.top - grab));
+        applyFromY(e.clientY);
+        drag((ev) => applyFromY(ev.clientY));
+        return;
+      }
+
       const hit = model.hitTest(px, py);
       const s = daw.getState();
 

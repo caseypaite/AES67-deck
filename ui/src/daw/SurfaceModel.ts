@@ -137,6 +137,35 @@ export class SurfaceModel {
     return Math.max(0, this.contentHeight() - this.height);
   }
 
+  // Vertical scrollbar geometry (screen space), or null when everything fits.
+  static SCROLLBAR_W = 14;   // wide enough to be a touch target
+  scrollbar(): { x: number; trackY: number; trackH: number; thumbY: number; thumbH: number } | null {
+    const max = this.maxScrollY();
+    if (max <= 0) return null;
+    const trackY = RULER_H;
+    const trackH = this.height - RULER_H;
+    const viewBelow = this.height - RULER_H;
+    const contentBelow = this.contentHeight() - RULER_H;
+    const thumbH = Math.max(24, trackH * (viewBelow / contentBelow));
+    const thumbY = trackY + (trackH - thumbH) * (this.scrollY / max);
+    return { x: this.width - SurfaceModel.SCROLLBAR_W, trackY, trackH, thumbY, thumbH };
+  }
+
+  // Pointer x/y is on the scrollbar → the scrollY it maps to (dragging the
+  // thumb), plus whether the press landed on the thumb itself.
+  scrollbarHit(px: number, py: number): { onThumb: boolean } | null {
+    const sb = this.scrollbar();
+    if (!sb || px < sb.x - 2 || py < sb.trackY) return null;
+    return { onThumb: py >= sb.thumbY && py <= sb.thumbY + sb.thumbH };
+  }
+  scrollYForThumbTop(thumbTopY: number): number {
+    const sb = this.scrollbar();
+    if (!sb) return 0;
+    const span = sb.trackH - sb.thumbH;
+    if (span <= 0) return 0;
+    return Math.max(0, Math.min(this.maxScrollY(), ((thumbTopY - sb.trackY) / span) * this.maxScrollY()));
+  }
+
   trackAtY(py: number): Track | undefined {
     return this.tracks().find((t) => py >= t.y && py < t.y + t.height);
   }
@@ -250,12 +279,25 @@ export class SurfaceModel {
     const daw = useDawStore.getState();
     const recording = useMixerStore.getState().transportState === 'recording';
     const px = this.timeToX(daw.playheadPosition);
-    if (px < 0 || px > w) return;
-    ctx.strokeStyle = recording ? '#ef4444' : '#ffffff';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(px + 0.5, 0); ctx.lineTo(px + 0.5, h); ctx.stroke();
-    ctx.fillStyle = ctx.strokeStyle as string;
-    ctx.beginPath(); ctx.moveTo(px - 4, 0); ctx.lineTo(px + 5, 0); ctx.lineTo(px + 0.5, 7); ctx.fill();
+    if (px >= 0 && px <= w) {
+      ctx.strokeStyle = recording ? '#ef4444' : '#ffffff';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px + 0.5, 0); ctx.lineTo(px + 0.5, h); ctx.stroke();
+      ctx.fillStyle = ctx.strokeStyle as string;
+      ctx.beginPath(); ctx.moveTo(px - 4, 0); ctx.lineTo(px + 5, 0); ctx.lineTo(px + 0.5, 7); ctx.fill();
+    }
+
+    // vertical scrollbar (only when the track stack overflows the viewport)
+    const sb = this.scrollbar();
+    if (sb) {
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(sb.x, sb.trackY, SurfaceModel.SCROLLBAR_W, sb.trackH);
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fillRect(sb.x, sb.trackY, 1, sb.trackH);
+      ctx.fillStyle = 'rgba(255,255,255,0.40)';
+      this.roundRectPath(ctx, sb.x + 3, sb.thumbY, SurfaceModel.SCROLLBAR_W - 6, sb.thumbH, 3);
+      ctx.fill();
+    }
   }
 
   draw(ctx: CanvasRenderingContext2D) {
