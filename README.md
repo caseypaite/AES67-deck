@@ -66,6 +66,10 @@ Three processes talk over local sockets:
 
 ### Mixing console (Mixer view)
 
+![Mixer panel walkthrough: channel strips, insert FX racks, analog plug-in editors, aux sends, the mastering suite and scenes](docs/media/mixer-showcase.gif)
+
+<sub>Scripted headless capture — regenerate with `npm run showcase` in [`test/browser/`](test/browser/).</sub>
+
 - 32 input channels in banks of 16, plus the 8 aux buses, Monitor and Master
   as fixed right-hand groups.
 - Per-channel fader, pan, mute, solo, **polarity invert (ø)**, record-arm;

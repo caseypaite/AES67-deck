@@ -1,0 +1,18 @@
+{
+  "name": "aes67-deck-browser-test",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Headless-browser smoke test for the TIMELINE view (cue list + loudness log)",
+  "scripts": {
+    "test": "bash run.sh",
+    "showcase": "bash showcase.sh",
+    "postinstall": "node ./node_modules/puppeteer/install.mjs || true"
+  },
+  "dependencies": {
+    "gifenc": "^1.0.3",
+    "jpeg-js": "^0.4.4",
+    "puppeteer": "^25.9.0",
+    "yauzl": "^3.4.0"
+  }
+}
