@@ -162,6 +162,8 @@ void IpcClient::run() {
                         if (plugin_manage_callback_) plugin_manage_callback_(j);
                     } else if (type == "transport_play" || type == "transport_stop" ||
                                type == "transport_locate" || type == "transport_set_loop" ||
+                               type == "transport_set_punch" ||
+                               type == "bounce_start" || type == "bounce_abort" ||
                                type == "start_multitrack_record" || type == "stop_multitrack_record" ||
                                type == "set_timeline" || type == "set_monitor_input_mask") {
                         if (transport_callback_) transport_callback_(j);

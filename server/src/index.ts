@@ -1003,8 +1003,37 @@ function maybePunch(t: any): void {
 // Server picks the file path + times the run; the engine opens/closes the
 // writer (bounce_start / bounce_abort) and echoes bounceState on the metering
 // frame. Same server-timed pattern as auto-punch.
-const bounce: { active: boolean; path: string; name: string; inSec: number; outSec: number; bits: number } =
-  { active: false, path: '', name: '', inSec: 0, outSec: 0, bits: 24 };
+const bounce: { active: boolean; path: string; name: string; inSec: number; outSec: number; bits: number; prerollFrames: number } =
+  { active: false, path: '', name: '', inSec: 0, outSec: 0, bits: 24, prerollFrames: 0 };
+
+// Drop `frames` of audio off the head of a PCM WAV (the bounce preroll) and fix
+// the RIFF / data chunk sizes. No-op if the layout isn't what we wrote.
+function trimWavHead(file: string, frames: number): void {
+  const cutFrames = Math.max(0, Math.round(frames));
+  if (cutFrames === 0) return;
+  const buf = fs.readFileSync(file);
+  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return;
+  let off = 12, channels = 2, bits = 24, dataOff = -1, dataLen = 0;
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4);
+    const sz = buf.readUInt32LE(off + 4);
+    if (id === 'fmt ') { channels = buf.readUInt16LE(off + 10); bits = buf.readUInt16LE(off + 22); }
+    else if (id === 'data') { dataOff = off + 8; dataLen = sz; break; }
+    off += 8 + sz + (sz & 1);
+  }
+  if (dataOff < 0) return;
+  const blockAlign = channels * (bits >> 3);
+  const cut = Math.min(dataLen, cutFrames * blockAlign);
+  if (cut <= 0) return;
+  const out = Buffer.concat([
+    buf.subarray(0, dataOff),
+    buf.subarray(dataOff + cut, dataOff + dataLen),
+    buf.subarray(dataOff + dataLen),
+  ]);
+  out.writeUInt32LE(out.length - 8, 4);
+  out.writeUInt32LE(dataLen - cut, dataOff - 4);
+  fs.writeFileSync(file, out);
+}
 
 function startBounce(inSec: number, outSec: number, name: string, bits: number): string | null {
   if (!engineSocket) return 'engine not connected';
@@ -1015,11 +1044,17 @@ function startBounce(inSec: number, outSec: number, name: string, bits: number):
   const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const file = `${safe}-${ts}.wav`;
   const b = bits === 16 || bits === 24 ? bits : 24;
-  Object.assign(bounce, { active: true, path: path.join(BOUNCES_DIR, file), name: file, inSec, outSec, bits: b });
   const sr = 48000;
-  engineSocket.write(JSON.stringify({ type: 'transport_locate', frame: Math.round(inSec * sr) }) + '\n');
-  engineSocket.write(JSON.stringify({ type: 'bounce_start', path: path.resolve(bounce.path), bits: b, endFrame: Math.round(outSec * sr) }) + '\n');
+  // Roll in from ~1.5 s before the in-point so the timeline reader primes
+  // before the region; the preroll is trimmed off the file head on completion.
+  const beginFrame = Math.round(inSec * sr);
+  const locateFrame = Math.max(0, beginFrame - Math.round(1.5 * sr));
+  Object.assign(bounce, { active: true, path: path.join(BOUNCES_DIR, file), name: file, inSec, outSec, bits: b, prerollFrames: beginFrame - locateFrame });
+  // play before bounce_start: the engine's bounce_start blocks the IPC thread
+  // waiting for the reader to prime, so the transport must already be rolling.
+  engineSocket.write(JSON.stringify({ type: 'transport_locate', frame: locateFrame }) + '\n');
   engineSocket.write(JSON.stringify({ type: 'transport_play' }) + '\n');
+  engineSocket.write(JSON.stringify({ type: 'bounce_start', path: path.resolve(bounce.path), bits: b, beginFrame, endFrame: Math.round(outSec * sr) }) + '\n');
   broadcastToClients(JSON.stringify({ type: 'bounce_status', state: 'running', name: file, inSec, outSec }));
   return null;
 }
@@ -1040,6 +1075,7 @@ function maybeFinishBounce(t: any): void {
   const b = { ...bounce };
   bounce.active = false;
   setTimeout(() => {
+    try { trimWavHead(b.path, b.prerollFrames); } catch (e) { console.error('bounce: preroll trim failed', e); }
     let bytes = 0;
     try { bytes = fs.statSync(b.path).size; } catch { /* ignore */ }
     broadcastToClients(JSON.stringify({
