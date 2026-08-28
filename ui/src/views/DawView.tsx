@@ -35,6 +35,9 @@ export const DawView = () => {
   const preRollSec = useDawStore((s) => s.preRollSec);
   const setPreRoll = useDawStore((s) => s.setPreRoll);
   const clearRegion = useDawStore((s) => s.clearRegion);
+  const rippleEdit = useDawStore((s) => s.rippleEdit);
+  const setRippleEdit = useDawStore((s) => s.setRippleEdit);
+  const rippleDelete = useDawStore((s) => s.rippleDelete);
   const canUndo = useDawStore((s) => s.canUndo);
   const canRedo = useDawStore((s) => s.canRedo);
   const undo = useDawStore((s) => s.undo);
@@ -77,6 +80,14 @@ export const DawView = () => {
       if (e.key === 'Backspace' || e.key === 'Delete') deleteSelected();
       else if (mod && e.key === 'c') copySelected();
       else if (mod && e.key === 'v') pasteClipboard();
+      else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !mod) {
+        const d = useDawStore.getState();
+        if (!d.selectedClipIds.length) return;
+        e.preventDefault();
+        const fine = e.altKey ? 1 / d.fps : (d.snapToGrid ? d.gridSize : 0.1);
+        const step = (e.shiftKey ? fine * 5 : fine) * (e.key === 'ArrowLeft' ? -1 : 1);
+        d.nudgeSelected(step);
+      }
       else if (e.key.toLowerCase() === 's' && !mod) sliceSelectedAtPlayhead();
       else if (e.key.toLowerCase() === 'l' && !mod) {
         const d = useDawStore.getState();
@@ -158,6 +169,17 @@ export const DawView = () => {
             className="w-9 bg-[#0d0f13] border border-[#333] rounded px-1 py-0.5 text-right text-gray-300 outline-none"
           />
         </label>
+        <div className="w-px h-6 bg-[#333] mx-1" />
+        <button
+          onClick={() => setRippleEdit(!rippleEdit)} title="Ripple edit — delete/paste close/open the gap after"
+          className={`px-2.5 py-1 text-xs font-bold rounded transition-colors ${rippleEdit ? 'bg-amber-600 text-white' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
+        >RIPPLE</button>
+        {region && (
+          <button
+            onClick={rippleDelete} title="Cut the region out of every track and close the gap"
+            className="px-2 py-1 text-xs font-bold rounded bg-[#222] text-gray-400 hover:bg-red-700 hover:text-white transition-colors"
+          >✂ CUT</button>
+        )}
       </div>
 
       <div className={`absolute ${loudnessOpen ? 'bottom-[104px]' : 'bottom-6'} ${cuesOpen ? 'right-[280px]' : 'right-8'} flex items-center bg-[#111] rounded-lg shadow-xl border border-[#333] p-1 z-40 gap-1`}>

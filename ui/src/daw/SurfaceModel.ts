@@ -206,6 +206,7 @@ export class SurfaceModel {
       const x1 = this.timeToX(c.start + c.length);
       if (px < x0 - 1 || px > x1 + 1) continue;
       const base = { clipId: c.id, trackId: track.id, lane: band.lane, time };
+      if (c.locked) return { kind: 'clip', ...base, cursor: 'default' };
       const g = this.grips(c, x0, x1, y, ch);
 
       // fade grips (top edge, near the ramp end-point) — comp lane only
@@ -441,17 +442,40 @@ export class SurfaceModel {
     }
     ctx.restore();
 
-    // border — recording placeholders pulse
+    // border — recording placeholders pulse; grouped clips get a coloured edge
     if (c.recording) {
       const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 180);
       ctx.strokeStyle = `rgba(255,90,90,${pulse.toFixed(3)})`;
       ctx.lineWidth = 2;
+    } else if (c.group && !sel) {
+      const hue = (parseInt(c.group.slice(0, 6), 36) || 0) % 360;
+      ctx.strokeStyle = `hsla(${hue},70%,65%,0.9)`;
+      ctx.lineWidth = 1.5;
     } else {
       ctx.strokeStyle = sel ? '#ffffff' : rgba(mix(base, WHITE, 0.25), 0.5);
       ctx.lineWidth = sel ? 1.5 : 1;
     }
     this.roundRectPath(ctx, x + 0.75, y + 0.75, wClip - 1.5, ch - 1.5, 3);
     ctx.stroke();
+
+    // lock: hatch wash + a padlock tick at the right edge of the header
+    if (c.locked) {
+      ctx.save();
+      this.roundRectPath(ctx, x, y, wClip, ch, 3);
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+      ctx.lineWidth = 1;
+      for (let hx = x - ch; hx < x + wClip; hx += 7) {
+        ctx.beginPath(); ctx.moveTo(hx, y + ch); ctx.lineTo(hx + ch, y); ctx.stroke();
+      }
+      if (wClip > 16) {
+        ctx.fillStyle = 'rgba(255,255,255,0.8)';
+        ctx.fillRect(x + wClip - 8, y + 4, 5, 4);
+        ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+        ctx.beginPath(); ctx.arc(x + wClip - 5.5, y + 4, 2, Math.PI, 0); ctx.stroke();
+      }
+      ctx.restore();
+    }
 
     // fade grips + gain grip (only when selected — keeps idle clips clean)
     if (sel) {
