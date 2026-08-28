@@ -18,13 +18,16 @@ DiskWriter::~DiskWriter() {
     jack_ringbuffer_free(ringbuffer_);
 }
 
-bool DiskWriter::start_recording(const std::string& filepath, int channels, int sample_rate) {
+bool DiskWriter::start_recording(const std::string& filepath, int channels, int sample_rate, int bits) {
     if (is_recording_) return false;
 
     channels_ = channels;
     sf_info_.channels = channels;
     sf_info_.samplerate = sample_rate;
-    sf_info_.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+    const int subtype = bits == 16 ? SF_FORMAT_PCM_16
+                      : bits == 24 ? SF_FORMAT_PCM_24
+                                   : SF_FORMAT_FLOAT;
+    sf_info_.format = SF_FORMAT_WAV | subtype;   // libsndfile converts float→PCM on write
 
     SNDFILE* sf = sf_open(filepath.c_str(), SFM_WRITE, &sf_info_);
     if (!sf) {

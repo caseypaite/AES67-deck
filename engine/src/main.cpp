@@ -275,6 +275,13 @@ struct Transport {
 };
 static Transport g_transport;
 
+// Bounce (plan Phase 4) — render a timeline region through the graph to a file.
+// 0 idle, 1 running, 2 just-finished. `g_bounce_end` is the exclusive out-frame;
+// the audio thread stops the recorder + transport when the clock reaches it.
+// The server opens/closes the file (IPC thread) and picks the path.
+static std::atomic<int> g_bounce_state{0};
+static std::atomic<uint64_t> g_bounce_end{0};
+
 // Virtual-soundcheck per-channel monitor source override. Bit (i-1) set => input
 // channel i monitors its LIVE JACK input even while the timeline is playing
 // (state 1); clear => it follows the transport like normal. Written from the IPC
@@ -466,7 +473,7 @@ int main(int argc, char** argv) {
     // take files here (never on the audio thread) and flips the transport
     // atomics the audio callback reads. take_started / take_finished replies
     // ride the same IPC tx path as metering.
-    ipc.set_transport_callback([&mtr, &jack, &ipc, &player](const nlohmann::json& j) {
+    ipc.set_transport_callback([&mtr, &jack, &ipc, &player, &recorder](const nlohmann::json& j) {
         const std::string type = j.value("type", "");
 
         if (type == "set_timeline") {
@@ -535,6 +542,27 @@ int main(int argc, char** argv) {
             g_transport.punch_out.store(e, std::memory_order_relaxed);
             g_transport.punch_enabled.store(j.value("enabled", false) && e > s,
                                             std::memory_order_relaxed);
+
+        } else if (type == "bounce_start") {
+            // Server has located the transport to the in-point already; open
+            // the writer here (IPC thread, never the audio thread) and roll.
+            const std::string path = j.value("path", "");
+            const int bits = j.value("bits", 24);
+            const uint64_t endF = j.value("endFrame", (uint64_t)0);
+            if (path.empty() || endF == 0 ||
+                !recorder.start_recording(path, 2, static_cast<int>(jack.get_sample_rate()), bits)) {
+                ipc.send_json(nlohmann::json{{"type", "bounce_failed"}, {"path", path}}.dump());
+            } else {
+                g_bounce_end.store(endF, std::memory_order_relaxed);
+                g_bounce_state.store(1, std::memory_order_relaxed);
+                std::cout << "Bounce -> " << path << "  end frame " << endF
+                          << "  " << bits << "-bit" << std::endl;
+            }
+
+        } else if (type == "bounce_abort") {
+            recorder.stop_recording();
+            g_bounce_state.store(0, std::memory_order_relaxed);
+            g_transport.state.store(0, std::memory_order_relaxed);
 
         } else if (type == "start_multitrack_record") {
             const std::string dir = j.value("dir", "");
@@ -1292,7 +1320,8 @@ int main(int argc, char** argv) {
             //    `buf` = the process block size, for the toolbar latency readout.
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
                 ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d,\"monInMask\":%u,"
-                "\"loopOn\":%d,\"loopIn\":%llu,\"loopOut\":%llu,\"punchOn\":%d,\"punchIn\":%llu,\"punchOut\":%llu}",
+                "\"loopOn\":%d,\"loopIn\":%llu,\"loopOut\":%llu,\"punchOn\":%d,\"punchIn\":%llu,\"punchOut\":%llu,"
+                "\"bounceState\":%d,\"bounceOverrun\":%d}",
                 static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
                 g_transport.state.load(std::memory_order_relaxed),
                 static_cast<int>(jack.get_sample_rate()),
@@ -1304,7 +1333,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(g_transport.loop_end.load(std::memory_order_relaxed)),
                 g_transport.punch_enabled.load(std::memory_order_relaxed) ? 1 : 0,
                 static_cast<unsigned long long>(g_transport.punch_in.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(g_transport.punch_out.load(std::memory_order_relaxed)));
+                static_cast<unsigned long long>(g_transport.punch_out.load(std::memory_order_relaxed)),
+                g_bounce_state.load(std::memory_order_relaxed),
+                recorder.had_overrun() ? 1 : 0);
 
             snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
 
@@ -1321,6 +1352,17 @@ int main(int argc, char** argv) {
                 if (le > ls && next >= le) next = ls + (next - le) % (le - ls);
             }
             g_transport.frame.store(next, std::memory_order_relaxed);
+
+            // Bounce end — stop the writer + transport when the clock reaches
+            // the out-point. stop_recording() only flips a flag; the disk
+            // thread finalises the file. Server sees g_bounce_state==2 on the
+            // metering frame and reports the result.
+            if (g_bounce_state.load(std::memory_order_relaxed) == 1 &&
+                next >= g_bounce_end.load(std::memory_order_relaxed)) {
+                recorder.stop_recording();
+                g_transport.state.store(0, std::memory_order_relaxed);
+                g_bounce_state.store(2, std::memory_order_relaxed);
+            }
         }
     });
 

@@ -88,6 +88,12 @@ interface DawState {
   punchEnabled: boolean;
   preRollSec: number;
 
+  // Phase 4 — realtime master bounce (server-timed; not persisted).
+  bounceState: 'idle' | 'running' | 'done' | 'failed';
+  lastBounce: { name: string; bytes: number; durationSec: number; overrun: boolean } | null;
+  bounceError: string | null;
+  bounces: Array<{ name: string; bytes: number; mtime: number }>;
+
   selectedClipIds: string[];
   clipboard: DawClip[];
 
@@ -142,6 +148,14 @@ interface DawState {
   redo: () => void;
   historyBegin: () => void;   // open a coalescing txn (a pointer gesture)
   historyEnd: () => void;
+
+  // Phase 4 — bounce.
+  startBounce: (opts: { inSec: number; outSec: number; name: string; bits: number }) => void;
+  cancelBounce: () => void;
+  applyBounceStatus: (msg: { state: string; error?: string }) => void;
+  applyBounceDone: (msg: { name: string; bytes: number; durationSec: number; overrun: boolean }) => void;
+  setBounces: (list: Array<{ name: string; bytes: number; mtime: number }>) => void;
+  projectEndSec: () => number;
 
   beginRecordingClips: (armed: number[], originSec: number, sr: number) => void;
   pushRecPeaks: (byTrack: Record<string, number[]>) => void;
@@ -323,6 +337,10 @@ export const useDawStore = create<DawState>()(
       preRollSec: 0,
       canUndo: false,
       canRedo: false,
+      bounceState: 'idle',
+      lastBounce: null,
+      bounceError: null,
+      bounces: [],
 
       selectedClipIds: [],
       clipboard: [],
@@ -369,6 +387,28 @@ export const useDawStore = create<DawState>()(
         const want = { loop: !!s.region && s.loopEnabled, punch: !!s.region && s.punchEnabled };
         if (want.loop !== engineLoopOn || want.punch !== enginePunchOn) syncRegionToEngine(s);
       },
+
+      // --- Phase 4: bounce ---
+      projectEndSec: () => {
+        const cs = Object.values(get().clips).filter((c) => !c.recording);
+        return cs.length ? Math.max(...cs.map((c) => c.start + c.length)) : 0;
+      },
+      startBounce: ({ inSec, outSec, name, bits }) => {
+        if (!(outSec > inSec)) return;
+        set({ bounceState: 'running', bounceError: null, lastBounce: null });
+        wsSend({ type: 'bounce', inSec, outSec, name, bits });
+      },
+      cancelBounce: () => { wsSend({ type: 'bounce_cancel' }); set({ bounceState: 'idle' }); },
+      applyBounceStatus: (msg) => {
+        if (msg.state === 'running') set({ bounceState: 'running', bounceError: null });
+        else if (msg.state === 'failed') set({ bounceState: 'failed', bounceError: msg.error || 'bounce failed' });
+        else set({ bounceState: 'idle' }); // cancelled
+      },
+      applyBounceDone: (msg) => set({
+        bounceState: 'done',
+        lastBounce: { name: msg.name, bytes: msg.bytes, durationSec: msg.durationSec, overrun: !!msg.overrun },
+      }),
+      setBounces: (list) => set({ bounces: Array.isArray(list) ? list : [] }),
 
       // --- Phase 4: undo / redo ---
       historyBegin: () => { if (txnDepth === 0) pushHistory(true); txnDepth += 1; },

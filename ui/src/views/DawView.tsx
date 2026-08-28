@@ -1,10 +1,11 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useDawStore } from '../stores/useDawStore';
 import { useMixerStore } from '../stores/useMixerStore';
 import { ArrangeSurface } from '../daw/ArrangeSurface';
 import { TrackPanel } from '../daw/TrackPanel';
 import { CueListPanel } from '../components/daw/CueListPanel';
 import { LoudnessHistory } from '../components/daw/LoudnessHistory';
+import { BounceDialog } from '../components/daw/BounceDialog';
 
 const PANEL_W = 208;
 
@@ -21,6 +22,8 @@ export const DawView = () => {
   const setCuesOpen = useDawStore((s) => s.setCuesOpen);
   const loudnessOpen = useDawStore((s) => s.loudnessOpen);
   const setLoudnessOpen = useDawStore((s) => s.setLoudnessOpen);
+  const [bounceOpen, setBounceOpen] = useState(false);
+  const bounceState = useDawStore((s) => s.bounceState);
   const vscMessage = useMixerStore((s) => s.vscStatus.message);
   const vscDiskLow = useMixerStore((s) => s.vscStatus.diskLow);
 
@@ -107,6 +110,7 @@ export const DawView = () => {
       </div>
 
       {loudnessOpen && <LoudnessHistory />}
+      {bounceOpen && <BounceDialog onClose={() => setBounceOpen(false)} />}
 
       {(lastOverrun || playbackUnderrun) && (
         <div className={`absolute ${loudnessOpen ? 'bottom-[152px]' : 'bottom-[54px]'} left-8 z-40 px-3 py-1.5 rounded bg-red-700 text-white text-xs font-bold shadow-xl border border-red-400`}>
@@ -170,6 +174,13 @@ export const DawView = () => {
           title="Loudness log"
         >
           LUFS
+        </button>
+        <button
+          onClick={() => setBounceOpen(true)}
+          className={`px-3 py-1 text-xs font-bold rounded transition-colors ${bounceState === 'running' ? 'bg-blue-600 text-white animate-pulse' : 'bg-[#222] text-gray-500 hover:text-gray-300'}`}
+          title="Bounce a region (or the whole project) through the master chain to a WAV"
+        >
+          BOUNCE
         </button>
         <div className="w-px h-6 bg-[#333] mx-1" />
         <button
