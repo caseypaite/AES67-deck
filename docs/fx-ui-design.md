@@ -1,4 +1,4 @@
-# FX plugin UI design guideline (2026-08-26)
+# FX plugin UI design guideline (2026-08-26, knob revised 2026-08-28)
 
 How every effect's editor UI in the FX rack must look and behave. Applies to
 the plugin detail view in `ui/src/components/plugins/FxRackCard.tsx`
@@ -44,29 +44,52 @@ Every effect editor is three columns, left → right:
 
 ## 3. Analog knob standard
 
-All continuous parameters are **analog rotary knobs** — the shared `<Knob>`
-component from the analog kit (`ui-design.md` §2.1), **standard** size tier
-(52–64 px). No bare `<input type="range">` bars anywhere in the FX body.
+All continuous parameters are **analog rotary knobs** — the shared
+`AnalogKnob` component (`ui/src/components/analog/AnalogKnob.tsx`),
+**standard** size tier (52–64 px; the FX bays use `KNOB_SIZE = 56`). No bare
+`<input type="range">` bars anywhere in the FX body.
 
-- `<Knob>` carries the realistic 3D treatment (skirt, knurl, cap, engraved
-  tick ring, pointer shadow, press-in state) — see `ui-design.md`. This doc
-  only sets FX usage:
-- Interaction: vertical drag = value (≈ 0.5 %/px of range), double-tap =
-  default, Shift-drag or slow-drag = fine. Wheel optional.
-- Bipolar params (gain, trim, pan) get the red centre tick and a
-  snap-to-centre detent.
-- Accent colour = the effect's category colour (§7).
-- Each knob shows its live value + unit in a small `font-mono` readout below
-  the label, in the style of the fader dB pill in `LiveConsoleView`.
-- Range / label / unit come from the engine's `PluginControlPortInfo`
-  (`symbol`, `name`, `min`, `max`, `default_value` — `Lv2Host.h`) once the
-  server forwards it (`plugin_ports`, §6). Until then keep an explicit
-  per-URI param map in the registry — **do not** ship the
-  `key.includes('threshold') ? …` heuristic currently in `PluginDetail`.
-- `KNOB2624.knob` / `webknobman.html` is the sanctioned route to a
-  higher-fidelity sprite-sheet skin. If adopted, the frame count and
-  rotation mapping live inside one shared `<AnalogKnob>` so every effect
-  inherits it.
+The knob is the **"Rotary Knob · LED Level Ring"** design — ported from the
+Claude Design canvas (`claude.ai/design/p/8dcc512d…`; the published study is
+the artifact "Audio control knob design"). 270° sweep, zero at −135°.
+
+- **Look**, concentric layers outer → inner:
+  - a recessed dark **LED channel** at the rim;
+  - the **value ring** — a faint unlit track plus an accent
+    `conic-gradient` arc filled to the current position, with an always-on
+    `drop-shadow` glow (brighter while turning) and a soft blurred bloom
+    behind it. The lit arc *is* the value indicator — there is no engraved
+    tick ring.
+  - a machined **metal collar**;
+  - a **chromed cap** (multi-stop metal `linear-gradient`) that rotates, with
+    a **static** environment-sheen stack on top (conic reflection + top
+    hotspot + directional shade + inset shadow) that does **not** rotate;
+  - the **accent pointer** — a short bar in the category colour with its own
+    glow, on the rotating cap.
+  - `ring` geometry scales with `size` and the channel/track get extra
+    contrast so the arc still reads at 56 px (the study was drawn at
+    100–200 px).
+- **Interaction:** vertical drag = value (≈ `1/240` of range per px; Shift =
+  fine, `1/900`); **wheel = 3 % steps**; double-click / double-tap =
+  default; **↑ ↓ ← → nudge** once focused (Shift = fine). `role="slider"`
+  with `aria-label` / `aria-valuetext`; a hairline focus ring on keyboard
+  focus.
+- **Bipolar params** (gain, trim, pan) get a red **centre-detent reference
+  mark** at 12 o'clock. (No snap detent — the ring reads the offset.)
+- **Accent colour** = the effect's category colour (§7).
+- The live value + unit shows in a `font-mono` pill that **floats above the
+  knob while it is being turned** (mouse: until release; touch: for the whole
+  gesture), styled like the fader dB pill in `LiveConsoleView`. The static
+  label sits below in `text-[8px] font-black tracking-wide uppercase`.
+- Range / label / unit come from the curated per-URI `ParamSpec` maps
+  (`data/calfPlugins.ts`, from the `.ttl` files) via
+  `paramToPos` / `posToParam` / `formatParam`, which also carry the log /
+  gain taper. For non-Calf plugins, fall back to the engine's
+  `PluginControlPortInfo` once the server forwards it (`plugin_ports`, §6) —
+  **never** the `key.includes('threshold') ? …` heuristic.
+- The old `KNOB2624.knob` / `webknobman.html` sprite-sheet route is
+  **superseded** — the LED-ring design is pure CSS/DOM (no image assets, no
+  frame-count mapping) and lives entirely in `AnalogKnob`.
 
 ## 4. Effect-specific body layouts
 
@@ -273,5 +296,10 @@ category falls back to a plain `<Knob>` grid — never the range-bar list.
      de-esser, limiter). GR still derived from the in/out meters; a real
      `gr` / `fx_rta` on the `fx` payload would improve dynamics + add live
      RTA behind the EQ curve.
-6. Realistic sprite-sheet knob skin (`KNOB2624.knob`), rack-format chrome
-   (`ui-design.md`).
+6. **DONE — LED level-ring knob** (§3): `AnalogKnob` reskinned to the
+   "Rotary Knob · LED Level Ring" study from the Claude Design canvas (accent
+   `conic-gradient` value ring + glow, chromed cap with static environment
+   sheen, accent pointer). Pure CSS/DOM, same `ParamSpec` API — all nine
+   editors + the generic `PluginDetail` list inherit it. Adds wheel + arrow
+   nudge + `role="slider"`. Supersedes the sprite-sheet route.
+   Remaining: rack-format chrome (`ui-design.md`).
