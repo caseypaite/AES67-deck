@@ -3,7 +3,9 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include "WavpackWriter.h"
 
@@ -15,13 +17,24 @@ namespace recorder {
 // armed channel. Files are opened/closed on the IPC thread (start()/stop());
 // the audio thread only calls write(), which is lock-free and allocation-free.
 //
+// Thread model (the reason for the atomics below): start()/stop() run on the
+// IPC thread and mutate the writer set; the audio thread reads it every block
+// via write() + the metering builder's armed_mask()/poll_tap_peaks(); a reaper
+// thread destroys writers from finished takes. A stop()+immediate start()
+// (auto-punch, or an operator mashing the button) must never free a writer the
+// audio thread is one block deep inside — hence the retire/reap with an audio
+// block-sequence fence rather than an inline reset.
+//
 // Tap point is the raw pre-insert channel input (see plan D1) — the caller
 // passes the JACK input buffers straight through.
 class MultitrackRecorder {
 public:
     static constexpr int MAX_CH = 32; // channel ids 1..32
 
-    MultitrackRecorder() = default;
+    MultitrackRecorder();
+    ~MultitrackRecorder();
+    MultitrackRecorder(const MultitrackRecorder&) = delete;
+    MultitrackRecorder& operator=(const MultitrackRecorder&) = delete;
 
     // armed: 1-based channel ids to capture. origin_frame: transport frame the
     // take starts at (its project-time zero). Returns false if already
@@ -32,17 +45,22 @@ public:
     // Close every open writer. Safe to call when not recording.
     void stop();
 
-    bool is_recording() const { return recording_.load(std::memory_order_relaxed); }
+    // acquire so a reader that sees `true` also sees the writer_ptr_ / armed_mask_
+    // that start() published before flipping this.
+    bool is_recording() const { return recording_.load(std::memory_order_acquire); }
     const std::string& dir() const { return dir_; }
     uint64_t origin_frame() const { return origin_frame_; }
     int sample_rate() const { return sample_rate_; }
-    const std::vector<int>& armed() const { return armed_; }
+    const std::vector<int>& armed() const { return armed_; }   // IPC thread only
 
     // RT thread. No-op for channels not armed in the current take.
     void write(int ch_id, const float* l, const float* r, int nframes) {
         if (!recording_.load(std::memory_order_acquire)) return;
         if (ch_id < 1 || ch_id > MAX_CH) return;
-        WavpackWriter* w = writers_[ch_id].get();
+        // Atomic load: an in-flight write() that raced a retire sees either the
+        // still-live outgoing writer (kept alive by the reaper's block-seq
+        // fence) or nullptr — never a torn pointer.
+        WavpackWriter* w = writer_ptr_[ch_id].load(std::memory_order_acquire);
         if (!w) return;
         const float* chans[2] = { l, r };
         w->write_audio(chans, 2, nframes);
@@ -66,6 +84,14 @@ public:
         }
     }
 
+    // RT thread, once per process callback after the per-channel write()s. Bumps
+    // the block sequence the reaper fences retired-writer destruction against.
+    void end_audio_block() { audio_block_seq_.fetch_add(1, std::memory_order_release); }
+
+    // RT thread (metering builder): which channels to poll_tap_peaks(). Bit
+    // (ch-1) set = armed. Own snapshot so the audio thread never touches armed_.
+    uint32_t armed_mask() const { return armed_mask_.load(std::memory_order_acquire); }
+
     // RT thread (metering builder). Drains up to `cap` accumulated min/max
     // pairs into out[] as [min,max,min,max,...]; returns the pair count.
     int poll_tap_peaks(int ch_id, float* out, int cap) {
@@ -84,13 +110,14 @@ public:
     uint64_t frames_tapped() const { return frames_tapped_.load(std::memory_order_relaxed); }
 
     // Frames actually written per channel this take — the reliable clip length,
-    // independent of where the transport was when record armed.
+    // independent of where the transport was when record armed. IPC thread.
     uint64_t recorded_frames() const {
         const size_t n = armed_.size();
         return n ? frames_tapped_.load(std::memory_order_relaxed) / n : 0;
     }
 
     // True if any armed channel's disk writer reported a ringbuffer overrun.
+    // IPC thread (writers_ is IPC-owned).
     bool had_overrun() const {
         for (int c = 1; c <= MAX_CH; ++c) {
             const WavpackWriter* w = writers_[c].get();
@@ -103,9 +130,25 @@ public:
     static constexpr const char* file_ext() { return "wv"; }
 
 private:
-    std::array<std::unique_ptr<WavpackWriter>, MAX_CH + 1> writers_{}; // index by ch id
+    void reaper_loop();
+
+    // Ownership (IPC thread) and the audio thread's atomic view of it.
+    std::array<std::unique_ptr<WavpackWriter>, MAX_CH + 1> writers_{};
+    std::array<std::atomic<WavpackWriter*>, MAX_CH + 1> writer_ptr_{};
+
     std::atomic<bool> recording_{false};
     std::atomic<uint64_t> frames_tapped_{0};
+    std::atomic<uint32_t> armed_mask_{0};
+    std::atomic<uint64_t> audio_block_seq_{0};
+
+    // Writers from finished takes wait here to be destroyed off the RT / IPC
+    // path, and only once the audio block sequence has advanced past the retire
+    // point (so any in-flight write() on the outgoing writer has completed).
+    struct Retired { std::unique_ptr<WavpackWriter> w; uint64_t seq; };
+    std::vector<Retired> retired_;
+    std::mutex retired_mutex_;
+    std::thread reaper_;
+    std::atomic<bool> reaper_run_{true};
 
     // Live-waveform peak envelope: one min/max pair per PEAK_BUCKET frames
     // (~5 ms @ 48k), per channel. Single-thread (process) ring; the metering

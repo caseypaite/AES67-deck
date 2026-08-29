@@ -92,6 +92,19 @@ while time.time() - t0 < DUR:
         send({"type": "start_record"})   # immediate-ish re-record
     if n == 78:
         send({"type": "stop_record"})
+
+    # Multitrack take stress — rapid start/stop is the WavpackWriter-lifetime
+    # window (start() used to reap writers the audio thread was still in).
+    if n % 90 == 10:
+        d = f"/tmp/aes67_mtr_test/take_{n}"; os.makedirs(d, exist_ok=True)
+        send({"type": "start_multitrack_record", "dir": d, "armed": [1, 2, 3, 4, 5, 6, 7, 8]})
+    if n % 90 == 13:        # ~9 ms later — barely a couple of audio blocks
+        send({"type": "stop_multitrack_record"})
+    if n % 90 == 14:        # immediately re-arm
+        d = f"/tmp/aes67_mtr_test/take_{n}b"; os.makedirs(d, exist_ok=True)
+        send({"type": "start_multitrack_record", "dir": d, "armed": [1, 2, 3, 4, 5, 6, 7, 8]})
+    if n % 90 == 16:
+        send({"type": "stop_multitrack_record"})
     if n % 25 == 0:
         send({"type": "set_timeline", "clips": [
             {"trackId": 1, "timelineStart": 0, "length": 48000 * 10,

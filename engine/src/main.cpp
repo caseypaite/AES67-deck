@@ -1315,6 +1315,10 @@ int main(int argc, char** argv) {
             st.current_peak_r = std::max(st.current_peak_r, peak_r);
         }
 
+        // Every multitrack tap for this block is in — advance the block
+        // sequence the recorder's reaper fences retired-writer destruction on.
+        mtr.end_audio_block();
+
         // Talkback: only while pressed, summed pre-fader/pan into every bus
         // buffer selected in the destination mask (Master and/or any Aux
         // buses), so it rides through each bus's own fader/pan/inserts like
@@ -1687,7 +1691,9 @@ int main(int argc, char** argv) {
                 offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, ",\"recPeaks\":{");
                 bool rf = true;
                 float pk[192];
-                for (int ch : mtr.armed()) {
+                const uint32_t armed_mask = mtr.armed_mask();
+                for (int ch = 1; ch <= NUM_CHANNELS; ++ch) {
+                    if (!(armed_mask & (1u << (ch - 1)))) continue;
                     const int npairs = mtr.poll_tap_peaks(ch, pk, 96);
                     offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
                         "%s\"%d\":[", rf ? "" : ",", ch);
