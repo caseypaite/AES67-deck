@@ -3,6 +3,7 @@
 #include <lilv/lilv.h>
 #include <lv2/atom/atom.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 #include <atomic>
@@ -59,7 +60,9 @@ public:
     // allocation. Safe to call from the audio thread (via the plugin command
     // ring) as well as the IPC thread.
     void set_control_value(uint32_t port_index, float value);
-    void set_control_value_by_symbol(const std::string& symbol, float value);
+    // RT thread calls this with a char[] from the plugin command ring — takes
+    // string_view so no std::string is constructed on the audio thread.
+    void set_control_value_by_symbol(std::string_view symbol, float value);
     float get_control_value(uint32_t port_index) const;
 
     // Helpers
@@ -81,7 +84,7 @@ private:
     // Heap allocated control values to ensure stable pointers for lilv
     std::map<uint32_t, float*> control_values_;
     // symbol -> control-port index, built in instantiate(), read-only after.
-    std::map<std::string, uint32_t> control_index_by_symbol_;
+    std::map<std::string, uint32_t, std::less<>> control_index_by_symbol_;  // std::less<> → heterogeneous find()
     
     std::vector<uint32_t> audio_inputs_;
     std::vector<uint32_t> audio_outputs_;

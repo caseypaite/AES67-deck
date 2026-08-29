@@ -67,11 +67,17 @@ void IpcClient::send_metering(float l, float r) {
     }
 }
 
-void IpcClient::send_multichannel_metering(const std::string& json_payload) {
-    std::string msg = json_payload + "\n";
-    if (jack_ringbuffer_write_space(tx_buffer_) >= msg.length()) {
-        jack_ringbuffer_write(tx_buffer_, msg.c_str(), msg.length());
+void IpcClient::send_metering_rt(const char* json, size_t len) {
+    // Two writes (payload, newline) so nothing is allocated on the RT thread.
+    // jack_ringbuffer is byte-oriented; the consumer reassembles lines anyway.
+    if (jack_ringbuffer_write_space(tx_buffer_) >= len + 1) {
+        jack_ringbuffer_write(tx_buffer_, json, len);
+        jack_ringbuffer_write(tx_buffer_, "\n", 1);
     }
+}
+
+void IpcClient::send_multichannel_metering(const std::string& json_payload) {
+    send_metering_rt(json_payload.data(), json_payload.size());
 }
 
 void IpcClient::start() {

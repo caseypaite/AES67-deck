@@ -879,7 +879,13 @@ int main(int argc, char** argv) {
     std::vector<float> tmp_R(8192, 0.0f);
     std::vector<float> tmp_out_L(8192, 0.0f);
     std::vector<float> tmp_out_R(8192, 0.0f);
-    std::vector<char> meter_json(32768, 0);   // headroom for live-record peak batches
+    // Metering frame scratch. Worst case is recPeaks — up to 32 armed multitrack
+    // channels × 96 min/max pairs × ~16 chars ≈ 48 KB — plus the ~4 KB of
+    // channels/fx/master/transport, so 64 KB with margin. The mj_append helper
+    // below also hard-clamps `offset` so a truncated write can never let the
+    // next snprintf run past the buffer (that underflows `size - offset` → an
+    // out-of-bounds write, i.e. heap corruption on the RT thread).
+    std::vector<char> meter_json(64 * 1024, 0);
 
     // Timecode & sync engines (audio thread only) — plan Phase 3d.
     timecode::LtcEncoder ltc_enc;
@@ -965,12 +971,13 @@ int main(int argc, char** argv) {
                 frame_counter += static_cast<int>(nframes);
                 if (frame_counter >= meter_interval_frames) {
                     frame_counter = 0;
-                    snprintf(meter_json.data(), meter_json.size(),
+                    int cn = snprintf(meter_json.data(), meter_json.size(),
                         "{\"type\":\"metering\",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d},"
                         "\"tc\":{\"countin\":%lld}}",
                         static_cast<unsigned long long>(block_start_frame), transport_state,
                         static_cast<int>(sr), static_cast<long long>(countin));
-                    ipc.send_multichannel_metering(meter_json.data());
+                    ipc.send_metering_rt(meter_json.data(),
+                        cn > 0 ? std::min<size_t>(cn, meter_json.size() - 1) : 0);
                 }
                 return;
             }
@@ -1585,6 +1592,18 @@ int main(int argc, char** argv) {
         if (frame_counter >= meter_interval_frames) {
             int offset = snprintf(meter_json.data(), meter_json.size(), "{\"type\":\"metering\",\"channels\":{");
 
+            // Bounded append into meter_json. snprintf returns the length it
+            // *would* have written, so on truncation `offset` must not run past
+            // the buffer — `meter_json.size() - offset` is size_t and would
+            // underflow, making the next call write out of bounds (heap
+            // corruption on the RT thread). This clamps every append.
+            const int MJ_CAP = static_cast<int>(meter_json.size()) - 1;
+            auto mj = [&](const char* fmt, auto&&... a) {
+                if (offset >= MJ_CAP) return;
+                int n = snprintf(meter_json.data() + offset, static_cast<size_t>(MJ_CAP - offset), fmt, a...);
+                offset += (n > 0) ? std::min(n, MJ_CAP - offset) : 0;
+            };
+
             auto calc_db = [](float peak) {
                 return (peak > 0.00001f) ? 20.0f * std::log10(peak) : -100.0f;
             };
@@ -1594,9 +1613,9 @@ int main(int argc, char** argv) {
             bool first = true;
             for (auto& pair : channels) {
                 if (!first) {
-                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, ",");
+                    mj( ",");
                 }
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                mj(
                     "\"%d\":{\"l\":%.1f,\"r\":%.1f}",
                     pair.first, calc_db(pair.second.current_peak_l), calc_db(pair.second.current_peak_r));
 
@@ -1604,22 +1623,22 @@ int main(int argc, char** argv) {
                 pair.second.current_peak_r *= decay;
                 first = false;
             }
-            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+            mj( "}");
 
             // Per-plugin in/out for the editor the UI has open (fx_focus).
             const int fc = g_fx_focus_channel.load(std::memory_order_relaxed);
             const int fp = g_fx_focus_plugin.load(std::memory_order_relaxed);
             if (fc >= 0 && fp >= 0) {
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                mj(
                     ",\"fx\":{\"channel\":%d,\"pluginIndex\":%d,\"inL\":%.1f,\"inR\":%.1f,\"outL\":%.1f,\"outR\":%.1f,\"rta\":[",
                     fc, fp,
                     calc_db(g_fx_in_peak_l), calc_db(g_fx_in_peak_r),
                     calc_db(g_fx_out_peak_l), calc_db(g_fx_out_peak_r));
                 for (int k = 0; k < RTA_BANDS; ++k) {
-                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    mj(
                         "%s%.1f", k ? "," : "", g_rta_mag[k]);
                 }
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]}");
+                mj( "]}");
             }
             g_fx_in_peak_l *= decay;  g_fx_in_peak_r *= decay;
             g_fx_out_peak_l *= decay; g_fx_out_peak_r *= decay;
@@ -1661,66 +1680,66 @@ int main(int argc, char** argv) {
                 float tp = g_lufs_tp > 1e-6f ? 20.0f * std::log10(g_lufs_tp) : -120.0f;
                 g_lufs_tp *= 0.92f;  // slow decay so a transient peak lingers
 
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                mj(
                     ",\"lufs\":{\"m\":%.1f,\"s\":%.1f,\"i\":%.1f,\"tp\":%.1f}", m, st, integ, tp);
             }
 
             // ── Master analyser: spectrum, correlation, goniometer scatter ──
-            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+            mj(
                 ",\"master\":{\"corr\":%.2f,\"rta\":[", g_corr_val);
             for (int k = 0; k < MRTA_BANDS; ++k) {
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                mj(
                     "%s%.1f", k ? "," : "", g_mrta_mag[k]);
             }
-            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "],\"gonio\":[");
+            mj( "],\"gonio\":[");
             for (int i = 0; i < GONIO_POINTS; ++i) {
                 int idx = (g_gonio_pos + i) % GONIO_POINTS;
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                mj(
                     "%s%.3f,%.3f", i ? "," : "", g_gonio[idx * 2], g_gonio[idx * 2 + 1]);
             }
-            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]}");
+            mj( "]}");
 
             // ── Live-record peak envelope: the per-block min/max pairs of each
             //    armed tap accumulated since the last frame, for the growing
             //    UI waveform. Flat [min,max,min,max,...] per channel. ──
             if (mtr.is_recording()) {
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, ",\"recPeaks\":{");
+                mj( ",\"recPeaks\":{");
                 bool rf = true;
                 float pk[192];
                 const uint32_t armed_mask = mtr.armed_mask();
                 for (int ch = 1; ch <= NUM_CHANNELS; ++ch) {
                     if (!(armed_mask & (1u << (ch - 1)))) continue;
                     const int npairs = mtr.poll_tap_peaks(ch, pk, 96);
-                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    mj(
                         "%s\"%d\":[", rf ? "" : ",", ch);
                     for (int i = 0; i < npairs * 2 && offset < (int)meter_json.size() - 16; ++i)
-                        offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                        mj(
                             "%s%.4f", i ? "," : "", pk[i]);
-                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "]");
+                    mj( "]");
                     rf = false;
                 }
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+                mj( "}");
             }
 
             // ── Live insert-chain lengths ── so the server/UI can detect (and
             //    heal) a drift between what they think the rack holds and what
             //    the engine actually has. Only non-empty chains are listed.
             {
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, ",\"fxN\":{");
+                mj( ",\"fxN\":{");
                 bool ff = true;
                 for (const auto& pr : channels) {
                     const size_t nfx = pr.second.insert_chain.size();
                     if (nfx == 0) continue;
-                    offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+                    mj(
                         "%s\"%d\":%zu", ff ? "" : ",", pr.first, nfx);
                     ff = false;
                 }
-                offset += snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+                mj( "}");
             }
 
             // ── Transport position (engine-owned clock; UI/server follow).
             //    `buf` = the process block size, for the toolbar latency readout.
-            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+            mj(
                 ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d,\"monInMask\":%u,"
                 "\"loopOn\":%d,\"loopIn\":%llu,\"loopOut\":%llu,\"punchOn\":%d,\"punchIn\":%llu,\"punchOut\":%llu,"
                 "\"bounceState\":%d,\"bounceOverrun\":%d,\"xruns\":%u}",
@@ -1741,7 +1760,7 @@ int main(int argc, char** argv) {
                 jack.get_xrun_count());
 
             // ── Timecode & sync status (plan Phase 3d) ──
-            offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
+            mj(
                 ",\"tc\":{\"src\":%d,\"fps\":%d,\"df\":%d,\"off\":%lld,\"tod\":%.3f,"
                 "\"gen\":%d,\"mtc\":%d,\"chase\":%d,\"lock\":%d,\"in\":%lld,\"inpk\":%.3f,"
                 "\"countin\":%lld,\"err\":%.1f,\"fly\":%d}",
@@ -1757,9 +1776,9 @@ int main(int argc, char** argv) {
                 g_ltc_chase_err.load(std::memory_order_relaxed),
                 ltc_anchored ? 1 : 0);
 
-            snprintf(meter_json.data() + offset, meter_json.size() - offset, "}");
+            mj("}");
 
-            ipc.send_multichannel_metering(meter_json.data());
+            ipc.send_metering_rt(meter_json.data(), static_cast<size_t>(offset));
             frame_counter = 0;
 
             // The bounce-finished pulse (state 2) is published exactly once,

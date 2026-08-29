@@ -2028,6 +2028,13 @@ wss.on('connection', (ws) => {
         const deleteTakes = !!data.deleteTakes;
         if (activeTakeDir) {
           ws.send(JSON.stringify({ type: 'timeline_cleared', error: 'a take is recording' }));
+        } else if (activeRecordingProject) {
+          // A saved REAPER project's timeline lives in its .rpp, not
+          // project.json, and its media is consolidated under records/ — a
+          // blank-slate reset there is meaningless and its take-dir delete
+          // would only hit the (already-consolidated) staging area. The UI
+          // hides the button in this mode; refuse a scripted request too.
+          ws.send(JSON.stringify({ type: 'timeline_cleared', error: 'close the recording project first' }));
         } else {
           const cleared: DawProject = {
             clips: [], markers: [], trackHeights: {},

@@ -109,9 +109,10 @@ void PluginInstance::run(uint32_t nframes) {
     if (instance_) lilv_instance_run(instance_, nframes);
 }
 
-void PluginInstance::set_control_value_by_symbol(const std::string& symbol, float value) {
-    // RT-safe: resolved against the map built in instantiate(), no lilv calls,
-    // no allocation. An unknown symbol is a harmless no-op.
+void PluginInstance::set_control_value_by_symbol(std::string_view symbol, float value) {
+    // RT-safe: heterogeneous lookup against the map built in instantiate() — no
+    // lilv calls, no std::string constructed from the caller's char[]. Unknown
+    // symbol = harmless no-op.
     auto it = control_index_by_symbol_.find(symbol);
     if (it != control_index_by_symbol_.end()) {
         set_control_value(it->second, value);

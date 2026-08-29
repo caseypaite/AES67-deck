@@ -51,9 +51,18 @@ bool WavpackWriter::start_recording(const std::string& filepath, int channels, i
     if (is_recording_.load(std::memory_order_relaxed)) return false;
     if (channels < 1 || channels > 2) return false;
     // A previous take may still be closing on the disk thread (stop() +
-    // immediate start()); let it finish so the ring drain below can't race it.
-    for (int i = 0; i < 200 && wpc_.load(std::memory_order_acquire) != nullptr; ++i)
+    // immediate start(), e.g. a vsc split after a long take on slow storage).
+    // Everything below overwrites file_ / wpc_ / path_ / first_block_ and
+    // drains the ring — all of which the disk thread is still touching until it
+    // publishes wpc_ = nullptr from close_file(). Wait it out; if it's taking
+    // this long, refuse rather than race (the caller drops this channel from
+    // the take and logs it — far better than a disk-thread use-after-free).
+    for (int i = 0; i < 1500 && wpc_.load(std::memory_order_acquire) != nullptr; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (wpc_.load(std::memory_order_acquire) != nullptr) {
+        std::cerr << "WavpackWriter: previous take still closing after 3 s, refusing " << filepath << std::endl;
+        return false;
+    }
     channels_.store(channels, std::memory_order_relaxed);
     path_ = filepath;
     first_block_.clear();

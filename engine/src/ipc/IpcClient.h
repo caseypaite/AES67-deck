@@ -36,6 +36,11 @@ public:
     void send_json(const std::string& json_payload);
     void send_json_async(const std::string& json_payload);
     // Audio-thread only. Lock-free SPSC ring — this is the single producer.
+    // Allocation-free: writes the payload + a newline straight into the ring,
+    // no std::string built on the RT thread.
+    void send_metering_rt(const char* json, size_t len);
+    // Non-RT convenience (startup plugin-catalog dump). Do NOT call from the
+    // audio thread — it builds a std::string.
     void send_multichannel_metering(const std::string& json_payload);
 
     // Start the worker thread. Call this AFTER installing every callback — the
