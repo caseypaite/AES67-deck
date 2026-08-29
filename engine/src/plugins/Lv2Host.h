@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <atomic>
 #include <iostream>
 #include <memory>
 #include <cstdint>
@@ -52,7 +53,11 @@ public:
     void connect_audio_port(uint32_t port_index, float* buffer);
     void run(uint32_t nframes);
     
-    // Control ports
+    // Control ports. set_control_value_by_symbol() is RT-safe — the
+    // symbol->port-index map is built once in instantiate() and read-only
+    // after, so this is a map lookup plus a float store, no lilv calls, no
+    // allocation. Safe to call from the audio thread (via the plugin command
+    // ring) as well as the IPC thread.
     void set_control_value(uint32_t port_index, float value);
     void set_control_value_by_symbol(const std::string& symbol, float value);
     float get_control_value(uint32_t port_index) const;
@@ -62,16 +67,21 @@ public:
     int get_audio_output_port(int index) const;
     void print_ports() const;
 
-    bool bypassed = true;
+    // Written from the IPC thread (add/load seeding) and, via the plugin
+    // command ring, applied on the audio thread; read every block by the
+    // audio thread's insert-chain loop.
+    std::atomic<bool> bypassed{true};
 
 private:
     LilvWorld* world_;
     const LilvPlugin* plugin_;
     double sample_rate_;
     LilvInstance* instance_ = nullptr;
-    
+
     // Heap allocated control values to ensure stable pointers for lilv
     std::map<uint32_t, float*> control_values_;
+    // symbol -> control-port index, built in instantiate(), read-only after.
+    std::map<std::string, uint32_t> control_index_by_symbol_;
     
     std::vector<uint32_t> audio_inputs_;
     std::vector<uint32_t> audio_outputs_;

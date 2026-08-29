@@ -77,6 +77,13 @@ while time.time() - t0 < DUR:
         send({"type": "remove_plugin", "channel": ch, "pluginIndex": 0})
     if n % 45 == 0:
         send({"type": "load_rack", "channel": ch, "plugins": [{"uri": CALF_EQ, "enabled": True}]})
+    # live FX-editor knob / bypass churn — the path Phase 4 moved onto the ring
+    send({"type": "set_plugin_param", "channel": ch, "pluginIndex": random.randint(0, 3),
+          "paramId": random.choice(["level_in", "level_out", "ls_level", "p1_level", "bogus_sym"]),
+          "value": random.random() * 2})
+    if n % 7 == 0:
+        send({"type": "set_plugin_bypass", "channel": ch,
+              "pluginIndex": random.randint(0, 3), "value": random.randint(0, 1)})
     if n == 5:
         send({"type": "start_record"})
     if n == 40:

@@ -76,6 +76,8 @@ bool PluginInstance::instantiate() {
             if (max) lilv_node_free(max);
 
             control_values_[i] = val;
+            const LilvNode* sym = lilv_port_get_symbol(plugin_, port);
+            if (sym) control_index_by_symbol_[lilv_node_as_string(sym)] = i;
             lilv_instance_connect_port(instance_, i, val);
         } else if (is_atom || (!is_audio && !is_control)) {
             // Atom port or any other port type the engine doesn't handle
@@ -108,12 +110,11 @@ void PluginInstance::run(uint32_t nframes) {
 }
 
 void PluginInstance::set_control_value_by_symbol(const std::string& symbol, float value) {
-    LilvNode* sym_node = lilv_new_string(world_, symbol.c_str());
-    const LilvPort* port = lilv_plugin_get_port_by_symbol(plugin_, sym_node);
-    lilv_node_free(sym_node);
-    if (port) {
-        uint32_t idx = lilv_port_get_index(plugin_, port);
-        set_control_value(idx, value);
+    // RT-safe: resolved against the map built in instantiate(), no lilv calls,
+    // no allocation. An unknown symbol is a harmless no-op.
+    auto it = control_index_by_symbol_.find(symbol);
+    if (it != control_index_by_symbol_.end()) {
+        set_control_value(it->second, value);
     }
 }
 

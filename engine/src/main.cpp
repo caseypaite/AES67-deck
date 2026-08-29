@@ -21,6 +21,7 @@
 #include "recorder/MultitrackRecorder.h"
 #include "playback/TimelinePlayer.h"
 #include "timecode/Timecode.h"
+#include "util/tsan_annotations.h"
 
 using namespace aes67_deck;
 
@@ -244,14 +245,20 @@ constexpr size_t MAX_PLUGINS_PER_CHANNEL = 16;
 // top of the process callback. Trivially copyable so it can move through a
 // lock-free jack_ringbuffer_t as raw bytes, the same mechanism IpcClient
 // already uses for its own tx queue.
-enum class PluginCmdType { Add, Remove, Reorder, Clear };
+// SetParam / SetBypass are the live FX-editor knob/bypass path: they used to
+// be applied straight from the IPC thread (dereferencing insert_chain[idx],
+// racing the audio thread's insert/erase and the trash thread's delete), now
+// they ride this same ring and are applied by the audio thread.
+enum class PluginCmdType { Add, Remove, Reorder, Clear, SetParam, SetBypass };
 
 struct PluginCmd {
     PluginCmdType type;
     int channel_id;
-    int index;   // Add: insert position (clamped to chain bounds when applied); Remove: index; Reorder: from-index
+    int index;   // Add: insert position (clamped to chain bounds when applied); Remove/SetParam/SetBypass: index; Reorder: from-index
     int index2;  // Reorder: to-index
     plugins::PluginInstance* instance; // Add only — ownership transfers to whichever thread applies the command
+    float value = 0.0f;   // SetParam / SetBypass
+    char sym[48] = {};     // SetParam: LV2 control-port symbol (already remapped on the IPC thread)
 };
 
 // Push-to-talk state. Atomics because this is written from the IPC thread
@@ -402,6 +409,7 @@ int main(int argc, char** argv) {
             while (jack_ringbuffer_read_space(plugin_trash_ring) >= sizeof(void*)) {
                 void* raw = nullptr;
                 jack_ringbuffer_read(plugin_trash_ring, reinterpret_cast<char*>(&raw), sizeof(raw));
+                AES67_TSAN_ACQUIRE(plugin_trash_ring);
                 delete static_cast<plugins::PluginInstance*>(raw);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -742,16 +750,32 @@ int main(int argc, char** argv) {
         }
     });
 
-    ipc.set_plugin_callback([&channels](const std::string& type, int channel_id, int p_idx, const std::string& param_id, float value) {
-        if (channels.find(channel_id) != channels.end()) {
-            if (p_idx >= 0 && p_idx < channels[channel_id].insert_chain.size()) {
-                auto* plugin = channels[channel_id].insert_chain[p_idx].get();
-                if (type == "set_plugin_bypass") {
-                    plugin->bypassed = (value > 0.5f);
-                } else if (type == "set_plugin_param") {
-                    plugin->set_control_value_by_symbol(remap_param_symbol(plugin->get_uri(), param_id), value);
-                }
-            }
+    // Live FX-editor param / bypass changes. These must NOT touch insert_chain
+    // from this (IPC) thread — that vector, and the PluginInstance lifetimes,
+    // are owned by the audio thread. Queue onto plugin_cmd_ring like the
+    // structural commands; the audio thread applies them against the chain it
+    // owns. The modern UI sends real LV2 control-port symbols (see
+    // ui/src/data/calfPlugins.ts), so no per-URI remap is needed here — an
+    // unrecognised symbol is a harmless no-op in set_control_value_by_symbol.
+    ipc.set_plugin_callback([plugin_cmd_ring](const std::string& type, int channel_id, int p_idx, const std::string& param_id, float value) {
+        if (p_idx < 0) return;
+        PluginCmd cmd{};
+        cmd.channel_id = channel_id;
+        cmd.index = p_idx;
+        cmd.value = value;
+        if (type == "set_plugin_bypass") {
+            cmd.type = PluginCmdType::SetBypass;
+        } else if (type == "set_plugin_param") {
+            cmd.type = PluginCmdType::SetParam;
+            std::strncpy(cmd.sym, param_id.c_str(), sizeof(cmd.sym) - 1);
+        } else {
+            return;
+        }
+        if (jack_ringbuffer_write_space(plugin_cmd_ring) >= sizeof(PluginCmd)) {
+            AES67_TSAN_RELEASE(plugin_cmd_ring);
+            jack_ringbuffer_write(plugin_cmd_ring, reinterpret_cast<const char*>(&cmd), sizeof(PluginCmd));
+        } else {
+            std::cerr << "Plugin command ring full, dropping a param/bypass change" << std::endl;
         }
     });
 
@@ -767,6 +791,7 @@ int main(int argc, char** argv) {
 
         auto enqueue = [plugin_cmd_ring](const PluginCmd& cmd) {
             if (jack_ringbuffer_write_space(plugin_cmd_ring) >= sizeof(PluginCmd)) {
+                AES67_TSAN_RELEASE(plugin_cmd_ring);
                 jack_ringbuffer_write(plugin_cmd_ring, reinterpret_cast<const char*>(&cmd), sizeof(PluginCmd));
             } else {
                 std::cerr << "Plugin command ring full, dropping a plugin-chain command" << std::endl;
@@ -786,7 +811,7 @@ int main(int argc, char** argv) {
             std::string uri = j.value("uri", "");
             auto inst = lv2_host.instantiate_plugin(uri, sr);
             if (!inst) { std::cerr << "add_plugin: failed to instantiate " << uri << std::endl; return; }
-            inst->bypassed = !j.value("enabled", true);
+            inst->bypassed.store(!j.value("enabled", true), std::memory_order_relaxed);
             seed_params(inst.get(), uri, j.value("params", nlohmann::json::object()));
             // No index given (or a huge one) means "append" — the audio
             // thread clamps this to chain.size() when it applies the
@@ -805,7 +830,7 @@ int main(int argc, char** argv) {
             std::string uri = j.value("uri", "");
             auto inst = lv2_host.instantiate_plugin(uri, sr);
             if (!inst) { std::cerr << "replace_plugin: failed to instantiate " << uri << std::endl; return; }
-            inst->bypassed = false;
+            inst->bypassed.store(false, std::memory_order_relaxed);
             seed_params(inst.get(), uri, j.value("params", nlohmann::json::object()));
             // Enqueued as Remove immediately followed by Add at the same
             // index — both land in the same drain pass on the audio thread
@@ -824,7 +849,7 @@ int main(int argc, char** argv) {
                         std::cerr << "load_rack: failed to instantiate " << uri << " (skipped)" << std::endl;
                         continue;
                     }
-                    inst->bypassed = !pj.value("enabled", true);
+                    inst->bypassed.store(!pj.value("enabled", true), std::memory_order_relaxed);
                     seed_params(inst.get(), uri, pj.value("params", nlohmann::json::object()));
                     enqueue(PluginCmd{PluginCmdType::Add, channel_id, next_index, 0, inst.release()});
                     next_index++;
@@ -1054,10 +1079,12 @@ int main(int argc, char** argv) {
         while (jack_ringbuffer_read_space(plugin_cmd_ring) >= sizeof(PluginCmd)) {
             PluginCmd cmd;
             jack_ringbuffer_read(plugin_cmd_ring, reinterpret_cast<char*>(&cmd), sizeof(PluginCmd));
+            AES67_TSAN_ACQUIRE(plugin_cmd_ring);
 
             auto trash = [plugin_trash_ring](plugins::PluginInstance* raw) {
                 if (!raw) return;
                 if (jack_ringbuffer_write_space(plugin_trash_ring) >= sizeof(void*)) {
+                    AES67_TSAN_RELEASE(plugin_trash_ring);
                     jack_ringbuffer_write(plugin_trash_ring, reinterpret_cast<const char*>(&raw), sizeof(void*));
                 } else {
                     // Trash ring full (should never happen in practice) —
@@ -1096,6 +1123,12 @@ int main(int argc, char** argv) {
             } else if (cmd.type == PluginCmdType::Clear) {
                 for (auto& p : chain) trash(p.release());
                 chain.clear();
+            } else if (cmd.type == PluginCmdType::SetBypass) {
+                if (cmd.index >= 0 && cmd.index < static_cast<int>(chain.size()))
+                    chain[cmd.index]->bypassed.store(cmd.value > 0.5f, std::memory_order_relaxed);
+            } else if (cmd.type == PluginCmdType::SetParam) {
+                if (cmd.index >= 0 && cmd.index < static_cast<int>(chain.size()))
+                    chain[cmd.index]->set_control_value_by_symbol(cmd.sym, cmd.value);
             }
         }
 
@@ -1209,7 +1242,7 @@ int main(int argc, char** argv) {
             for (auto& plugin_ptr : st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
                 meter_fx(i, p_i, true, tmp_L.data(), tmp_R.data());
-                if (plugin->bypassed) {
+                if (plugin->bypassed.load(std::memory_order_relaxed)) {
                     meter_fx(i, p_i, false, tmp_L.data(), tmp_R.data());
                     p_i++;
                     continue;
@@ -1328,7 +1361,7 @@ int main(int argc, char** argv) {
             for (auto& plugin_ptr : b_st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
                 meter_fx(b_id, b_p_i, true, tmp_L.data(), tmp_R.data());
-                if (plugin->bypassed) {
+                if (plugin->bypassed.load(std::memory_order_relaxed)) {
                     meter_fx(b_id, b_p_i, false, tmp_L.data(), tmp_R.data());
                     b_p_i++;
                     continue;
@@ -1389,7 +1422,7 @@ int main(int argc, char** argv) {
             for (auto& plugin_ptr : m_st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
                 meter_fx(MONITOR_ID, m_p_i, true, tmp_L.data(), tmp_R.data());
-                if (plugin->bypassed) {
+                if (plugin->bypassed.load(std::memory_order_relaxed)) {
                     meter_fx(MONITOR_ID, m_p_i, false, tmp_L.data(), tmp_R.data());
                     m_p_i++;
                     continue;

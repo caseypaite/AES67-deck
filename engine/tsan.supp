@@ -1,11 +1,12 @@
 # ThreadSanitizer suppressions for the AES67-Deck engine.
 #
-# jack_ringbuffer_t is a correct single-producer / single-consumer lock-free
-# queue. Its synchronisation is a pair of atomic read/write pointers with
-# acquire/release fences that live inside libjack, which is not instrumented,
-# so TSan reports the data movement through the buffer as a race. Every use in
-# this codebase keeps to exactly one producer thread and one consumer thread
-# per ring (see the comments at each site), which is what makes it safe.
+# The engine's own cross-thread hand-offs through jack_ringbuffer are annotated
+# with AES67_TSAN_RELEASE / AES67_TSAN_ACQUIRE (src/util/tsan_annotations.h), so
+# TSan sees those happens-before edges directly and no suppression is needed for
+# app code. What remains here is all third-party:
+
+# jack_ringbuffer's own read/write-pointer atomics live in uninstrumented
+# libjack; TSan attributes the data movement through the buffer to these.
 race:jack_ringbuffer_read
 race:jack_ringbuffer_write
 race:jack_ringbuffer_read_space
@@ -14,30 +15,10 @@ race:jack_ringbuffer_read_advance
 race:jack_ringbuffer_write_advance
 race:jack_ringbuffer_reset
 
-# libjack / PipeWire-jack, LV2 hosts (lilv, plugin .so's), libsndfile and
-# WavPack are all uninstrumented third-party code — TSan cannot reason about
-# their internal locking.
+# Uninstrumented third-party libraries — TSan can't reason about their locking.
 called_from_lib:libjack.so
 called_from_lib:libpipewire-0.3.so
 called_from_lib:liblilv-0.so
 called_from_lib:libsndfile.so
 called_from_lib:libwavpack.so
 called_from_lib:calf.so
-
-# PluginInstance hand-off across threads goes through jack_ringbuffer
-# (plugin_cmd_ring for add/remove/reorder, plugin_trash_ring for deletion) —
-# see the comments at those sites in main.cpp. The ring's read/write pointers
-# carry acquire/release ordering, so `instantiate()` on the IPC thread
-# happens-before the audio thread's get_audio_*_port(), and the audio thread's
-# erase() happens-before the trash thread's `delete`. TSan can't see the
-# ordering because it lives inside uninstrumented libjack, so it reports the
-# fully-ordered accesses as races. (Not a blanket excuse — every genuine race
-# the Phase-1 work fixed showed up cleanly outside these frames.)
-race:aes67_deck::plugins::PluginInstance::~PluginInstance
-race:aes67_deck::plugins::PluginInstance::get_audio_input_port
-race:aes67_deck::plugins::PluginInstance::get_audio_output_port
-race:aes67_deck::plugins::PluginInstance::connect_audio_port
-race:aes67_deck::plugins::PluginInstance::instantiate
-# the make_unique<PluginInstance> allocation + field init on the IPC thread,
-# published to the audio/trash threads through plugin_cmd_ring / plugin_trash_ring
-race:aes67_deck::plugins::Lv2Host::instantiate_plugin
