@@ -2,7 +2,7 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phases 1–4 done + runtime-verified (Release + TSan + ASan builds,
+**Status:** Phases 1–5 done + runtime-verified (Release + TSan + ASan builds,
 scripted concurrency driver, dev-stack functional checks).
 
 ### Progress — Phase 1 (engine RT-safety)
@@ -331,12 +331,41 @@ metering rework (unless the latency target changes).
 
 ---
 
-## 6. Outstanding (separate from the audit)
+## 6. Phase 5 — MultitrackRecorder / WavpackWriter lifetime  ✅ DONE (commit `2b97e1a`)
+
+The audit's "not audited, worth a follow-up" item.
+
+- **`MultitrackRecorder::start()` reaped the previous take's `WavpackWriter`s
+  inline** (`for (auto& w : writers_) w.reset()`). On a `stop()` + immediate
+  `start()` (auto-punch, vsc split, operator mashing record) the audio thread
+  can still be one block deep in `write()` on one — and `~WavpackWriter`
+  frees its `jack_ringbuffer` under it. **Use-after-free on the RT thread.**
+- Fix: `writers_` (owning, IPC) + `writer_ptr_[]`
+  (`std::array<std::atomic<WavpackWriter*>>`, the audio thread's view — atomic
+  acquire load, so a raced in-flight `write()` sees the still-live outgoing
+  writer or `nullptr`, never a torn pointer). `start()` **retires** the old
+  writers into `retired_` tagged with the current `audio_block_seq_`; a
+  **reaper thread** destroys them once `end_audio_block()` (called once per
+  process callback) has advanced the sequence ≥2 past the retire — a real
+  happens-before that any in-flight `write()` has completed.
+- `armed_` (`std::vector`, rebuilt every `start()`) removed from the audio
+  thread — the metering builder iterates `armed_mask_` (`atomic<uint32_t>`).
+  `is_recording()` → acquire.
+- **Verified:** Release + TSan + ASan clean; the driver now also hammers
+  `start`/`stop_multitrack_record` (start → stop 9 ms later → immediate
+  re-arm) — 59+ takes finalised, no races, no ASan errors; dev-stack real
+  multitrack record + immediate re-arm, both takes recorded and committed.
+- The **"first ~2 s distorted"** bug was **not reproduced** — no consistent
+  concurrency cause found in this code; likely input-signal or WavPack
+  encoder/decoder, still open.
+
+---
+
+## 7. Outstanding (separate from the audit)
 
 - **Loop-wrap bug** — `transport_set_loop` never reaches
   `g_transport.loop_enabled` (see §1 note). Confirmed pre-existing via an
   A/B build against `46d2e76`.
-- **`MultitrackRecorder`** — never audited for concurrency; also the suspect
-  for the open "first ~2 s of every take distorted" bug. Worth its own pass.
-- Full **helgrind** run (TSan covered the same ground; helgrind would be a
-  second opinion, lower priority now).
+- **"First ~2 s distorted" take** — still unexplained (see §6).
+- Full **helgrind** run (TSan covered the same ground; a second opinion,
+  lower priority now).
