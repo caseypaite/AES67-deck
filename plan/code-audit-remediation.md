@@ -276,7 +276,7 @@ Only worth the churn + risk if the rig moves to q64 or adds channels.
 
 ### 3.3 ThreadSanitizer pass — DONE (commit `09ecb7d`)
 Added an opt-in `-DSANITIZE=thread` CMake build + `engine/tsan.supp`, and a
-scripted driver (`scratchpad/tsan_driver.py`, not committed) that stands in
+scripted driver (`engine/test/tsan_driver.py`, not committed) that stands in
 for the server and hammers every Phase-1 path — aux sends, faders,
 mute/solo/phase, plugin add/remove/load_rack, transport locate/play, record
 start/stop, timeline set — for ~25 s while draining metering.
