@@ -417,10 +417,13 @@ The "first ~2 s of every multitrack take is distorted" bug.
   + `mlock`ed in the ctor — same for `DiskWriter` and `TimelinePlayer`.
 - **Verified:** Release/TSan/ASan clean. Dev stack: 4 consecutive 6-channel
   takes add **3 xruns total** (takes 2 & 4 add zero) vs. ~1 per take before;
-  all takes valid + lossless. **Still needs a run on the appliance** —
-  `memlock infinity` there makes `mlock` real, and the weaker CPU makes the
-  burst worse, so that's where the fix matters most. The new **XR** toolbar
-  cell shows the count live.
+  all takes valid + lossless. The new **XR** toolbar cell shows the count live.
+- **Deployed + verified on `ck-aes67` (2026-08-29):** `start_multitrack_record`
+  causes **zero** xruns on the appliance (delta 0 over a full record cycle),
+  vs. the burst that was distorting take heads. Idle xruns also 0. Take
+  length correct (3 s record → `frames` 144000 = 3.00 s). Post-deploy fix
+  `8c15e5e` (persistent pool made `write()` skip its armed check → 32× frame
+  overcount → minutes of silent tail) also verified there.
 
 ---
 
