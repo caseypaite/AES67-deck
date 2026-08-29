@@ -23,8 +23,32 @@
   `is_recording_ || saw_recording`; bounded wait for a prior take to finish
   closing. Builds; needs a record + immediate re-record test.
 
-Remaining verification: timeline seek/loop audio, master record + bounce,
-ideally a TSan or helgrind pass over a scripted session.
+#### Runtime test results (2026-08-29, dev stack)
+
+- **1.1** aux-send/fader stress (800 msgs @ 2 ms across ch 1–8 / all bus ids)
+  concurrent with 38 Hz metering — engine stable, no crash. The old
+  std::map path was UB here.
+- **1.2** metering + LUFS frames flow at ~38 Hz after the tx split.
+- **1.3** Timeline playback of a real 20 s clip: **0 ring underruns over 5 s
+  of steady playback**; 40 rapid `transport_locate` calls survived cleanly
+  (each triggers the new `flush_gen_` drain), master meter tracking audio
+  throughout (~-8 dBFS).
+- **1.4** Master record: stop → **immediate** re-record → stop produced a
+  valid, correctly-finalised second WAV (`RIFF/WAVE`, 2 ch, 48 kHz, 32-bit
+  float, 1.00 s of data). This is the stop→start drain/wait window.
+
+Not yet done: helgrind / TSan pass over a scripted session.
+
+#### Pre-existing issue found during testing (NOT a Phase 1 regression)
+
+Loop playback does not wrap: `transport_set_loop {start,end,enabled:true}`
+leaves the engine's `transport.loopOn/loopIn/loopOut` at 0 and the playhead
+runs straight past the loop-out point. Confirmed identical on the pre-audit
+binary (`46d2e76`) via an A/B build, so Phase 1 did not cause it. Field
+names match what `ui/src/stores/useDawStore.ts:476` sends. Likely the
+`transport_set_loop` payload never reaches `g_transport.loop_enabled`
+(server forward vs. engine dispatch vs. a `region`-first precondition — not
+yet traced). Track separately from the audit work.
 
 ---
 
