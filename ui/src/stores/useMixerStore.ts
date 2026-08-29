@@ -972,11 +972,11 @@ export const useMixerStore = create<MixerState>((set, get) => ({
             if (want !== 0 && typeof t.monInMask === 'number' && (t.monInMask >>> 0) !== want) {
               get().ws?.send(JSON.stringify({ type: 'set_monitor_input_mask', mask: want }));
             }
-            // Phase 3e: same self-heal for the loop/punch region (not part of
-            // the server's timeline replay on engine reconnect).
-            if (typeof t.loopOn === 'number' && typeof t.punchOn === 'number') {
-              useDawStore.getState().reassertRegionToEngine(!!t.loopOn, !!t.punchOn);
-            }
+            // Loop/punch region self-heal on engine reconnect is the server's
+            // job now (it records the last transport_set_loop/punch and replays
+            // both after the engine reconnects). The old per-frame re-assert
+            // here made two clients with different local intent fight over the
+            // engine's loop_enabled at metering rate.
           }
         } else if (data.type === 'aes67_discovery') {
           const { upsertStream } = usePatchbayStore.getState();

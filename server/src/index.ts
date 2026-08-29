@@ -499,6 +499,8 @@ if (activeProjectName !== 'default' && fs.existsSync(rppPath(activeProjectName))
 function setActiveProject(name: string): void {
   activeProjectName = sanitizeProjectName(name);
   ensureProject(activeProjectName);
+  syncLastRegionFromProject(activeProjectName);
+  if (engineSocket) replayRegionToEngine();
   try {
     writeFileAtomicSync(ACTIVE_PROJECT_PATH, activeProjectName);
   } catch (e) {
@@ -1233,6 +1235,32 @@ const bounce: { active: boolean; path: string; name: string; inSec: number; outS
 
 // Phase 5 — last metronome config the UI set; replayed to the engine on reconnect.
 let lastMetronome: { enabled: boolean; bpm: number; sigNum: number; sigDen: number; dest: string } | null = null;
+
+// Last loop / punch region the engine was told about (frames). The engine drops
+// these on restart and the server's reconnect replay doesn't otherwise cover
+// them; the server is the authority so clients don't have to re-assert every
+// metering frame (which made two clients with different local intent fight).
+let lastLoop: { start: number; end: number; enabled: boolean } = { start: 0, end: 0, enabled: false };
+let lastPunch: { start: number; end: number; enabled: boolean } = { start: 0, end: 0, enabled: false };
+function replayRegionToEngine(): void {
+  if (!engineSocket) return;
+  engineSocket.write(JSON.stringify({ type: 'transport_set_loop', ...lastLoop }) + '\n');
+  engineSocket.write(JSON.stringify({ type: 'transport_set_punch', ...lastPunch }) + '\n');
+}
+// Seed lastLoop/lastPunch (frames) from a project's persisted `loop` slot
+// ({start,end} in seconds, plus loop/punch booleans) so a cold start restores
+// a saved region even before any UI connects.
+function syncLastRegionFromProject(name: string): void {
+  const lp = loadProject(name).loop as
+    { start?: number; end?: number; loop?: boolean; punch?: boolean } | undefined;
+  const sr = 48000;
+  const s = lp && typeof lp.start === 'number' ? Math.round(lp.start * sr) : 0;
+  const e = lp && typeof lp.end === 'number' ? Math.round(lp.end * sr) : 0;
+  const valid = e > s;
+  lastLoop = { start: s, end: e, enabled: valid && !!(lp && lp.loop) };
+  lastPunch = { start: s, end: e, enabled: valid && !!(lp && lp.punch) };
+}
+syncLastRegionFromProject(activeProjectName);   // seed from the active project at startup
 
 // --- Timecode & sync (plan/daw-timeline-roadmap.md Phase 3d) ----------------
 // Persisted like loudness_config.json / vsc_config.json; the four engine
@@ -2269,6 +2297,13 @@ wss.on('connection', (ws) => {
           maybeCaptureAutomation(data);
         }
         if (data.type === 'transport_stop') finishAutomationWrite();
+        // Remember the loop / punch region so the server can replay it on an
+        // engine reconnect — clients no longer re-assert it every frame.
+        if (data.type === 'transport_set_loop') {
+          lastLoop = { start: Number(data.start) || 0, end: Number(data.end) || 0, enabled: !!data.enabled };
+        } else if (data.type === 'transport_set_punch') {
+          lastPunch = { start: Number(data.start) || 0, end: Number(data.end) || 0, enabled: !!data.enabled };
+        }
         // Forward to engine
         if (engineSocket) {
           engineSocket.write(payloadStr + '\n');
@@ -2522,6 +2557,7 @@ const ipcServer = net.createServer((socket) => {
     // Replay the active project's timeline so playback works after an engine
     // restart, same self-heal contract as routing.
     pushTimelineToEngine(activeProjectName);
+    replayRegionToEngine();   // loop / punch region — engine drops it on restart
     if (lastMetronome && engineSocket)
       engineSocket.write(JSON.stringify({ type: 'set_metronome', ...lastMetronome }) + '\n');
     pushTimecodeToEngine(getTimecodeConfig());   // Phase 3d
