@@ -2,8 +2,8 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phases 1–5 done + runtime-verified (Release + TSan + ASan builds,
-scripted concurrency driver, dev-stack functional checks).
+**Status:** Phases 1–6 done + runtime-verified (Release + TSan + ASan builds,
+scripted concurrency driver, dev-stack + browser functional checks).
 
 ### Progress — Phase 1 (engine RT-safety)
 
@@ -40,16 +40,18 @@ scripted concurrency driver, dev-stack functional checks).
 
 Not yet done: helgrind / TSan pass over a scripted session.
 
-#### Pre-existing issue found during testing (NOT a Phase 1 regression)
+#### Pre-existing issue found during testing — DIAGNOSED + FIXED in §8
 
-Loop playback does not wrap: `transport_set_loop {start,end,enabled:true}`
-leaves the engine's `transport.loopOn/loopIn/loopOut` at 0 and the playhead
-runs straight past the loop-out point. Confirmed identical on the pre-audit
-binary (`46d2e76`) via an A/B build, so Phase 1 did not cause it. Field
-names match what `ui/src/stores/useDawStore.ts:476` sends. Likely the
-`transport_set_loop` payload never reaches `g_transport.loop_enabled`
-(server forward vs. engine dispatch vs. a `region`-first precondition — not
-yet traced). Track separately from the audit work.
+"Loop playback does not wrap." Root cause turned out to be **not** the
+engine (its loop + wrap work — proven by a direct-IPC test and a Chrome
+browser test). The UI's `reassertRegionToEngine()` ran every metering
+frame and re-sent `transport_set_loop`/`punch` whenever the engine's echo
+disagreed with that client's local `!!region && loopEnabled`; two clients
+with different local intent (e.g. one with no region) fought over
+`loop_enabled` at ~40 Hz, and any external/scripted loop command was
+reverted in ~25 ms — which is what every earlier scripted test hit,
+including the "A/B against `46d2e76`" one (a browser tab was connected).
+Fixed in Phase 6 (§8).
 
 ---
 
@@ -361,11 +363,37 @@ The audit's "not audited, worth a follow-up" item.
 
 ---
 
-## 7. Outstanding (separate from the audit)
+## 8. Phase 6 — loop/punch region ownership  ✅ DONE (commit `86834e8`)
 
-- **Loop-wrap bug** — `transport_set_loop` never reaches
-  `g_transport.loop_enabled` (see §1 note). Confirmed pre-existing via an
-  A/B build against `46d2e76`.
-- **"First ~2 s distorted" take** — still unexplained (see §6).
+The "loop doesn't wrap" report (see §1). **The engine was never the
+problem** — a direct-IPC test and a Chrome browser test both wrap
+correctly at the loop-out point.
+
+- **Root cause:** the UI's `reassertRegionToEngine()` fired every metering
+  frame (~40 Hz) from `useMixerStore` and re-sent
+  `transport_set_loop`/`punch` whenever the engine's echoed `loopOn`/`punchOn`
+  disagreed with that client's local `!!region && loopEnabled`. Two clients
+  with different local intent (typically one with no region drawn) then
+  fought over `loop_enabled` at metering rate, and any external / scripted
+  loop command was reverted in ~25 ms. Every earlier "confirmed pre-existing"
+  scripted test hit this because a browser tab was connected.
+- **Fix (server):** record the last `transport_set_loop` / `transport_set_punch`
+  (`lastLoop` / `lastPunch`, frames) and replay both on engine reconnect —
+  the same self-heal the region was missing while routing / mixer /
+  metronome / timecode all had it. Seeded from the active project's
+  persisted `loop` slot at startup and on `setActiveProject`.
+- **Fix (ui):** removed the per-frame `reassertRegionToEngine()` call.
+  `syncRegionToEngine` still fires on real user edits.
+- **Verified in Chrome, live:** draw region → click LOOP → `loopOn:1` holds,
+  0 flips over 4 s; play across the loop-out → playhead wraps 22.9 s → 15.0 s
+  and stays in the region. An already-open browser tab must reload for the
+  UI half.
+
+---
+
+## 9. Outstanding (separate from the audit)
+
+- **"First ~2 s distorted" take** — still unexplained (see §6). Not a
+  concurrency bug in the recorder; suspect input signal or WavPack.
 - Full **helgrind** run (TSan covered the same ground; a second opinion,
   lower priority now).
