@@ -4,12 +4,84 @@ import * as fs from 'fs';
 import * as dgram from 'dgram';
 import * as http from 'http';
 import { execFile } from 'child_process';
+import { Worker } from 'worker_threads';
 import * as path from 'path';
-import { ensurePeaks } from './wavPeaks';
+import type { PeaksFile } from './wavPeaks';
 import { buildRpp, parseRpp, type RppProject } from './rpp';
 import {
   TIMECODE_DEFAULTS, timecodeAt, type TimecodeConfig, type TcFps,
 } from './timecode';
+
+// ── Crash-safe file write ────────────────────────────────────────────────
+// Write to a temp file in the same directory, then atomically rename over the
+// target. A power cut or kill mid-write then leaves the previous version
+// intact instead of a truncated/empty/half-JSON file. Used for every piece of
+// persisted session state (mixer, fx racks, projects, routing, playlists, …).
+function writeFileAtomicSync(file: string, data: string | Buffer): void {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw e;
+  }
+}
+
+// ── Waveform peaks: off the event loop ───────────────────────────────────
+// computePeaks() is seconds of blocking work for a long take; run it on a
+// single persistent worker thread with a FIFO queue (peak requests are
+// infrequent and disk-bound, so serialising is fine and keeps memory flat).
+const PEAKS_WORKER_PATH = path.join(
+  __dirname, __filename.endsWith('.ts') ? 'wavPeaksWorker.ts' : 'wavPeaksWorker.js',
+);
+let peaksWorker: Worker | null = null;
+const peaksQueue: Array<{ srcPath: string; resolve: (p: PeaksFile | null) => void }> = [];
+let peaksInFlight: { resolve: (p: PeaksFile | null) => void } | null = null;
+
+function pumpPeaksQueue(): void {
+  if (peaksInFlight || peaksQueue.length === 0) return;
+  const job = peaksQueue.shift()!;
+  peaksInFlight = job;
+
+  const settle = (peaks: PeaksFile | null) => {
+    const j = peaksInFlight;
+    peaksInFlight = null;
+    j?.resolve(peaks);
+    pumpPeaksQueue();
+  };
+
+  try {
+    if (!peaksWorker) {
+      peaksWorker = new Worker(PEAKS_WORKER_PATH, {
+        execArgv: __filename.endsWith('.ts') ? ['-r', 'ts-node/register/transpile-only'] : [],
+      });
+      peaksWorker.unref(); // don't keep the process alive for a pending peaks job
+      peaksWorker.on('message', (peaks: PeaksFile | null) => settle(peaks ?? null));
+      peaksWorker.on('error', (e) => {
+        console.error('peaks worker error', e);
+        peaksWorker = null;
+        settle(null);
+      });
+      peaksWorker.on('exit', (code) => {
+        peaksWorker = null;
+        if (code !== 0) console.error('peaks worker exited with code', code);
+        if (peaksInFlight) settle(null);
+      });
+    }
+    peaksWorker.postMessage(job.srcPath);
+  } catch (e) {
+    console.error('peaks worker spawn failed', e);
+    settle(null);
+  }
+}
+
+function getPeaksAsync(srcPath: string): Promise<PeaksFile | null> {
+  return new Promise((resolve) => {
+    peaksQueue.push({ srcPath, resolve });
+    pumpPeaksQueue();
+  });
+}
 
 const SCENES_DIR = path.join(process.cwd(), '..', 'scenes');
 if (!fs.existsSync(SCENES_DIR)) {
@@ -251,7 +323,7 @@ function writeRppDebounced(name: string, rpp: RppProject): void {
   rppSaveTimer = setTimeout(() => {
     try {
       fs.mkdirSync(recProjectDir(name), { recursive: true });
-      fs.writeFileSync(rppPath(name), buildRpp(rpp));
+      writeFileAtomicSync(rppPath(name), buildRpp(rpp));
     } catch (e) {
       console.error(`Error writing ${name}.rpp`, e);
     }
@@ -269,7 +341,7 @@ function ensureProject(name: string): void {
   fs.mkdirSync(path.join(dir, 'video'), { recursive: true });
   const pj = path.join(dir, 'project.json');
   if (!fs.existsSync(pj)) {
-    fs.writeFileSync(pj, JSON.stringify(emptyProject(), null, 2));
+    writeFileAtomicSync(pj, JSON.stringify(emptyProject(), null, 2));
   }
 }
 
@@ -374,7 +446,7 @@ function saveProjectDebounced(name: string, project: DawProject): void {
   if (projectSaveTimer) clearTimeout(projectSaveTimer);
   projectSaveTimer = setTimeout(() => {
     try {
-      fs.writeFileSync(pj, JSON.stringify(project, null, 2));
+      writeFileAtomicSync(pj, JSON.stringify(project, null, 2));
     } catch (e) {
       console.error(`Error saving project ${name}`, e);
     }
@@ -428,7 +500,7 @@ function setActiveProject(name: string): void {
   activeProjectName = sanitizeProjectName(name);
   ensureProject(activeProjectName);
   try {
-    fs.writeFileSync(ACTIVE_PROJECT_PATH, activeProjectName);
+    writeFileAtomicSync(ACTIVE_PROJECT_PATH, activeProjectName);
   } catch (e) {
     console.error('Could not persist active project name', e);
   }
@@ -537,7 +609,7 @@ function saveFxRacks() {
   if (fxRacksSaveTimer) clearTimeout(fxRacksSaveTimer);
   fxRacksSaveTimer = setTimeout(() => {
     try {
-      fs.writeFileSync(FX_RACKS_PATH, JSON.stringify(fxRacks, null, 2));
+      writeFileAtomicSync(FX_RACKS_PATH, JSON.stringify(fxRacks, null, 2));
     } catch (e) {
       console.error('Error saving fx_racks.json', e);
     }
@@ -635,7 +707,7 @@ function saveMixerState() {
   if (mixerStateSaveTimer) clearTimeout(mixerStateSaveTimer);
   mixerStateSaveTimer = setTimeout(() => {
     try {
-      fs.writeFileSync(MIXER_STATE_PATH, JSON.stringify(mixerState, null, 2));
+      writeFileAtomicSync(MIXER_STATE_PATH, JSON.stringify(mixerState, null, 2));
     } catch (e) {
       console.error('Error saving mixer_state.json', e);
     }
@@ -802,7 +874,7 @@ function writeVscConfig(patch: Partial<VscConfig>): VscConfig {
     if (/^\d{1,2}:\d{2}$/.test(patch.schedule.at || '')) next.schedule.at = patch.schedule.at;
   }
   try {
-    fs.writeFileSync(VSC_CONFIG_PATH, JSON.stringify(next, null, 2));
+    writeFileAtomicSync(VSC_CONFIG_PATH, JSON.stringify(next, null, 2));
   } catch (e) {
     console.error('Error writing vsc_config.json', e);
   }
@@ -973,7 +1045,7 @@ function writeLoudnessConfig(patch: Partial<LoudnessConfig>): LoudnessConfig {
   if (LOUDNESS_TARGETS.includes(Number(patch.target))) next.target = Number(patch.target);
   if (typeof patch.logWhileStopped === 'boolean') next.logWhileStopped = patch.logWhileStopped;
   try {
-    fs.writeFileSync(LOUDNESS_CONFIG_PATH, JSON.stringify(next, null, 2));
+    writeFileAtomicSync(LOUDNESS_CONFIG_PATH, JSON.stringify(next, null, 2));
   } catch (e) {
     console.error('Error writing loudness_config.json', e);
   }
@@ -1202,7 +1274,7 @@ function writeTimecodeConfig(patch: Partial<TimecodeConfig>): TimecodeConfig {
   next.offsetFrames = Number.isFinite(Number(next.offsetFrames)) ? Math.round(Number(next.offsetFrames)) : 0;
   next.ltcLevel = Number.isFinite(Number(next.ltcLevel)) ? Math.min(1, Math.max(0, Number(next.ltcLevel))) : TIMECODE_DEFAULTS.ltcLevel;
   try {
-    fs.writeFileSync(TIMECODE_CONFIG_PATH, JSON.stringify(next, null, 2));
+    writeFileAtomicSync(TIMECODE_CONFIG_PATH, JSON.stringify(next, null, 2));
   } catch (e) {
     console.error('Error writing timecode_config.json', e);
   }
@@ -1352,7 +1424,7 @@ function loadPlaylist(name: string): Playlist {
   } catch { return { name: sanitizeProjectName(name), segments: [] }; }
 }
 function savePlaylist(pl: Playlist): void {
-  fs.writeFileSync(playlistPath(pl.name), JSON.stringify(pl, null, 2));
+  writeFileAtomicSync(playlistPath(pl.name), JSON.stringify(pl, null, 2));
 }
 
 // End of the arrangement (seconds) = the latest clip end in the project/.rpp.
@@ -1508,7 +1580,7 @@ function trimWavHead(file: string, frames: number): void {
   ]);
   out.writeUInt32LE(out.length - 8, 4);
   out.writeUInt32LE(dataLen - cut, dataOff - 4);
-  fs.writeFileSync(file, out);
+  writeFileAtomicSync(file, out);
 }
 
 function startBounce(inSec: number, outSec: number, name: string, bits: number): string | null {
@@ -1718,7 +1790,7 @@ wss.on('connection', (ws) => {
       }
       if (data.type === 'save_scene') {
         const safeName = data.name.replace(/[^a-zA-Z0-9_-]/g, '_');
-        fs.writeFileSync(path.join(SCENES_DIR, `${safeName}.json`), JSON.stringify(data.state, null, 2));
+        writeFileAtomicSync(path.join(SCENES_DIR, `${safeName}.json`), JSON.stringify(data.state, null, 2));
         broadcastToClients(JSON.stringify({ type: 'scenes_list', scenes: listScenes() }));
       } else if (data.type === 'list_scenes') {
         ws.send(JSON.stringify({ type: 'scenes_list', scenes: listScenes() }));
@@ -1750,7 +1822,7 @@ wss.on('connection', (ws) => {
             enabled: p.enabled !== false,
             params: (p.params && typeof p.params === 'object') ? p.params : {}
           }));
-          fs.writeFileSync(path.join(RACK_PRESETS_DIR, `${safeName}.json`), JSON.stringify(plugins, null, 2));
+          writeFileAtomicSync(path.join(RACK_PRESETS_DIR, `${safeName}.json`), JSON.stringify(plugins, null, 2));
           const presets = fs.readdirSync(RACK_PRESETS_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
           connectedWsClients.forEach(c => {
              if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'rack_presets_list', presets }));
@@ -1776,10 +1848,10 @@ wss.on('connection', (ws) => {
         }
       } else if (data.type === 'sync_patchbay_matrix') {
         const merged = mergePatchbayMappings(data.mappings);
-        fs.writeFileSync(PATCHBAY_CONFIG_PATH, JSON.stringify(merged));
+        writeFileAtomicSync(PATCHBAY_CONFIG_PATH, JSON.stringify(merged));
 
         const mergedOutputs = mergeOutputRouting(data.outputs);
-        fs.writeFileSync(OUTPUT_ROUTING_PATH, JSON.stringify(mergedOutputs));
+        writeFileAtomicSync(OUTPUT_ROUTING_PATH, JSON.stringify(mergedOutputs));
 
         // Sequenced, not concurrent: both touch AES67_Deck ports via
         // pw-link, and an output endpoint could in principle coincide with
@@ -1798,7 +1870,7 @@ wss.on('connection', (ws) => {
         const micSourceName = typeof data.micSourceName === 'string' ? data.micSourceName : null;
         const micAlsaPortName = typeof data.micAlsaPortName === 'string' ? data.micAlsaPortName : null;
         const cfg: TalkbackConfig = { sourcePorts, destBusIds, micSourceName, micAlsaPortName };
-        fs.writeFileSync(TALKBACK_CONFIG_PATH, JSON.stringify(cfg));
+        writeFileAtomicSync(TALKBACK_CONFIG_PATH, JSON.stringify(cfg));
 
         (async () => {
           await applyTalkbackRouting(cfg);
@@ -1909,7 +1981,7 @@ wss.on('connection', (ws) => {
         ensureProject(name);
         setActiveProject(name);
         const project = emptyProject();
-        fs.writeFileSync(path.join(projectDir(name), 'project.json'), JSON.stringify(project, null, 2));
+        writeFileAtomicSync(path.join(projectDir(name), 'project.json'), JSON.stringify(project, null, 2));
         connectedWsClients.forEach(c => {
           if (c.readyState === WebSocket.OPEN) {
             c.send(JSON.stringify({ type: 'project_data', name, project }));
@@ -1967,12 +2039,12 @@ wss.on('connection', (ws) => {
             for (const td of sourceTakeDirs) {
               try { fs.rmSync(path.join(projectDir(activeProjectName), 'takes', td), { recursive: true, force: true }); } catch { /* ignore */ }
             }
-            fs.writeFileSync(rppPath(name), buildRpp(
+            writeFileAtomicSync(rppPath(name), buildRpp(
               timelineToRpp(project.clips, project.markers, project.trackHeights, sr, (c) => c.file, project),
             ));
             activeRecordingProject = name;
             activeProjectName = name;
-            try { fs.writeFileSync(ACTIVE_PROJECT_PATH, name); } catch { /* ignore */ }
+            try { writeFileAtomicSync(ACTIVE_PROJECT_PATH, name); } catch { /* ignore */ }
 
             const loaded = rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name);
             connectedWsClients.forEach((c) => {
@@ -1995,7 +2067,7 @@ wss.on('connection', (ws) => {
             const proj = rppToProject(parseRpp(fs.readFileSync(rppPath(name), 'utf8')), name);
             activeRecordingProject = name;
             activeProjectName = name;
-            try { fs.writeFileSync(ACTIVE_PROJECT_PATH, name); } catch { /* ignore */ }
+            try { writeFileAtomicSync(ACTIVE_PROJECT_PATH, name); } catch { /* ignore */ }
             connectedWsClients.forEach((c) => {
               if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'project_data', name, project: proj }));
             });
@@ -2139,10 +2211,12 @@ wss.on('connection', (ws) => {
           const srcPath = activeRecordingProject
             ? path.join(recProjectDir(activeRecordingProject), file)
             : path.join(projectDir(activeProjectName), 'takes', takeDir, file);
-          setImmediate(() => {
-            const peaks = fs.existsSync(srcPath) ? ensurePeaks(srcPath) : null;
+          const clipId = data.clipId;
+          // Computed on a worker thread — a long take is seconds of blocking
+          // work that must not stall the event loop (see pumpPeaksQueue).
+          getPeaksAsync(srcPath).then((peaks) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'clip_peaks', clipId: data.clipId, takeDir, file, peaks }));
+              ws.send(JSON.stringify({ type: 'clip_peaks', clipId, takeDir, file, peaks }));
             }
           });
         }
@@ -2227,7 +2301,7 @@ function handleTakeStarted(msg: any): boolean {
   try {
     const tcCfg = getTimecodeConfig();
     const sr = Number(msg.sampleRate) || lastSampleRate || 48000;
-    fs.writeFileSync(path.join(activeTakeDir, 'take.json'), JSON.stringify({
+    writeFileAtomicSync(path.join(activeTakeDir, 'take.json'), JSON.stringify({
       originFrame: Number(msg.originFrame) || 0,
       sampleRate: sr,
       armed: Array.isArray(msg.armed) ? msg.armed : [],
@@ -2291,7 +2365,7 @@ function handleTakeFinished(msg: any): boolean {
     // Merge end frame into the manifest written at take_started.
     const p = path.join(takeDir, 'take.json');
     const existing = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
-    fs.writeFileSync(p, JSON.stringify({ ...existing, ...manifest, overrun: !!msg.overrun }, null, 2));
+    writeFileAtomicSync(p, JSON.stringify({ ...existing, ...manifest, overrun: !!msg.overrun }, null, 2));
   } catch (e) {
     console.error('Could not finalise take.json', e);
   }
@@ -2328,7 +2402,7 @@ function handleTakeFinished(msg: any): boolean {
       const base = rppToProject(parseRpp(fs.readFileSync(rppPath(recName), 'utf8')), recName);
       merged = { clips: [...base.clips, ...clips], markers: base.markers, trackHeights: base.trackHeights,
                  tempo: base.tempo, timeSig: base.timeSig };
-      fs.writeFileSync(rppPath(recName), buildRpp(
+      writeFileAtomicSync(rppPath(recName), buildRpp(
         timelineToRpp(merged.clips, merged.markers, merged.trackHeights, manifest.sampleRate, (x) => path.basename(String(x.file || '')), merged),
       ));
     } catch (e) {
@@ -2704,7 +2778,7 @@ function getTxSourcePrefs(): TxSourcePrefs {
 }
 
 function saveTxSourcePrefs(prefs: TxSourcePrefs) {
-  fs.writeFileSync(TX_SOURCES_PATH, JSON.stringify(prefs, null, 2));
+  writeFileAtomicSync(TX_SOURCES_PATH, JSON.stringify(prefs, null, 2));
 }
 
 // Converge the daemon's transmit Sources to the enabled TX groups. Each group
@@ -2821,7 +2895,7 @@ function getRxSinkAssignments(): RxSinkAssignment[] {
 }
 
 function saveRxSinkAssignments(list: RxSinkAssignment[]) {
-  fs.writeFileSync(RX_SINKS_PATH, JSON.stringify(list, null, 2));
+  writeFileAtomicSync(RX_SINKS_PATH, JSON.stringify(list, null, 2));
 }
 
 // Lowest capture channel where `count` contiguous channels are free. Counts
