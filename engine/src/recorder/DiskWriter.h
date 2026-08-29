@@ -35,17 +35,22 @@ private:
     void disk_thread_func();
     void drain_ringbuffer();
 
+    // Interleave scratch is pre-allocated once (constructor) to this ceiling so
+    // start_recording() never resizes a vector the audio thread may be reading.
+    static constexpr int MAX_NFRAMES = 8192;   // matches the engine's block cap
+    static constexpr int MAX_CHANNELS = 8;
+
     std::atomic<bool> is_recording_;
     std::atomic<bool> thread_running_;
     std::atomic<bool> overrun_{false};
     std::thread thread_;
     jack_ringbuffer_t* ringbuffer_;
 
-    int channels_;
-    SNDFILE* sndfile_;
+    std::atomic<int> channels_{0};      // IPC thread writes, disk + audio read
+    std::atomic<SNDFILE*> sndfile_{nullptr};
     SF_INFO sf_info_;
-    
-    // Scratch buffer for interleaving
+
+    // Scratch buffer for interleaving — fixed capacity, never resized after ctor.
     std::vector<float> interleave_buffer_;
 };
 

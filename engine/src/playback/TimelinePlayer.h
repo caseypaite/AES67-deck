@@ -117,6 +117,14 @@ private:
     bool was_playing_ = false;
     std::atomic<bool> priming_{false}; // reader flushed, ring not yet refilled
 
+    // Ring flush handoff. jack_ringbuffer is SPSC and jack_ringbuffer_reset()
+    // from the reader (producer) thread races the audio thread's
+    // read_space()/read() in render(). Instead the reader bumps flush_gen_ and
+    // the audio thread drains its own ring (consumer-side read_advance) when it
+    // sees a new generation.
+    std::atomic<uint32_t> flush_gen_{0};
+    uint32_t render_seen_gen_[MAX_CH + 1]{}; // audio thread only
+
     std::vector<float> read_scratch_;      // reader thread
     std::vector<float> read_scratch_b_;    // reader thread — crossfade neighbour
     std::vector<float> rt_scratch_;        // audio thread (render)

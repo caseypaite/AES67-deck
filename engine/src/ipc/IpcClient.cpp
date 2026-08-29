@@ -44,7 +44,17 @@ void IpcClient::set_transport_callback(std::function<void(const nlohmann::json&)
 }
 
 void IpcClient::send_json(const std::string& json_payload) {
-    send_multichannel_metering(json_payload);
+    // Callers of this are all non-RT (transport replies, bounce_failed, …).
+    send_json_async(json_payload);
+}
+
+void IpcClient::send_json_async(const std::string& json_payload) {
+    std::lock_guard<std::mutex> lk(async_tx_mutex_);
+    async_tx_.push_back(json_payload + "\n");
+    // Bound the backlog if the socket is gone or the server has stalled.
+    // These are discrete events, not last-value-wins telemetry, so drop the
+    // oldest rather than grow without limit.
+    while (async_tx_.size() > 4096) async_tx_.pop_front();
 }
 
 void IpcClient::send_metering(float l, float r) {
@@ -202,6 +212,16 @@ void IpcClient::run() {
             jack_ringbuffer_read(tx_buffer_, tx_scratch.data(), chunk);
             tx_pending.append(tx_scratch.data(), chunk);
             avail -= chunk;
+        }
+
+        // ── Drain the non-RT async queue (transport replies, bounce_failed,
+        //    take_started/finished/failed) into the same pending buffer ──
+        {
+            std::lock_guard<std::mutex> lk(async_tx_mutex_);
+            while (!async_tx_.empty()) {
+                tx_pending += async_tx_.front();
+                async_tx_.pop_front();
+            }
         }
 
         // If the server has stalled, cap the backlog by dropping whole oldest

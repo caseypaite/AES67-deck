@@ -2,6 +2,8 @@
 #include <string>
 #include <thread>
 #include <functional>
+#include <mutex>
+#include <deque>
 #include <jack/ringbuffer.h>
 #include "json.hpp"
 
@@ -26,9 +28,13 @@ public:
     // paths, so the whole parsed message is handed through as-is.
     void set_transport_callback(std::function<void(const nlohmann::json&)> cb);
     void send_metering(float l, float r);
-    // Send an arbitrary already-serialised JSON line to the server (no
-    // trailing newline needed). Same lock-free tx path as the metering frame.
+    // Send an already-serialised JSON line to the server (no trailing newline
+    // needed) from a NON-RT thread — goes through a mutex-guarded queue, not
+    // the SPSC metering ring, so it is safe to call concurrently with the
+    // audio thread's send_multichannel_metering().
     void send_json(const std::string& json_payload);
+    void send_json_async(const std::string& json_payload);
+    // Audio-thread only. Lock-free SPSC ring — this is the single producer.
     void send_multichannel_metering(const std::string& json_payload);
 
 private:
@@ -44,7 +50,9 @@ private:
     std::function<void(const std::string&, int, int, const std::string&, float)> plugin_callback_;
     std::function<void(const nlohmann::json&)> plugin_manage_callback_;
     std::function<void(const nlohmann::json&)> transport_callback_;
-    jack_ringbuffer_t* tx_buffer_;
+    jack_ringbuffer_t* tx_buffer_;            // RT audio thread -> IPC thread (SPSC)
+    std::mutex async_tx_mutex_;               // guards async_tx_
+    std::deque<std::string> async_tx_;        // non-RT producers -> IPC thread
 };
 
 } // namespace ipc

@@ -137,6 +137,18 @@ void TimelinePlayer::set_schedule(std::vector<ClipSpec> clips) {
 void TimelinePlayer::render(int track_id, float* L, float* R, uint32_t nframes) {
     if (track_id < 1 || track_id > MAX_CH) return;
     jack_ringbuffer_t* ring = tracks_[track_id]->ring;
+
+    // The reader signalled a flush (seek / schedule edit / stop->play). Drop
+    // whatever stale timeline audio is still queued for this track — done here,
+    // on the consumer side, because jack_ringbuffer_reset() from the reader
+    // thread would race this function.
+    const uint32_t g = flush_gen_.load(std::memory_order_acquire);
+    if (g != render_seen_gen_[track_id]) {
+        render_seen_gen_[track_id] = g;
+        const size_t stale = jack_ringbuffer_read_space(ring);
+        if (stale) jack_ringbuffer_read_advance(ring, stale);
+    }
+
     const size_t want = static_cast<size_t>(nframes) * 2 * sizeof(float);
     if (jack_ringbuffer_read_space(ring) >= want &&
         rt_scratch_.size() >= static_cast<size_t>(nframes) * 2) {
@@ -304,8 +316,10 @@ void TimelinePlayer::reader_loop() {
 
         if (!was_playing_ || discontinuity || playhead_ran_dry) {
             priming_.store(true, std::memory_order_relaxed);
+            // Hand the ring flush to the audio thread (see render()) rather than
+            // calling jack_ringbuffer_reset() here — that races the consumer.
+            flush_gen_.fetch_add(1, std::memory_order_release);
             for (int t = 1; t <= MAX_CH; ++t) {
-                jack_ringbuffer_reset(tracks_[t]->ring);
                 tracks_[t]->cursor = -1;
                 tracks_b_[t]->cursor = -1;
             }

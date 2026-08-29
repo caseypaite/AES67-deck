@@ -36,19 +36,33 @@ constexpr int AUX_BASE = 101;         // 101..108
 constexpr int MONITOR_ID = 109;       // dedicated operator monitor bus
 constexpr int TALKBACK_ID = 110;      // not a ChannelState; see TalkbackState
 
+// Live per-channel controls are written from the IPC thread and read every
+// audio block, so every field the RT thread touches is atomic — a plain
+// std::map<int,float> aux_sends here was undefined behaviour (tree rebalance
+// on insert racing the audio thread's traversal, i.e. a crash *inside* the
+// process callback). Fixed-size atomic array instead: index 0 = Master send,
+// 1..NUM_AUX = Aux 101..108. current_peak_* stay plain — only the RT thread
+// ever touches them.
 struct ChannelState {
-    float fader = 0.75f;
-    float pan = 0.0f;
-    bool mute = false;
-    bool solo = false;
-    bool phase = false;   // polarity invert (the "ø" button)
+    std::atomic<float> fader{0.75f};
+    std::atomic<float> pan{0.0f};
+    std::atomic<bool> mute{false};
+    std::atomic<bool> solo{false};
+    std::atomic<bool> phase{false};   // polarity invert (the "ø" button)
 
     float current_peak_l = 0.0f;
     float current_peak_r = 0.0f;
-    std::map<int, float> aux_sends;
+    std::atomic<float> aux_sends[NUM_AUX + 1];   // [0] Master, [1..NUM_AUX] Aux
 
     std::vector<std::unique_ptr<plugins::PluginInstance>> insert_chain;
 };
+
+// busId (Master 100 / Aux 101..108) -> aux_sends[] slot, or -1 if out of range.
+static inline int aux_send_slot(int bus_id) {
+    if (bus_id == MASTER_ID) return 0;
+    if (bus_id >= AUX_BASE && bus_id < AUX_BASE + NUM_AUX) return bus_id - AUX_BASE + 1;
+    return -1;
+}
 
 // Per-plugin in/out metering for whichever plugin editor the UI currently has
 // open (docs/fx-ui-design.md §6, the `fx` key on the metering message). The
@@ -349,16 +363,25 @@ int main(int argc, char** argv) {
     // Scan system for LV2 plugins
     lv2_host.scan_plugins();
 
+    // ChannelState holds atomics now (non-copyable, non-movable), so each
+    // entry is default-constructed in place rather than assigned.
     std::map<int, ChannelState> channels;
-    for (int i = 1; i <= NUM_CHANNELS; i++) channels[i] = ChannelState();
-    channels[MASTER_ID] = ChannelState();
-    for (int b = 0; b < NUM_AUX; b++) channels[AUX_BASE + b] = ChannelState();
-    channels[MONITOR_ID] = ChannelState();
+    for (int i = 1; i <= NUM_CHANNELS; i++) (void)channels[i];
+    (void)channels[MASTER_ID];
+    for (int b = 0; b < NUM_AUX; b++) (void)channels[AUX_BASE + b];
+    (void)channels[MONITOR_ID];
 
-    // Pre-reserve so Add/Remove/Reorder (applied on the audio thread, see
-    // the process callback's drain loop) never trigger a vector
-    // reallocation mid-stream.
-    for (auto& pair : channels) pair.second.insert_chain.reserve(MAX_PLUGINS_PER_CHANNEL);
+    for (auto& pair : channels) {
+        // Seed aux sends: Master starts at 0.75 (unity after the /0.75
+        // normalisation on the audio thread), Aux sends start closed.
+        pair.second.aux_sends[0].store(0.75f, std::memory_order_relaxed);
+        for (int b = 1; b <= NUM_AUX; b++)
+            pair.second.aux_sends[b].store(0.0f, std::memory_order_relaxed);
+        // Pre-reserve so Add/Remove/Reorder (applied on the audio thread, see
+        // the process callback's drain loop) never trigger a vector
+        // reallocation mid-stream.
+        pair.second.insert_chain.reserve(MAX_PLUGINS_PER_CHANNEL);
+    }
 
     TalkbackState talkback;
 
@@ -484,18 +507,20 @@ int main(int argc, char** argv) {
 
     ipc.set_command_callback([&channels, &recorder, &jack, &talkback](const std::string& type, int channel_id, int bus_id, float value) {
         if (channels.find(channel_id) != channels.end()) {
+            ChannelState& cs = channels[channel_id];
             if (type == "set_fader") {
-                channels[channel_id].fader = value;
+                cs.fader.store(value, std::memory_order_relaxed);
             } else if (type == "set_pan") {
-                channels[channel_id].pan = value;
+                cs.pan.store(value, std::memory_order_relaxed);
             } else if (type == "set_mute") {
-                channels[channel_id].mute = (value > 0.5f);
+                cs.mute.store(value > 0.5f, std::memory_order_relaxed);
             } else if (type == "set_solo") {
-                channels[channel_id].solo = (value > 0.5f);
+                cs.solo.store(value > 0.5f, std::memory_order_relaxed);
             } else if (type == "set_phase") {
-                channels[channel_id].phase = (value > 0.5f);
+                cs.phase.store(value > 0.5f, std::memory_order_relaxed);
             } else if (type == "set_aux_send") {
-                channels[channel_id].aux_sends[bus_id] = value; std::cout << "Set AUX SEND CH " << channel_id << " BUS " << bus_id << " to " << value << std::endl;
+                int slot = aux_send_slot(bus_id);
+                if (slot >= 0) cs.aux_sends[slot].store(value, std::memory_order_relaxed);
             }
         }
         if (type == "fx_focus") {
@@ -1090,7 +1115,7 @@ int main(int argc, char** argv) {
 
         bool any_solo = false;
         for (int i = 1; i <= NUM_CHANNELS; i++) {
-            if (channels[i].solo) { any_solo = true; break; }
+            if (channels[i].solo.load(std::memory_order_relaxed)) { any_solo = true; break; }
         }
 
         // Per-plugin in/out metering for the UI's currently-open editor.
@@ -1169,7 +1194,7 @@ int main(int argc, char** argv) {
 
             // Polarity invert ("ø") — applied to whatever the channel source is
             // (live input or timeline playback), ahead of the insert chain.
-            if (st.phase) {
+            if (st.phase.load(std::memory_order_relaxed)) {
                 for (uint32_t s = 0; s < nframes; ++s) { tmp_L[s] = -tmp_L[s]; tmp_R[s] = -tmp_R[s]; }
             }
 
@@ -1206,19 +1231,20 @@ int main(int argc, char** argv) {
             }
 
             // 3. Apply Fader, Mute, Pan
-            bool muted = st.mute || (any_solo && !st.solo);
-            float gain = muted ? 0.0f : (st.fader * 2.0f);
-            float pan_norm = (st.pan + 1.0f) / 2.0f;
+            bool muted = st.mute.load(std::memory_order_relaxed) ||
+                         (any_solo && !st.solo.load(std::memory_order_relaxed));
+            float gain = muted ? 0.0f : (st.fader.load(std::memory_order_relaxed) * 2.0f);
+            float pan_norm = (st.pan.load(std::memory_order_relaxed) + 1.0f) / 2.0f;
             float pan_gain_L = std::cos(pan_norm * M_PI_2);
             float pan_gain_R = std::sin(pan_norm * M_PI_2);
 
             float peak_l = 0.0f;
             float peak_r = 0.0f;
 
-            float master_send = (st.aux_sends.count(MASTER_ID) ? st.aux_sends[MASTER_ID] : 0.75f) / 0.75f;
+            float master_send = st.aux_sends[0].load(std::memory_order_relaxed) / 0.75f;
             float b_send[NUM_AUX] = {0.0f};
             for (int b = 0; b < NUM_AUX; b++) {
-                b_send[b] = (st.aux_sends.count(AUX_BASE + b) ? st.aux_sends[AUX_BASE + b] : 0.0f) / 0.75f;
+                b_send[b] = st.aux_sends[b + 1].load(std::memory_order_relaxed) / 0.75f;
             }
 
             for (jack_nframes_t s = 0; s < nframes; s++) {
@@ -1321,8 +1347,9 @@ int main(int argc, char** argv) {
                 b_p_i++;
             }
 
-            float b_gain = b_st.mute ? 0.0f : (b_st.fader * 2.0f);
-            float b_pan_norm = (b_st.pan + 1.0f) / 2.0f;
+            float b_gain = b_st.mute.load(std::memory_order_relaxed) ? 0.0f
+                         : (b_st.fader.load(std::memory_order_relaxed) * 2.0f);
+            float b_pan_norm = (b_st.pan.load(std::memory_order_relaxed) + 1.0f) / 2.0f;
             float b_pan_gain_L = std::cos(b_pan_norm * M_PI_2);
             float b_pan_gain_R = std::sin(b_pan_norm * M_PI_2);
             float b_peak_l = 0.0f;
@@ -1381,8 +1408,9 @@ int main(int argc, char** argv) {
                 m_p_i++;
             }
 
-            float m_gain = m_st.mute ? 0.0f : (m_st.fader * 2.0f);
-            float m_pan_norm = (m_st.pan + 1.0f) / 2.0f;
+            float m_gain = m_st.mute.load(std::memory_order_relaxed) ? 0.0f
+                         : (m_st.fader.load(std::memory_order_relaxed) * 2.0f);
+            float m_pan_norm = (m_st.pan.load(std::memory_order_relaxed) + 1.0f) / 2.0f;
             float m_pan_gain_L = std::cos(m_pan_norm * M_PI_2);
             float m_pan_gain_R = std::sin(m_pan_norm * M_PI_2);
             float m_peak_l = 0.0f;
