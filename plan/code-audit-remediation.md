@@ -2,9 +2,10 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phase 1 implemented + builds; 1.1/1.2 runtime-verified, 1.3/1.4 need targeted tests
+**Status:** Phase 1 done + runtime-verified. Phase 2 done + runtime-verified.
+Phase 3 pending. Full helgrind/TSan pass still outstanding.
 
-### Progress
+### Progress — Phase 1 (engine RT-safety)
 
 - [x] **1.1** `ChannelState` → atomics (`fader/pan/mute/solo/phase` + `aux_sends[NUM_AUX+1]`);
   `aux_send_slot()` helper; in-place map construction; default seeding.
@@ -219,25 +220,42 @@ struct ChannelState {
 
 ---
 
-## 3. Phase 2 — server (after Phase 1 lands)
+## 3. Phase 2 — server  ✅ DONE (commit `4f1d042`)
 
-### 2.1 Async peaks
-Move `computePeaks` / `readAudio` to a `worker_threads` pool (or async
-`child_process.execFile` + streaming WAV parse). Keep the `.peaks.json`
-cache. `get_clip_peaks` enqueues, replies on completion.
+### 2.1 Async peaks — done
+- New `server/src/wavPeaksWorker.ts`: a persistent worker thread that runs
+  `ensurePeaks()` (wvunpack + full per-sample parse + 3-tier reduce) and
+  posts back the `PeaksFile`.
+- `index.ts`: single worker + FIFO queue (`pumpPeaksQueue` / `getPeaksAsync`)
+  — peak requests are infrequent and disk-bound, so serialising keeps memory
+  flat. Worker crash/exit fails the in-flight job with `null` and respawns on
+  the next request. `worker.unref()` so a pending job can't hold the process
+  open.
+- `PEAKS_WORKER_PATH` + `execArgv` switch on `__filename` ext: `.ts` +
+  `-r ts-node/register/transpile-only` under ts-node, `.js` under compiled
+  `dist/`. Verified in both.
+- `get_clip_peaks` handler: `setImmediate(… ensurePeaks …)` →
+  `getPeaksAsync(srcPath).then(…)`. The `.peaks.json` cache is unchanged.
 
-### 2.2 Atomic writes
-One helper, applied to every state-persistence site (`index.ts:377, 431, 540,
-638, 805, 976, 1205, 1355, 1779, 1782, 1801, 1912, 2294, ...`):
+### 2.2 Atomic writes — done
+`writeFileAtomicSync(file, data)` (temp file in the same dir → `renameSync`
+over the target; cleans up the temp on failure). Applied to **all** persisted
+state: `mixer_state`, `fx_racks`, `project.json` (×3 sites), `.active` (×3),
+patchbay / output-routing / talkback configs, vsc / loudness / timecode
+configs, playlists, scenes, rack presets, `take.json` + manifest,
+`tx_sources` / `rx_sinks`, the three `.rpp` exports, and the bounce-WAV
+head-trim. Left as-is: the append-only loudness CSV log + one-time CSV header.
 
-```ts
-function writeJsonAtomic(file: string, data: unknown) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file);
-}
-```
-Leave `.rpp` export and CSV log writes as-is (not recovery-critical).
+#### Runtime test results (2026-08-29, dev stack)
+
+- **2.2** 30 rapid `set_fader` + 30 `set_aux_send` + a mute, then read back
+  `mixer_state.json` → valid JSON, `ch5.mute === true`, **no `.tmp` litter**
+  anywhere. Server restart reloaded 42 channels + 3 FX racks cleanly.
+- **2.1** forced peaks recompute (cache cleared) on a 24 s take: `clip_peaks`
+  returned valid v2 peaks; **server WS ping RTT stayed avg 0.7 ms / max 6 ms**
+  through the whole compute (a blocked event loop would spike into the 100s of
+  ms). Isolated worker test on the same file: 132 ms compute, main thread
+  ticked 25/26 times → event loop free. 2nd request served from cache in 2 ms.
 
 ---
 
