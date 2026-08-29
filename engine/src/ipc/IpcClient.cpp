@@ -20,7 +20,9 @@ IpcClient::IpcClient(const std::string& socket_path) : socket_path_(socket_path)
     // of LV2 plugins, each with several control ports of metadata) — the
     // regular per-cycle metering messages are tiny by comparison.
     tx_buffer_ = jack_ringbuffer_create(1024 * 1024 * 4);
-    start();
+    // NB: the worker thread is NOT started here — main() calls start() after
+    // installing every callback (see the header). Sends before then just
+    // queue in tx_buffer_ / async_tx_ and flush once the thread connects.
 }
 
 IpcClient::~IpcClient() {

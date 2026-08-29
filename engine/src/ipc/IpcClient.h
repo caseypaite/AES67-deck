@@ -4,6 +4,7 @@
 #include <functional>
 #include <mutex>
 #include <deque>
+#include <atomic>
 #include <jack/ringbuffer.h>
 #include "json.hpp"
 
@@ -37,14 +38,19 @@ public:
     // Audio-thread only. Lock-free SPSC ring — this is the single producer.
     void send_multichannel_metering(const std::string& json_payload);
 
-private:
+    // Start the worker thread. Call this AFTER installing every callback — the
+    // worker reads command_callback_ / transport_callback_ / … with no
+    // synchronisation, so starting it from the constructor (before main() sets
+    // them) is a data race on those std::function objects.
     void start();
+
+private:
     void stop();
     void run();
 
     std::string socket_path_;
     int sock_fd_;
-    bool running_;
+    std::atomic<bool> running_;
     std::thread thread_;
     std::function<void(const std::string&, int, int, float)> command_callback_;
     std::function<void(const std::string&, int, int, const std::string&, float)> plugin_callback_;

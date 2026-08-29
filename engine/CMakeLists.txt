@@ -12,6 +12,18 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -ffast-math")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
 add_compile_options(-Wall -Wextra)
 
+# Opt-in sanitizer build for concurrency / memory verification, e.g.
+#   cmake -B build-tsan -DSANITIZE=thread   (then run with
+#   TSAN_OPTIONS=suppressions=engine/tsan.supp — jack_ringbuffer is a
+#   correct lock-free SPSC queue that TSan cannot see the ordering of).
+# Values: thread | address | undefined. Overrides the Debug ASan default.
+set(SANITIZE "" CACHE STRING "Sanitizer: thread | address | undefined")
+if(SANITIZE)
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+    add_compile_options(-fsanitize=${SANITIZE} -g -O1 -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${SANITIZE})
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LILV REQUIRED lilv-0)
 pkg_check_modules(SNDFILE REQUIRED sndfile)

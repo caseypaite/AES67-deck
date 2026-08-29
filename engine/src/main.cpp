@@ -833,6 +833,12 @@ int main(int argc, char** argv) {
         }
     });
 
+    // Every callback is installed — now it's safe to start the IPC worker
+    // thread (it dispatches into these std::function objects with no lock).
+    // Anything queued before now — the plugin catalog dump above — flushes
+    // once the thread connects.
+    ipc.start();
+
     // Telemetry cadence — gated on elapsed frames, not block count, so the
     // metering rate stays ~40 Hz regardless of the JACK/PipeWire quantum
     // (a small quantum was pushing this to ~125 Hz and swamping the UI).
