@@ -2,8 +2,9 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phase 1 done + runtime-verified. Phase 2 done + runtime-verified.
-Phase 3 pending. Full helgrind/TSan pass still outstanding.
+**Status:** Phases 1–3 done + runtime-verified, incl. a ThreadSanitizer pass.
+Phase 4 (plugin-chain thread safety — new findings from the TSan pass) is
+recommended but not started.
 
 ### Progress — Phase 1 (engine RT-safety)
 
@@ -259,13 +260,65 @@ head-trim. Left as-is: the append-only loudness CSV log + one-time CSV header.
 
 ---
 
-## 4. Phase 3 — cleanup
+## 4. Phase 3 — cleanup + verification
 
-- **3.1** Fix `audio-watchdog.sh:44–45` → `in_1_L` / `in_1_R`; tighten the
-  `:40` guard. Or delete the script if `route-system-audio.sh` + the server's
-  routing convergence have superseded it (decide first).
-- **3.2** *(optional, low priority)* Move metering serialisation off the RT
-  thread: RT writes a packed binary frame to a ring, a telemetry worker emits
-  JSON. Only justified if we go to quantum 64 or add channels.
+### 3.1 `audio-watchdog.sh` — DONE (commit `0bb4c56`): **deleted**
+Untouched since the initial commit, referenced nowhere, superseded by the
+server's `handlePatchbaySync` + routing re-apply on engine reconnect. Beyond
+the port suffix (`in_1` vs `in_1_L`) it targeted the wrong source node and
+channel — fixing the names would give a script that fights the server.
+`route-system-audio.sh` and `aes67-audio-fix.sh` (correct port names, genuine
+manual helpers) were left alone.
 
-**Explicitly not doing:** C3 (hardcoded paths — non-issue).
+### 3.2 RT metering serialisation off-thread — **not done (deferred by design)**
+Optional; A5 re-rated LOW–MEDIUM. Production runs fine at q128 with headroom.
+Only worth the churn + risk if the rig moves to q64 or adds channels.
+
+### 3.3 ThreadSanitizer pass — DONE (commit `09ecb7d`)
+Added an opt-in `-DSANITIZE=thread` CMake build + `engine/tsan.supp`, and a
+scripted driver (`scratchpad/tsan_driver.py`, not committed) that stands in
+for the server and hammers every Phase-1 path — aux sends, faders,
+mute/solo/phase, plugin add/remove/load_rack, transport locate/play, record
+start/stop, timeline set — for ~25 s while draining metering.
+
+- **Phase 1 primitives: zero races.** `aux_sends` atomic array, `async_tx_`
+  mutex path, `TimelinePlayer::flush_gen_`, `DiskWriter` atomics — all clean.
+- **Fixed one real pre-existing race:** `IpcClient` started its worker from
+  the constructor, before `main()` installed the callbacks → unsynchronised
+  read of the `std::function`s in `run()`. Now `ipc.start()` is explicit,
+  called after every `set_*_callback`; `running_` → atomic. Verified the
+  server's post-connect state restore still lands in full.
+- **Remaining TSan noise (92 → 2):** the 2 are 100 % inside `ld-linux` /
+  `libpipewire-module-protocol-native` (no app frames). The ~55 suppressed
+  reports are all `PluginInstance` / `Lv2Host::instantiate_plugin` accesses
+  synchronised through `jack_ringbuffer` (plugin_cmd_ring / plugin_trash_ring)
+  — real acquire/release ordering TSan can't see inside uninstrumented libjack.
+
+## 5. Phase 4 (recommended) — plugin-chain thread safety
+
+Found during the TSan pass; **not in the original audit**, genuine latent bugs:
+
+- **`PluginInstance::bypassed` is a plain `bool`** written by
+  `set_plugin_callback` (IPC thread, `plugin->bypassed = …`) and read every
+  block by the audio thread (`main.cpp` insert-chain loop). → `std::atomic<bool>`.
+- **`set_plugin_callback` (`set_plugin_param` / `set_plugin_bypass`) runs on
+  the IPC thread and dereferences `channels[ch].insert_chain[idx].get()`
+  directly** — reading the vector and calling `set_control_value_by_symbol()`
+  on a `PluginInstance` the audio thread may be erasing and the trash thread
+  may be `delete`ing. This one is **not** ring-mediated — it's a real
+  cross-thread `std::vector` + use-after-free hazard on a live control path.
+  Fix: route param/bypass changes through `plugin_cmd_ring` like add/remove,
+  or hold an atomic per-port value array the audio thread reads.
+- Consider the same treatment for `MultitrackRecorder` (never audited for
+  concurrency; also the suspect for the open "first ~2 s distorted" bug).
+
+**Explicitly not doing:** C3 (hardcoded paths — non-issue); Phase 3.2 unless
+the latency target changes.
+
+---
+
+## 6. Outstanding
+
+- Pre-existing **loop-wrap bug** (`transport_set_loop` never reaches
+  `g_transport.loop_enabled`) — see §1 note. Separate from the audit.
+- Phase 4 above (new findings).
