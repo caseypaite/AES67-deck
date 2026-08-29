@@ -110,14 +110,17 @@ export interface ConfirmDialogProps {
   message: string;
   confirmLabel?: string;
   danger?: boolean;
+  /** Optional extra content (e.g. a checkbox) rendered between the message and buttons. */
+  children?: React.ReactNode;
   onConfirm: () => void;
   onClose: () => void;
 }
 
-export function ConfirmDialog({ title, message, confirmLabel = 'OK', danger, onConfirm, onClose }: ConfirmDialogProps) {
+export function ConfirmDialog({ title, message, confirmLabel = 'OK', danger, children, onConfirm, onClose }: ConfirmDialogProps) {
   return (
     <Shell title={title} onClose={onClose} width={360}>
       <div className="text-xs text-gray-300 leading-relaxed">{message}</div>
+      {children}
       <div className="flex justify-end gap-2 pt-1">
         <button onClick={onClose} className="px-3 py-1.5 text-xs font-bold rounded-sm bg-[#23262d] text-gray-300 hover:bg-[#2c2f37]">
           Cancel

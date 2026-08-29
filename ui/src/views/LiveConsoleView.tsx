@@ -326,6 +326,8 @@ export const LiveConsoleView = () => {
   const recordingProjects = useDawStore(state => state.recordingProjects);
   const activeRecordingProject = useDawStore(state => state.activeRecordingProject);
   const saveRecordingProject = useDawStore(state => state.saveRecordingProject);
+  const clearTimeline = useDawStore(state => state.clearTimeline);
+  const dawClips = useDawStore(state => state.clips);
   const openRecordingProject = useDawStore(state => state.openRecordingProject);
   const refreshRecordingProjects = useDawStore(state => state.refreshRecordingProjects);
   const toggleTransport = useMixerStore(state => state.toggleTransport);
@@ -371,6 +373,11 @@ export const LiveConsoleView = () => {
   const [pendingOpenProject, setPendingOpenProject] = useState<string | null>(null);
   const [sceneSel, setSceneSel] = useState('');
   const [pendingDeleteScene, setPendingDeleteScene] = useState<string | null>(null);
+  const [showClearTimeline, setShowClearTimeline] = useState(false);
+  const [clearDeleteTakes, setClearDeleteTakes] = useState(true);
+  const takeCount = new Set(
+    Object.values(dawClips).map((c: { takeDir?: string }) => c.takeDir).filter(Boolean),
+  ).size;
   const deleteScene = useMixerStore(state => state.deleteScene);
 
   // Keep the selection valid as the scene list changes (e.g. after a delete).
@@ -443,6 +450,30 @@ export const LiveConsoleView = () => {
           onClose={() => setPendingDeleteScene(null)}
         />
       )}
+      {showClearTimeline && (
+        <ConfirmDialog
+          title="Clear timeline"
+          message={
+            clearDeleteTakes
+              ? `Reset the timeline to blank and permanently delete ${takeCount || 'the recorded'} take${takeCount === 1 ? '' : 's'} from disk. This cannot be undone.`
+              : 'Reset the timeline to blank. The take files stay on disk and will re-appear on the timeline the next time the project loads.'
+          }
+          confirmLabel={clearDeleteTakes ? 'Clear + Delete' : 'Clear'}
+          danger={clearDeleteTakes}
+          onConfirm={() => clearTimeline(clearDeleteTakes)}
+          onClose={() => setShowClearTimeline(false)}
+        >
+          <label className="flex items-center gap-2 text-xs text-gray-300 select-none cursor-pointer">
+            <input
+              type="checkbox"
+              checked={clearDeleteTakes}
+              onChange={(e) => setClearDeleteTakes(e.target.checked)}
+              className="accent-red-600"
+            />
+            Also delete the recorded take files{takeCount ? ` (${takeCount})` : ''}
+          </label>
+        </ConfirmDialog>
+      )}
       {pendingOpenProject && (
         <ConfirmDialog
           title="Open recording project"
@@ -486,6 +517,16 @@ export const LiveConsoleView = () => {
               >
                 SAVE PROJECT
               </button>
+              {!activeRecordingProject && (
+                <button
+                  onClick={() => { setClearDeleteTakes(true); setShowClearTimeline(true); }}
+                  disabled={transportState === 'recording'}
+                  title="Reset the timeline to a blank slate (and optionally delete the recorded takes)"
+                  className="px-3 py-1.5 bg-[#1a1c22] text-gray-400 text-[10px] font-bold rounded shadow-sm border border-[#333] enabled:hover:bg-red-700 enabled:hover:text-white disabled:opacity-40"
+                >
+                  CLEAR
+                </button>
+              )}
               <select
                 onFocus={refreshRecordingProjects}
                 value={activeRecordingProject ?? ''}

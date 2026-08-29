@@ -2017,6 +2017,52 @@ wss.on('connection', (ws) => {
           }
         });
         pushTimelineToEngine(name, project);
+      } else if (data.type === 'clear_timeline') {
+        // Reset the active project's timeline to a blank slate. Musical settings
+        // (tempo / time sig / metro dest / …) survive; clips, markers,
+        // automation, the loop/punch region and any video are dropped.
+        // deleteTakes: also permanently remove the recorded take dirs — required
+        // for the clear to actually stick, since loadProject() otherwise
+        // re-merges orphan takes back in as clips.
+        const name = activeProjectName;
+        const deleteTakes = !!data.deleteTakes;
+        if (activeTakeDir) {
+          ws.send(JSON.stringify({ type: 'timeline_cleared', error: 'a take is recording' }));
+        } else {
+          const cleared: DawProject = {
+            clips: [], markers: [], trackHeights: {},
+            ...musicalFields(loadProject(name)),
+            loop: undefined, video: null, automation: [],
+          };
+          writeFileAtomicSync(path.join(projectDir(name), 'project.json'), JSON.stringify(cleared, null, 2));
+
+          let deleted = 0;
+          if (deleteTakes) {
+            const takesRoot = path.join(projectDir(name), 'takes');
+            try {
+              if (fs.existsSync(takesRoot)) {
+                for (const d of fs.readdirSync(takesRoot)) {
+                  fs.rmSync(path.join(takesRoot, d), { recursive: true, force: true });
+                  deleted++;
+                }
+              }
+            } catch (e) { console.error('clear_timeline: take delete failed', e); }
+          }
+
+          lastLoop = { start: 0, end: 0, enabled: false };
+          lastPunch = { start: 0, end: 0, enabled: false };
+          if (engineSocket) {
+            engineSocket.write(JSON.stringify({ type: 'transport_stop' }) + '\n');
+            engineSocket.write(JSON.stringify({ type: 'transport_locate', frame: 0 }) + '\n');
+            replayRegionToEngine();
+          }
+          pushTimelineToEngine(name, cleared);
+          connectedWsClients.forEach(c => {
+            if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'project_data', name, project: cleared }));
+          });
+          console.log(`clear_timeline: ${name} reset${deleteTakes ? `, ${deleted} take dir(s) deleted` : ''}`);
+          ws.send(JSON.stringify({ type: 'timeline_cleared', deletedTakes: deleted }));
+        }
       } else if (data.type === 'list_recording_projects') {
         ws.send(JSON.stringify({ type: 'recording_projects_list', projects: listRecordingProjects(), active: activeRecordingProject }));
       } else if (data.type === 'save_recording_project') {

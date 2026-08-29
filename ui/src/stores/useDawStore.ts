@@ -335,6 +335,9 @@ interface DawState {
   addCommittedClips: (clips: DawClip[], overrun: boolean, opts?: { loopPass?: boolean; passIndex?: number }) => void;
   newProject: (name: string) => void;
   openProject: (name: string) => void;
+  // Reset the active project's timeline to blank. deleteTakes also permanently
+  // removes the recorded take files (needed for the clear to survive a reload).
+  clearTimeline: (deleteTakes: boolean) => void;
 
   // Recording projects (REAPER .rpp bundles)
   setRecordingProjects: (list: string[], active?: string | null) => void;
@@ -1564,6 +1567,15 @@ export const useDawStore = create<DawState>()(
 
       newProject: (name) => wsSend({ type: 'new_project', name }),
       openProject: (name) => wsSend({ type: 'load_project', name }),
+      clearTimeline: (deleteTakes) => {
+        // Optimistic local clear; the server's project_data broadcast confirms it.
+        set({
+          clips: {}, markers: {}, selectedClipIds: [], laneExpand: {},
+          automation: {}, autoExpand: {}, region: null,
+          loopEnabled: false, punchEnabled: false, video: null,
+        });
+        wsSend({ type: 'clear_timeline', deleteTakes: !!deleteTakes });
+      },
 
       setRecordingProjects: (list, active) =>
         set({
