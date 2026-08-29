@@ -2,9 +2,9 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phases 1–7 done + runtime-verified (Release + TSan + ASan builds,
-scripted concurrency driver, dev-stack + browser functional checks). Phase 7's
-target bug is appliance-specific and needs a final check on the real box.
+**Status:** Phases 1–7 done, deployed to `ck-aes67` and verified there.
+A self-audit of the branch (§11) turned up and fixed one HIGH (metering
+buffer overflow) + three MEDIUM/LOW issues; redeployed + re-verified.
 
 ### Progress — Phase 1 (engine RT-safety)
 
@@ -427,7 +427,38 @@ The "first ~2 s of every multitrack take is distorted" bug.
 
 ---
 
-## 10. Outstanding
+## 11. Branch self-audit  ✅ DONE (commit `e274b46`)
+
+Reviewed the whole diff before trusting it on the appliance.
+
+- **HIGH — metering JSON buffer overflow (`main.cpp`).** Every append was
+  `offset += snprintf(meter_json.data()+offset, meter_json.size()-offset, …)`.
+  snprintf returns the length it *would* have written, so a truncated write
+  lets `offset` run past the 32 KB buffer; `size()-offset` is `size_t` and
+  underflows, and the next call writes out of bounds → heap corruption on
+  the RT thread. Reachable with ~10+ armed multitrack channels streaming
+  peak envelopes through a slow metering frame — i.e. right in the workflow
+  Phases 5/7 hardened. **Pre-existing**, not introduced by this branch, but
+  now deployed. Fix: `mj()` clamp helper + 64 KB buffer.
+- **MEDIUM — `WavpackWriter::start_recording` bounded-wait fell through.**
+  Waited 400 ms for the prior take's disk thread, then raced it on
+  `file_`/`first_block_`/`path_`/the ring. Now waits 3 s and refuses rather
+  than racing (real closes are <50 ms).
+- **MEDIUM — RT-thread `std::string` alloc per metering frame.**
+  `send_multichannel_metering(char*)` → `std::string(char*) + "\n"`, ~40 Hz
+  on the audio thread. New `send_metering_rt(const char*, size_t)`, zero
+  alloc. Pre-existing.
+- **LOW — `set_control_value_by_symbol(const std::string&)`** → the RT
+  thread built a string from the command ring's `char[48]`. Now
+  `std::string_view` + heterogeneous map lookup.
+- **LOW — `clear_timeline`** now refuses while a REAPER recording project
+  is open.
+
+Redeployed to `ck-aes67` and re-verified: metering stays valid JSON (2-write
+payload+newline reassembles), 8-channel record → 0 xruns, take length
+correct, ASan clean recording all 32 channels.
+
+## 12. Outstanding
 
 - Full **helgrind** run (TSan covered the same ground; a second opinion,
   lower priority now).
