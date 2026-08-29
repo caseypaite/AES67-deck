@@ -98,6 +98,8 @@ interface DawState {
   recordOriginSec: number | null; // where the current take started (seconds)
   _engineSec: number;             // engine position (s) at the last transport msg
   _engineWall: number;            // performance.now() at the last transport msg
+  _locatePendingSec: number | null;  // a locate() we sent but the engine echo hasn't confirmed
+  _locatePendingAtMs: number;         // performance.now() when we sent it
 
   // Wall-clock anchor for the current take, for the as-run CSV's WallClock
   // column: a marker at timeline second t occurred at
@@ -568,6 +570,8 @@ export const useDawStore = create<DawState>()(
       recordOriginSec: null,
       _engineSec: 0,
       _engineWall: 0,
+      _locatePendingSec: null,
+      _locatePendingAtMs: 0,
       _takeStartedAtMs: null,
       _takeOriginSec: 0,
       cuesOpen: false,
@@ -828,6 +832,7 @@ export const useDawStore = create<DawState>()(
         const p = Math.max(0, sec);
         set({
           playheadPosition: p, _engineSec: p, _engineWall: performance.now(),
+          _locatePendingSec: p, _locatePendingAtMs: performance.now(),
           playbackUnderrun: false, timecode: fmtPlayhead(get(), p),
         });
         wsSend({ type: 'transport_locate', frame: Math.round(p * get().sampleRate) });
@@ -998,6 +1003,16 @@ export const useDawStore = create<DawState>()(
           clips = next;
         }
 
+        // A locate() we sent may not be reflected in this (in-flight) echo yet.
+        // While it's pending and unconfirmed, don't let the stale engine frame
+        // snap the playhead back — that's what made scrubbing feel stuck when
+        // stopped. Confirmed (echo matches) or timed out (700 ms) → resume trust.
+        const pend = s._locatePendingSec;
+        const locateSettled =
+          pend == null ||
+          Math.abs(sec - pend) < 0.02 ||
+          performance.now() - s._locatePendingAtMs > 700;
+
         set({
           engineFrame: frame,
           engineState: st,
@@ -1007,9 +1022,11 @@ export const useDawStore = create<DawState>()(
           _takeOriginSec: takeOriginSec,
           _engineSec: sec,
           _engineWall: performance.now(),
+          _locatePendingSec: locateSettled ? null : pend,
           ...(clips !== s.clips ? { clips } : {}),
-          // When stopped, snap exactly; while rolling, tickPlayhead interpolates.
-          ...(st === 0 ? { playheadPosition: sec, timecode: fmtPlayhead(s, sec) } : {}),
+          // When stopped, snap exactly (once any pending locate has settled);
+          // while rolling, tickPlayhead interpolates.
+          ...(st === 0 && locateSettled ? { playheadPosition: sec, timecode: fmtPlayhead(s, sec) } : {}),
         });
       },
 

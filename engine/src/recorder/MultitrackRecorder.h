@@ -51,10 +51,15 @@ public:
     int sample_rate() const { return sample_rate_; }
     const std::vector<int>& armed() const { return armed_; }   // IPC thread only
 
-    // RT thread. No-op for channels not armed in the current take.
+    // RT thread. Called for every channel every block — a no-op for channels
+    // not armed in the current take. (The armed check matters: the writer pool
+    // is persistent, so writers_[ch_id] is non-null even for unarmed channels;
+    // without this, frames_tapped_ counts all 32 and the committed clip ends up
+    // ~32× too long, i.e. a huge silent tail.)
     void write(int ch_id, const float* l, const float* r, int nframes) {
         if (!recording_.load(std::memory_order_acquire)) return;
         if (ch_id < 1 || ch_id > MAX_CH) return;
+        if (!(armed_mask_.load(std::memory_order_relaxed) & (1u << (ch_id - 1)))) return;
         WavpackWriter* w = writers_[ch_id].get();   // pool pointer, never moves
         if (!w) return;
         const float* chans[2] = { l, r };
