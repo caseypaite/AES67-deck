@@ -1315,10 +1315,6 @@ int main(int argc, char** argv) {
             st.current_peak_r = std::max(st.current_peak_r, peak_r);
         }
 
-        // Every multitrack tap for this block is in — advance the block
-        // sequence the recorder's reaper fences retired-writer destruction on.
-        mtr.end_audio_block();
-
         // Talkback: only while pressed, summed pre-fader/pan into every bus
         // buffer selected in the destination mask (Master and/or any Aux
         // buses), so it rides through each bus's own fader/pan/inserts like
@@ -1727,7 +1723,7 @@ int main(int argc, char** argv) {
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,
                 ",\"transport\":{\"frame\":%llu,\"state\":%d,\"sr\":%d,\"buf\":%u,\"pbUnderrun\":%d,\"monInMask\":%u,"
                 "\"loopOn\":%d,\"loopIn\":%llu,\"loopOut\":%llu,\"punchOn\":%d,\"punchIn\":%llu,\"punchOut\":%llu,"
-                "\"bounceState\":%d,\"bounceOverrun\":%d}",
+                "\"bounceState\":%d,\"bounceOverrun\":%d,\"xruns\":%u}",
                 static_cast<unsigned long long>(g_transport.frame.load(std::memory_order_relaxed)),
                 g_transport.state.load(std::memory_order_relaxed),
                 static_cast<int>(jack.get_sample_rate()),
@@ -1741,7 +1737,8 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(g_transport.punch_in.load(std::memory_order_relaxed)),
                 static_cast<unsigned long long>(g_transport.punch_out.load(std::memory_order_relaxed)),
                 g_bounce_state.load(std::memory_order_relaxed),
-                recorder.had_overrun() ? 1 : 0);
+                recorder.had_overrun() ? 1 : 0,
+                jack.get_xrun_count());
 
             // ── Timecode & sync status (plan Phase 3d) ──
             offset += snprintf(meter_json.data() + offset, meter_json.size() - offset,

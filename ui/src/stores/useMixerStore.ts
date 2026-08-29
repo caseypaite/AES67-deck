@@ -86,6 +86,7 @@ interface MixerState {
   // latency (2 × engine block size / sample rate, from the metering frame).
   serverStats: { cpu: number | null; memUsedMB: number | null; memTotalMB: number | null } | null;
   audioLatencyMs: number | null;
+  xruns: number;   // cumulative JACK xruns since the engine started (metering `transport.xruns`)
 
   // Replace a channel's whole plugin chain (used by mastering presets).
   applyRack: (channelId: number, plugins: { uri: string; enabled?: boolean; params?: Record<string, number> }[]) => void;
@@ -268,6 +269,7 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   masterAnalysis: null,
   serverStats: null,
   audioLatencyMs: null,
+  xruns: 0,
   channels: buildChannels(),
   activeView: 'mixer',
   transportState: 'stopped',
@@ -949,6 +951,9 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           if (data.transport?.buf && data.transport?.sr) {
             const ms = Math.round((2 * data.transport.buf / data.transport.sr) * 1000 * 10) / 10;
             if (get().audioLatencyMs !== ms) set({ audioLatencyMs: ms });
+          }
+          if (typeof data.transport?.xruns === 'number' && data.transport.xruns !== get().xruns) {
+            set({ xruns: data.transport.xruns });
           }
           if (data.tc) useDawStore.getState().applyTcTelemetry(data.tc);
           if (data.transport) {

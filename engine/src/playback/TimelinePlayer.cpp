@@ -118,6 +118,7 @@ TimelinePlayer::TimelinePlayer(int sample_rate)
     for (int t = 1; t <= MAX_CH; ++t) {
         tracks_[t] = std::make_unique<TrackReader>();
         tracks_[t]->ring = jack_ringbuffer_create(RING_BYTES);
+        if (tracks_[t]->ring) jack_ringbuffer_mlock(tracks_[t]->ring);  // keep resident
         tracks_b_[t] = std::make_unique<TrackReader>();   // no ring — crossfade only
     }
     reader_ = std::thread(&TimelinePlayer::reader_loop, this);

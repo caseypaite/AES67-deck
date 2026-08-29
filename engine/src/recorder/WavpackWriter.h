@@ -21,7 +21,10 @@ namespace recorder {
 // float WAV, and cheap enough to run many in parallel on the appliance.
 class WavpackWriter {
 public:
-    WavpackWriter();
+    // ring_bytes: per-writer lock-free ring capacity. The single-file master
+    // DiskWriter-equivalent uses the 16 MB default; MultitrackRecorder passes
+    // a smaller value since 32 run in parallel.
+    explicit WavpackWriter(size_t ring_bytes = 16 * 1024 * 1024);
     ~WavpackWriter();
 
     bool start_recording(const std::string& filepath, int channels, int sample_rate);
@@ -46,9 +49,9 @@ private:
     std::thread thread_;
     jack_ringbuffer_t* ringbuffer_;
 
-    int channels_ = 0;
+    std::atomic<int> channels_{0};
     FILE* file_ = nullptr;
-    WavpackContext* wpc_ = nullptr;
+    std::atomic<WavpackContext*> wpc_{nullptr};
     std::string path_;
     std::vector<unsigned char> first_block_;   // saved to patch the sample count on close
 

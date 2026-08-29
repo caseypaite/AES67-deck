@@ -23,9 +23,10 @@ const StatCell = ({ label, value, tone }: { label: string; value: string; tone: 
 const tone = (v: number | null, warn: number, bad: number) =>
   v == null ? 'text-gray-600' : v >= bad ? 'text-red-400' : v >= warn ? 'text-amber-400' : 'text-green-400';
 
-const ServerStats = ({ stats, latencyMs }: {
+const ServerStats = ({ stats, latencyMs, xruns }: {
   stats: { cpu: number | null; memUsedMB: number | null; memTotalMB: number | null } | null;
   latencyMs: number | null;
+  xruns: number;
 }) => {
   const cpu = stats?.cpu ?? null;
   const used = stats?.memUsedMB ?? null;
@@ -40,6 +41,7 @@ const ServerStats = ({ stats, latencyMs }: {
         tone={tone(memPct, 75, 90)}
       />
       <StatCell label="LAT" value={latencyMs == null ? '—' : `${latencyMs.toFixed(1)}ms`} tone={tone(latencyMs, 12, 25)} />
+      <StatCell label="XR" value={`${xruns}`} tone={xruns === 0 ? 'text-green-400' : 'text-red-400'} />
     </div>
   );
 };
@@ -329,6 +331,7 @@ export const LiveConsoleView = () => {
   const toggleTransport = useMixerStore(state => state.toggleTransport);
   const serverStats = useMixerStore(state => state.serverStats);
   const audioLatencyMs = useMixerStore(state => state.audioLatencyMs);
+  const xruns = useMixerStore(state => state.xruns);
   const activeView = useMixerStore(state => state.activeView);
   const setActiveView = useMixerStore(state => state.setActiveView);
   const selectedChannelId = useMixerStore(state => state.selectedChannelId);
@@ -539,7 +542,7 @@ export const LiveConsoleView = () => {
         </div>
 
         <div className="flex items-center gap-3">
-          <ServerStats stats={serverStats} latencyMs={audioLatencyMs} />
+          <ServerStats stats={serverStats} latencyMs={audioLatencyMs} xruns={xruns} />
           <div className="w-px h-5 bg-gray-700" />
           <div className="flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />

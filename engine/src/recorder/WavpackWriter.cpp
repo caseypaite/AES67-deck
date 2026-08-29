@@ -8,12 +8,23 @@ namespace aes67_deck {
 namespace recorder {
 
 namespace {
-constexpr size_t RING_BYTES = 16 * 1024 * 1024;
 constexpr int MAX_NFRAMES = 8192;
 }
 
-WavpackWriter::WavpackWriter() {
-    ringbuffer_ = jack_ringbuffer_create(RING_BYTES);
+WavpackWriter::WavpackWriter(size_t ring_bytes) {
+    ringbuffer_ = jack_ringbuffer_create(ring_bytes);
+    if (ringbuffer_) {
+        // Fault every page of the ring in NOW, on the constructing thread, and
+        // (best effort) lock it resident — so the audio thread's first writes
+        // into a fresh take don't take a page fault per block right when
+        // recording starts. That first-touch storm is the prime suspect for
+        // the distorted head of multitrack takes.
+        std::vector<char> touch(jack_ringbuffer_write_space(ringbuffer_), 0);
+        jack_ringbuffer_write(ringbuffer_, touch.data(), touch.size());
+        jack_ringbuffer_read_advance(ringbuffer_, jack_ringbuffer_read_space(ringbuffer_));
+        jack_ringbuffer_mlock(ringbuffer_);   // no-op on some jack shims; harmless
+    }
+    interleave_buffer_.assign(static_cast<size_t>(MAX_NFRAMES) * 2, 0.0f);
     thread_ = std::thread(&WavpackWriter::disk_thread_func, this);
 }
 
@@ -26,7 +37,7 @@ WavpackWriter::~WavpackWriter() {
 
 int WavpackWriter::write_block_cb(void* id, void* data, int32_t bcount) {
     auto* self = static_cast<WavpackWriter*>(id);
-    if (!self->file_) return 0;
+    if (!self->file_) return 0;   // disk thread only — file_ is stable here
     if (self->first_block_.empty()) {
         // The very first block carries the stream header whose sample count we
         // patch on close (encoding with unknown length).
@@ -38,7 +49,12 @@ int WavpackWriter::write_block_cb(void* id, void* data, int32_t bcount) {
 
 bool WavpackWriter::start_recording(const std::string& filepath, int channels, int sample_rate) {
     if (is_recording_.load(std::memory_order_relaxed)) return false;
-    channels_ = channels;
+    if (channels < 1 || channels > 2) return false;
+    // A previous take may still be closing on the disk thread (stop() +
+    // immediate start()); let it finish so the ring drain below can't race it.
+    for (int i = 0; i < 200 && wpc_.load(std::memory_order_acquire) != nullptr; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    channels_.store(channels, std::memory_order_relaxed);
     path_ = filepath;
     first_block_.clear();
 
@@ -68,14 +84,17 @@ bool WavpackWriter::start_recording(const std::string& filepath, int channels, i
         return false;
     }
 
-    interleave_buffer_.resize(static_cast<size_t>(MAX_NFRAMES) * channels);
-    jack_ringbuffer_reset(ringbuffer_);
+    // interleave_buffer_ is pre-allocated in the constructor — never resized
+    // here. Drain any stale bytes rather than jack_ringbuffer_reset() (the disk
+    // thread only touches the ring while recording / draining, both clear here).
+    if (size_t stale = jack_ringbuffer_read_space(ringbuffer_))
+        jack_ringbuffer_read_advance(ringbuffer_, stale);
     overrun_.store(false, std::memory_order_relaxed);
 
     // Publish wpc_ last, immediately before is_recording_ — matches DiskWriter:
     // the disk thread gates on is_recording_ and must never see a live wpc_
     // while is_recording_ is still false.
-    wpc_ = wpc;
+    wpc_.store(wpc, std::memory_order_release);
     is_recording_.store(true, std::memory_order_release);
     return true;
 }
@@ -88,14 +107,15 @@ void WavpackWriter::stop_recording() {
 
 void WavpackWriter::write_audio(const float* const* channel_buffers, int nchannels, int nframes) {
     if (!is_recording_.load(std::memory_order_acquire)) return;
-    if (nchannels != channels_) return;
-    if (static_cast<size_t>(nframes) * channels_ > interleave_buffer_.size()) return;
+    const int ch = channels_.load(std::memory_order_relaxed);
+    if (nchannels != ch) return;
+    if (static_cast<size_t>(nframes) * ch > interleave_buffer_.size()) return;
 
     for (int i = 0; i < nframes; ++i)
-        for (int c = 0; c < channels_; ++c)
-            interleave_buffer_[i * channels_ + c] = channel_buffers[c][i];
+        for (int c = 0; c < ch; ++c)
+            interleave_buffer_[i * ch + c] = channel_buffers[c][i];
 
-    const size_t bytes = static_cast<size_t>(nframes) * channels_ * sizeof(float);
+    const size_t bytes = static_cast<size_t>(nframes) * ch * sizeof(float);
     if (jack_ringbuffer_write_space(ringbuffer_) >= bytes) {
         jack_ringbuffer_write(ringbuffer_, reinterpret_cast<const char*>(interleave_buffer_.data()), bytes);
     } else {
@@ -106,7 +126,9 @@ void WavpackWriter::write_audio(const float* const* channel_buffers, int nchanne
 void WavpackWriter::drain_ringbuffer() {
     static thread_local std::vector<float> buf;
     if (buf.empty()) buf.resize(static_cast<size_t>(MAX_NFRAMES) * 16);
-    const int ch = channels_ > 0 ? channels_ : 1;
+    const int chv = channels_.load(std::memory_order_relaxed);
+    const int ch = chv > 0 ? chv : 1;
+    WavpackContext* wpc = wpc_.load(std::memory_order_acquire);
     size_t avail;
     while ((avail = jack_ringbuffer_read_space(ringbuffer_)) > 0) {
         size_t read_bytes = std::min(avail, buf.size() * sizeof(float));
@@ -114,46 +136,55 @@ void WavpackWriter::drain_ringbuffer() {
         if (frames == 0) break;
         read_bytes = frames * ch * sizeof(float);
         jack_ringbuffer_read(ringbuffer_, reinterpret_cast<char*>(buf.data()), read_bytes);
-        if (wpc_) {
+        if (wpc) {
             // WavPack takes an int32 buffer; for float data each int32 slot is
             // the bit pattern of the sample.
-            WavpackPackSamples(wpc_, reinterpret_cast<int32_t*>(buf.data()),
+            WavpackPackSamples(wpc, reinterpret_cast<int32_t*>(buf.data()),
                                static_cast<uint32_t>(frames));
         }
     }
 }
 
 void WavpackWriter::close_file() {
-    if (!wpc_) return;
-    WavpackFlushSamples(wpc_);
+    WavpackContext* wpc = wpc_.load(std::memory_order_acquire);
+    if (!wpc) return;
+    WavpackFlushSamples(wpc);
     if (!first_block_.empty()) {
-        WavpackUpdateNumSamples(wpc_, first_block_.data());
+        WavpackUpdateNumSamples(wpc, first_block_.data());
         if (file_ && std::fseek(file_, 0, SEEK_SET) == 0) {
             std::fwrite(first_block_.data(), 1, first_block_.size(), file_);
         }
     }
-    WavpackCloseFile(wpc_);
-    wpc_ = nullptr;
+    WavpackCloseFile(wpc);
     if (file_) { std::fflush(file_); std::fclose(file_); file_ = nullptr; }
     std::cout << "WavpackWriter: take file closed (" << path_ << ")" << std::endl;
+    // Publish nullptr LAST — start_recording()'s "wait for the prior take to
+    // finish closing" spins on this, and everything above touches path_ /
+    // first_block_ which start_recording() is about to overwrite.
+    wpc_.store(nullptr, std::memory_order_release);
 }
 
 void WavpackWriter::disk_thread_func() {
     bool saw_recording = false;
     while (thread_running_.load(std::memory_order_relaxed)) {
-        if (is_recording_.load(std::memory_order_acquire)) saw_recording = true;
+        const bool rec = is_recording_.load(std::memory_order_acquire);
+        if (rec) saw_recording = true;
 
-        if (jack_ringbuffer_read_space(ringbuffer_) > 0) {
-            drain_ringbuffer();
-        } else if (saw_recording && !is_recording_.load(std::memory_order_acquire) && wpc_) {
-            close_file();
-            saw_recording = false;
+        // Only touch the ring while recording or still draining a take —
+        // otherwise start_recording()'s own drain would have a second reader.
+        if (rec || saw_recording) {
+            if (jack_ringbuffer_read_space(ringbuffer_) > 0) {
+                drain_ringbuffer();
+            } else if (saw_recording && !rec) {
+                close_file();
+                saw_recording = false;
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // Shutdown mid-take: don't lose the tail.
-    if (wpc_) {
+    if (wpc_.load(std::memory_order_acquire)) {
         drain_ringbuffer();
         close_file();
     }

@@ -1,6 +1,7 @@
 #include "DiskWriter.h"
 #include <iostream>
 #include <cstring>
+#include <vector>
 
 namespace aes67_deck {
 namespace recorder {
@@ -9,8 +10,15 @@ DiskWriter::DiskWriter() : is_recording_(false), thread_running_(true) {
     // Pre-allocate the interleave scratch to its ceiling so start_recording()
     // never resizes it while the audio thread is in write_audio().
     interleave_buffer_.assign(static_cast<size_t>(MAX_NFRAMES) * MAX_CHANNELS, 0.0f);
-    // 16MB ringbuffer for lock-free writing
+    // 16MB ringbuffer for lock-free writing — fault its pages in + lock it
+    // resident now so the RT thread's first writes don't fault per block.
     ringbuffer_ = jack_ringbuffer_create(16 * 1024 * 1024);
+    if (ringbuffer_) {
+        std::vector<char> touch(jack_ringbuffer_write_space(ringbuffer_), 0);
+        jack_ringbuffer_write(ringbuffer_, touch.data(), touch.size());
+        jack_ringbuffer_read_advance(ringbuffer_, jack_ringbuffer_read_space(ringbuffer_));
+        jack_ringbuffer_mlock(ringbuffer_);
+    }
     thread_ = std::thread(&DiskWriter::disk_thread_func, this);
 }
 

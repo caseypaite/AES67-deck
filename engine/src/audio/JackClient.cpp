@@ -15,6 +15,7 @@ JackClient::JackClient(const std::string& client_name) : client_name_(client_nam
     }
 
     jack_set_process_callback(client_, process_callback_wrapper, this);
+    jack_set_xrun_callback(client_, xrun_callback_wrapper, this);
     jack_on_shutdown(client_, shutdown_callback_wrapper, this);
 }
 
@@ -83,6 +84,11 @@ int JackClient::process_callback_wrapper(jack_nframes_t nframes, void* arg) {
 void JackClient::shutdown_callback_wrapper(void* arg) {
     std::cerr << "JACK server shutdown!" << std::endl;
     std::exit(1);
+}
+
+int JackClient::xrun_callback_wrapper(void* arg) {
+    static_cast<JackClient*>(arg)->xruns_.fetch_add(1, std::memory_order_relaxed);
+    return 0;
 }
 
 } // namespace audio
