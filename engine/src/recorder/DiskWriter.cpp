@@ -73,7 +73,7 @@ bool DiskWriter::start_recording(const std::string& filepath, int channels, int 
 }
 
 void DiskWriter::stop_recording() {
-    is_recording_ = false;
+    is_recording_.store(false, std::memory_order_release);
     // The disk thread drains the ringbuffer, then flushes and closes the file.
 }
 
@@ -82,7 +82,7 @@ void DiskWriter::write_audio(const std::vector<float*>& channel_buffers, int nfr
 }
 
 void DiskWriter::write_audio(const float* const* channel_buffers, int nchannels, int nframes) {
-    if (!is_recording_) return;
+    if (!is_recording_.load(std::memory_order_acquire)) return;
     const int ch = channels_.load(std::memory_order_relaxed);
     if (nchannels != ch) return;
     if (static_cast<size_t>(nframes) * ch > interleave_buffer_.size()) return;

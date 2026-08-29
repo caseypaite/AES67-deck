@@ -7,6 +7,7 @@ import {
   PluginCategory,
 } from '../../stores/useMixerStore';
 import { PluginDetail } from './PluginDetail';
+import { FxChainOverview } from './FxChainOverview';
 import { Screw } from '../analog/Screw';
 import { SaveDialog } from '../common/SaveDialog';
 import { FX_CHAINS, FxChainGroup } from '../../data/fxChains';
@@ -371,8 +372,9 @@ const PluginSlot = ({
 
 // ─── Main FxRackCard ─────────────────────────────────────────────────────────
 
-export const FxRackCard = () => {
-  const selectedChannelId = useMixerStore(s => s.selectedChannelId);
+export const FxRackCard = ({ channelId: propChannelId }: { channelId?: number } = {}) => {
+  const storeSelectedId = useMixerStore(s => s.selectedChannelId);
+  const effectiveChannelId = propChannelId !== undefined ? propChannelId : (storeSelectedId !== null ? storeSelectedId : 100);
   const channels          = useMixerStore(s => s.channels);
   const addPlugin         = useMixerStore(s => s.addPlugin);
   const reorderPlugin     = useMixerStore(s => s.reorderPlugin);
@@ -397,16 +399,14 @@ export const FxRackCard = () => {
     setShowPresets(true);
   };
 
-  if (selectedChannelId === null) return null;
-
-  const channel = channels[selectedChannelId];
+  const channel = channels[effectiveChannelId];
   if (!channel) return null;
 
   const plugins = channel.plugins;
   const selectedPlugin = selectedSlot ? plugins.find(p => p.id === selectedSlot) ?? null : null;
 
   const handleSave = (name: string) => {
-    saveRackPreset(selectedChannelId, name);
+    saveRackPreset(effectiveChannelId, name);
     // Re-list after save so the popover stays fresh
     setTimeout(() => listRackPresets(), 300);
   };
@@ -455,7 +455,7 @@ export const FxRackCard = () => {
           <LoadPresetPopover
             anchor={rackRef.current}
             presets={rackPresets}
-            onApplyChain={(chain) => { applyRack(selectedChannelId, chain.plugins); setSelectedSlot(null); }}
+            onApplyChain={(chain) => { applyRack(effectiveChannelId, chain.plugins); setSelectedSlot(null); }}
             onLoadPreset={loadRackPreset}
             onDeletePreset={deleteRackPreset}
             onClose={() => setShowPresets(false)}
@@ -476,14 +476,14 @@ export const FxRackCard = () => {
               key={plugin.id}
               plugin={plugin}
               index={idx}
-              channelId={selectedChannelId}
+              channelId={effectiveChannelId}
               isSelected={selectedSlot === plugin.id}
               draggedIdx={draggedIdx}
               onSelect={() => setSelectedSlot(prev => prev === plugin.id ? null : plugin.id)}
               onDragStart={() => setDraggedIdx(idx)}
               onDrop={() => {
                 if (draggedIdx !== null && draggedIdx !== idx) {
-                  reorderPlugin(selectedChannelId, draggedIdx, idx);
+                  reorderPlugin(effectiveChannelId, draggedIdx, idx);
                 }
                 setDraggedIdx(null);
               }}
@@ -505,21 +505,25 @@ export const FxRackCard = () => {
           {showAdd && addBtnRef.current && (
             <AddEffectPopover
               anchor={addBtnRef.current}
-              onAdd={(uri, name) => addPlugin(selectedChannelId, { name, uri, enabled: true })}
+              onAdd={(uri, name) => addPlugin(effectiveChannelId, { name, uri, enabled: true })}
               onClose={() => setShowAdd(false)}
             />
           )}
         </div>
       </div>
 
-      {/* ── Detail panel (right of rack) ── */}
+      {/* ── Detail panel (right of rack): FxChainOverview by default, or PluginDetail when a slot is clicked ── */}
       {selectedPlugin ? (
-        <PluginDetail plugin={selectedPlugin} channelId={selectedChannelId} />
+        <PluginDetail
+          plugin={selectedPlugin}
+          channelId={effectiveChannelId}
+          onClose={() => setSelectedSlot(null)}
+        />
       ) : (
-        <div className="flex-1 flex flex-col items-center justify-center text-gray-600 text-[10px] font-black tracking-[0.2em] text-center gap-1 metal-well">
-          <div>SELECT AN EFFECT</div>
-          <div className="text-[8px] font-normal tracking-normal text-gray-700">Click a slot to inspect its parameters.</div>
-        </div>
+        <FxChainOverview
+          channelId={effectiveChannelId}
+          onSelectSlot={(pluginId) => setSelectedSlot(pluginId)}
+        />
       )}
     </div>
   );

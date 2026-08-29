@@ -65,6 +65,22 @@ static inline int aux_send_slot(int bus_id) {
     return -1;
 }
 
+// Transparent safety brickwall / soft-saturation clip guard on engine outputs.
+// Guarantees no sample ever exceeds +/- 1.0f (0 dBFS), sanitizes NaN/Inf to 0.0f,
+// and applies a gentle tanh soft-knee starting at -0.45 dBFS (0.95f) to prevent
+// harsh digital clipping and protect PA/IEM equipment against feedback/DSP runaway.
+static inline float output_safety_clamp(float x) {
+    if (std::isnan(x) || std::isinf(x)) return 0.0f;
+    constexpr float KNEE = 0.95f;
+    constexpr float HEADROOM = 1.0f - KNEE;
+    if (x > KNEE) {
+        return std::min(1.0f, KNEE + HEADROOM * std::tanh((x - KNEE) / HEADROOM));
+    } else if (x < -KNEE) {
+        return std::max(-1.0f, -(KNEE + HEADROOM * std::tanh((-x - KNEE) / HEADROOM)));
+    }
+    return x;
+}
+
 // Per-plugin in/out metering for whichever plugin editor the UI currently has
 // open (docs/fx-ui-design.md §6, the `fx` key on the metering message). The
 // UI announces its selection with an `fx_focus` command; the audio thread
@@ -76,6 +92,16 @@ static std::atomic<int> g_fx_focus_channel{-1};
 static std::atomic<int> g_fx_focus_plugin{-1};
 static float g_fx_in_peak_l = 0.0f, g_fx_in_peak_r = 0.0f;
 static float g_fx_out_peak_l = 0.0f, g_fx_out_peak_r = 0.0f;
+
+// AFL / PFL Monitor Mode — governs how a *channel's* Solo and Mute behave.
+// 0 = OFF (default): Solo and Mute are live and affect every bus. Mute cuts
+//     the channel on Master/Aux/Monitor; Solo is destructive Solo-In-Place
+//     (non-soloed channels drop out of Master/Aux/Monitor).
+// 1 = AFL: cue mode. A channel's Solo and Mute ONLY reshape the operator
+//     Monitor bus — the Master/Aux house mix always carries every channel at
+//     its fader/pan. Soloed channels are cued post-fader/pan.
+// 2 = PFL: same as AFL but soloed channels are cued pre-fader, pre-mute, unity.
+static std::atomic<int> g_afl_pfl_mode{0};
 
 // Real-time analyser for the focused plugin's *input* — a bank of Goertzel
 // detectors at log-spaced centre frequencies, fed sample-by-sample on the
@@ -555,6 +581,8 @@ int main(int argc, char** argv) {
                 std::cerr << "Talkback destination mask " << bus_id << " had bits outside Master/Aux range, clamped to " << mask << std::endl;
             }
             talkback.dest_bus_mask = mask;
+        } else if (type == "set_afl_pfl_mode") {
+            g_afl_pfl_mode.store(static_cast<int>(value), std::memory_order_relaxed);
         }
     });
 
@@ -1159,17 +1187,37 @@ int main(int argc, char** argv) {
             if (bus_out_R[b]) std::memset(bus_out_R[b], 0, sizeof(float) * nframes);
         }
 
-        bool any_solo = false;
+        const int afl_pfl = g_afl_pfl_mode.load(std::memory_order_relaxed);
+        // Split channel-solo from bus-solo. SIP channel-cutting keys off
+        // channel solos only — soloing an Aux bus must not zero the channels
+        // that feed it (that would starve the very bus you're trying to hear).
+        // Bus solo is handled independently (isolated onto Monitor in the bus
+        // loop, and — in SIP — muting the other Aux outputs there).
+        bool any_channel_solo = false;
         for (int i = 1; i <= NUM_CHANNELS; i++) {
-            if (channels[i].solo.load(std::memory_order_relaxed)) { any_solo = true; break; }
+            if (channels[i].solo.load(std::memory_order_relaxed)) { any_channel_solo = true; break; }
+        }
+        bool any_solo = any_channel_solo;
+        for (int b_id = AUX_BASE; b_id < AUX_BASE + NUM_AUX && !any_solo; b_id++) {
+            if (channels[b_id].solo.load(std::memory_order_relaxed)) { any_solo = true; }
         }
 
-        // Per-plugin in/out metering for the UI's currently-open editor.
+        // Per-plugin in/out metering for the UI's currently-open editor or whole rack (fx_pi == -1).
         const int fx_ch = g_fx_focus_channel.load(std::memory_order_relaxed);
         const int fx_pi = g_fx_focus_plugin.load(std::memory_order_relaxed);
-        auto meter_fx = [&](int chan, int plugin_idx, bool is_input,
+        auto meter_fx = [&](int chan, int plugin_idx, int total_plugins, bool is_input,
                             const float* l, const float* r) {
-            if (plugin_idx != fx_pi || chan != fx_ch) return;
+            if (chan != fx_ch) return;
+            bool should_meter = false;
+            if (fx_pi >= 0) {
+                should_meter = (plugin_idx == fx_pi);
+            } else if (fx_pi == -1) {
+                // Focus on whole rack: input is pre-first-plugin, output is post-last-plugin.
+                if (is_input && plugin_idx == 0) should_meter = true;
+                if (!is_input && plugin_idx == total_plugins - 1) should_meter = true;
+            }
+            if (!should_meter) return;
+
             float pl = 0.0f, pr = 0.0f;
             for (jack_nframes_t s = 0; s < nframes; s++) {
                 float a = std::fabs(l[s]); if (a > pl) pl = a;
@@ -1179,7 +1227,7 @@ int main(int argc, char** argv) {
                 g_fx_in_peak_l = std::max(g_fx_in_peak_l, pl);
                 g_fx_in_peak_r = std::max(g_fx_in_peak_r, pr);
 
-                // feed the RTA off the mono sum of this plugin's input
+                // feed the RTA off the mono sum of this input
                 for (jack_nframes_t s = 0; s < nframes; s++) {
                     float x = 0.5f * (l[s] + r[s]);
                     for (int k = 0; k < RTA_BANDS; ++k) {
@@ -1245,12 +1293,24 @@ int main(int argc, char** argv) {
             }
 
             // 2. Process LV2 Insert Chain
+            const int total_p = static_cast<int>(st.insert_chain.size());
+            if (total_p == 0 && i == fx_ch && fx_pi == -1) {
+                float pl = 0.0f, pr = 0.0f;
+                for (uint32_t s = 0; s < nframes; ++s) {
+                    float a = std::fabs(tmp_L[s]); if (a > pl) pl = a;
+                    float b = std::fabs(tmp_R[s]); if (b > pr) pr = b;
+                }
+                g_fx_in_peak_l = std::max(g_fx_in_peak_l, pl);
+                g_fx_in_peak_r = std::max(g_fx_in_peak_r, pr);
+                g_fx_out_peak_l = std::max(g_fx_out_peak_l, pl);
+                g_fx_out_peak_r = std::max(g_fx_out_peak_r, pr);
+            }
             int p_i = 0;
             for (auto& plugin_ptr : st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
-                meter_fx(i, p_i, true, tmp_L.data(), tmp_R.data());
+                meter_fx(i, p_i, total_p, true, tmp_L.data(), tmp_R.data());
                 if (plugin->bypassed.load(std::memory_order_relaxed)) {
-                    meter_fx(i, p_i, false, tmp_L.data(), tmp_R.data());
+                    meter_fx(i, p_i, total_p, false, tmp_L.data(), tmp_R.data());
                     p_i++;
                     continue;
                 }
@@ -1272,14 +1332,31 @@ int main(int argc, char** argv) {
                 // Copy output back to input buffers for the next plugin in chain
                 std::memcpy(tmp_L.data(), tmp_out_L.data(), sizeof(float) * nframes);
                 std::memcpy(tmp_R.data(), tmp_out_R.data(), sizeof(float) * nframes);
-                meter_fx(i, p_i, false, tmp_L.data(), tmp_R.data());
+                meter_fx(i, p_i, total_p, false, tmp_L.data(), tmp_R.data());
                 p_i++;
             }
 
-            // 3. Apply Fader, Mute, Pan
-            bool muted = st.mute.load(std::memory_order_relaxed) ||
-                         (any_solo && !st.solo.load(std::memory_order_relaxed));
-            float gain = muted ? 0.0f : (st.fader.load(std::memory_order_relaxed) * 2.0f);
+            // 3. Apply Fader, Mute, Pan — the channel's contribution to the
+            //    Master + Aux house mix.
+            // - AFL/PFL active (afl_pfl != 0): "cue mode" — this channel's Solo
+            //   and Mute do NOT touch the house mix at all; they only reshape
+            //   the Monitor bus (below). The house always gets the channel at
+            //   its fader/pan.
+            // - AFL/PFL off (default): Mute cuts the channel here; Solo is
+            //   destructive Solo-In-Place — with any channel soloed, non-soloed
+            //   channels drop out. (Keyed on channel solos only, so a lone
+            //   Aux-bus solo leaves the channel→bus feeds intact.)
+            bool chan_muted = st.mute.load(std::memory_order_relaxed);
+            bool chan_solo = st.solo.load(std::memory_order_relaxed);
+            float fader_gain = st.fader.load(std::memory_order_relaxed) * 2.0f;
+            float mix_gain;
+            if (afl_pfl != 0) {
+                mix_gain = fader_gain;
+            } else if (any_channel_solo) {
+                mix_gain = (chan_solo && !chan_muted) ? fader_gain : 0.0f;
+            } else {
+                mix_gain = chan_muted ? 0.0f : fader_gain;
+            }
             float pan_norm = (st.pan.load(std::memory_order_relaxed) + 1.0f) / 2.0f;
             float pan_gain_L = std::cos(pan_norm * M_PI_2);
             float pan_gain_R = std::sin(pan_norm * M_PI_2);
@@ -1294,8 +1371,8 @@ int main(int argc, char** argv) {
             }
 
             for (jack_nframes_t s = 0; s < nframes; s++) {
-                float spl_L = tmp_L[s] * gain * pan_gain_L;
-                float spl_R = tmp_R[s] * gain * pan_gain_R;
+                float spl_L = tmp_L[s] * mix_gain * pan_gain_L;
+                float spl_R = tmp_R[s] * mix_gain * pan_gain_R;
 
                 out_L[s] += spl_L * master_send;
                 out_R[s] += spl_R * master_send;
@@ -1305,15 +1382,41 @@ int main(int argc, char** argv) {
                     if (bus_out_R[b]) bus_out_R[b][s] += spl_R * b_send[b];
                 }
 
-                // Monitor bus: every input channel is summed here post-fader
-                // at a fixed unity send with no per-channel level control
-                // (there's no adjustable "send to Monitor" the operator can
-                // set — it's always everything, post-fader).
-                if (monitor_L) monitor_L[s] += spl_L;
-                if (monitor_R) monitor_R[s] += spl_R;
+                // Monitor bus — the operator cue feed. Follows Solo/Mute in
+                // every mode (this is exactly what AFL/PFL "cue mode" isolates
+                // Solo/Mute to). Post-insert-chain — the inserts already ran in
+                // step 2 and processed tmp_L/tmp_R in place.
+                // - Any channel soloed: only soloed channels are cued.
+                //   * PFL (2): pre-fader, pre-pan (mono sum), pre-mute, unity.
+                //   * AFL (1) / off (0): post-fader/pan; muted channels drop out.
+                // - Nothing soloed: every non-muted channel, post-fader.
+                if (any_solo) {
+                    if (chan_solo) {
+                        if (afl_pfl == 2) {
+                            // PFL: mono sum of the raw (pre-fader/pan/mute) channel
+                            // at unity, fed equally to both monitor legs.
+                            float mono = 0.5f * (tmp_L[s] + tmp_R[s]);
+                            if (monitor_L) monitor_L[s] += mono;
+                            if (monitor_R) monitor_R[s] += mono;
+                        } else {
+                            float g = chan_muted ? 0.0f : fader_gain;
+                            if (monitor_L) monitor_L[s] += tmp_L[s] * g * pan_gain_L;
+                            if (monitor_R) monitor_R[s] += tmp_R[s] * g * pan_gain_R;
+                        }
+                    }
+                } else {
+                    float mon_spl_L = tmp_L[s] * (chan_muted ? 0.0f : fader_gain) * pan_gain_L;
+                    float mon_spl_R = tmp_R[s] * (chan_muted ? 0.0f : fader_gain) * pan_gain_R;
+                    if (monitor_L) monitor_L[s] += mon_spl_L;
+                    if (monitor_R) monitor_R[s] += mon_spl_R;
+                }
 
-                float abs_l = std::fabs(spl_L);
-                float abs_r = std::fabs(spl_R);
+                // Channel meter = its actual contribution to the house mix.
+                // In cue mode that ignores Solo/Mute (the channel is still live);
+                // otherwise a muted, non-soloed channel reads silent.
+                bool meter_silent = (afl_pfl == 0) && chan_muted && !chan_solo;
+                float abs_l = std::fabs(meter_silent ? 0.0f : (tmp_L[s] * fader_gain * pan_gain_L));
+                float abs_r = std::fabs(meter_silent ? 0.0f : (tmp_R[s] * fader_gain * pan_gain_R));
                 if (abs_l > peak_l) peak_l = abs_l;
                 if (abs_r > peak_r) peak_r = abs_r;
             }
@@ -1364,12 +1467,24 @@ int main(int argc, char** argv) {
             std::memcpy(tmp_L.data(), buf_L, sizeof(float) * nframes);
             std::memcpy(tmp_R.data(), buf_R, sizeof(float) * nframes);
 
+            const int total_b_p = static_cast<int>(b_st.insert_chain.size());
+            if (total_b_p == 0 && b_id == fx_ch && fx_pi == -1) {
+                float pl = 0.0f, pr = 0.0f;
+                for (uint32_t s = 0; s < nframes; ++s) {
+                    float a = std::fabs(tmp_L[s]); if (a > pl) pl = a;
+                    float b = std::fabs(tmp_R[s]); if (b > pr) pr = b;
+                }
+                g_fx_in_peak_l = std::max(g_fx_in_peak_l, pl);
+                g_fx_in_peak_r = std::max(g_fx_in_peak_r, pr);
+                g_fx_out_peak_l = std::max(g_fx_out_peak_l, pl);
+                g_fx_out_peak_r = std::max(g_fx_out_peak_r, pr);
+            }
             int b_p_i = 0;
             for (auto& plugin_ptr : b_st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
-                meter_fx(b_id, b_p_i, true, tmp_L.data(), tmp_R.data());
+                meter_fx(b_id, b_p_i, total_b_p, true, tmp_L.data(), tmp_R.data());
                 if (plugin->bypassed.load(std::memory_order_relaxed)) {
-                    meter_fx(b_id, b_p_i, false, tmp_L.data(), tmp_R.data());
+                    meter_fx(b_id, b_p_i, total_b_p, false, tmp_L.data(), tmp_R.data());
                     b_p_i++;
                     continue;
                 }
@@ -1389,12 +1504,29 @@ int main(int argc, char** argv) {
 
                 std::memcpy(tmp_L.data(), tmp_out_L.data(), sizeof(float) * nframes);
                 std::memcpy(tmp_R.data(), tmp_out_R.data(), sizeof(float) * nframes);
-                meter_fx(b_id, b_p_i, false, tmp_L.data(), tmp_R.data());
+                meter_fx(b_id, b_p_i, total_b_p, false, tmp_L.data(), tmp_R.data());
                 b_p_i++;
             }
 
-            float b_gain = b_st.mute.load(std::memory_order_relaxed) ? 0.0f
-                         : (b_st.fader.load(std::memory_order_relaxed) * 2.0f);
+            float b_gain = 0.0f;
+            bool b_solo = b_st.solo.load(std::memory_order_relaxed);
+            bool b_mute = b_st.mute.load(std::memory_order_relaxed);
+            float b_fader = b_st.fader.load(std::memory_order_relaxed) * 2.0f;
+            if (b_id == MASTER_ID) {
+                // Master output: never solo-gated. Its own Mute always works
+                // (the PA kill), in every mode.
+                b_gain = b_mute ? 0.0f : b_fader;
+            } else if (afl_pfl != 0) {
+                // Cue mode: a channel solo never cuts Aux outputs; the Aux's
+                // own Mute still kills its own output.
+                b_gain = b_mute ? 0.0f : b_fader;
+            } else if (any_solo) {
+                // Off mode, SIP (destructive): any solo anywhere mutes
+                // non-soloed Aux outputs; a soloed Aux still passes.
+                b_gain = (b_solo && !b_mute) ? b_fader : 0.0f;
+            } else {
+                b_gain = b_mute ? 0.0f : b_fader;
+            }
             float b_pan_norm = (b_st.pan.load(std::memory_order_relaxed) + 1.0f) / 2.0f;
             float b_pan_gain_L = std::cos(b_pan_norm * M_PI_2);
             float b_pan_gain_R = std::sin(b_pan_norm * M_PI_2);
@@ -1402,10 +1534,23 @@ int main(int argc, char** argv) {
             float b_peak_r = 0.0f;
 
             for (jack_nframes_t s = 0; s < nframes; s++) {
-                float out_spl_L = tmp_L[s] * b_gain * b_pan_gain_L;
-                float out_spl_R = tmp_R[s] * b_gain * b_pan_gain_R;
+                float out_spl_L = output_safety_clamp(tmp_L[s] * b_gain * b_pan_gain_L);
+                float out_spl_R = output_safety_clamp(tmp_R[s] * b_gain * b_pan_gain_R);
                 buf_L[s] = out_spl_L;
                 buf_R[s] = out_spl_R;
+
+                if (any_solo && b_solo && b_id >= AUX_BASE && monitor_L && monitor_R) {
+                    if (afl_pfl == 2) {
+                        // PFL: mono sum, pre-fader/pan/mute, unity.
+                        float mono = 0.5f * (tmp_L[s] + tmp_R[s]);
+                        monitor_L[s] += mono;
+                        monitor_R[s] += mono;
+                    } else {
+                        float g = b_mute ? 0.0f : b_fader;
+                        monitor_L[s] += tmp_L[s] * g * b_pan_gain_L;
+                        monitor_R[s] += tmp_R[s] * g * b_pan_gain_R;
+                    }
+                }
 
                 float abs_l = std::fabs(out_spl_L);
                 float abs_r = std::fabs(out_spl_R);
@@ -1425,12 +1570,24 @@ int main(int argc, char** argv) {
             std::memcpy(tmp_L.data(), monitor_L, sizeof(float) * nframes);
             std::memcpy(tmp_R.data(), monitor_R, sizeof(float) * nframes);
 
+            const int total_m_p = static_cast<int>(m_st.insert_chain.size());
+            if (total_m_p == 0 && MONITOR_ID == fx_ch && fx_pi == -1) {
+                float pl = 0.0f, pr = 0.0f;
+                for (uint32_t s = 0; s < nframes; ++s) {
+                    float a = std::fabs(tmp_L[s]); if (a > pl) pl = a;
+                    float b = std::fabs(tmp_R[s]); if (b > pr) pr = b;
+                }
+                g_fx_in_peak_l = std::max(g_fx_in_peak_l, pl);
+                g_fx_in_peak_r = std::max(g_fx_in_peak_r, pr);
+                g_fx_out_peak_l = std::max(g_fx_out_peak_l, pl);
+                g_fx_out_peak_r = std::max(g_fx_out_peak_r, pr);
+            }
             int m_p_i = 0;
             for (auto& plugin_ptr : m_st.insert_chain) {
                 auto* plugin = plugin_ptr.get();
-                meter_fx(MONITOR_ID, m_p_i, true, tmp_L.data(), tmp_R.data());
+                meter_fx(MONITOR_ID, m_p_i, total_m_p, true, tmp_L.data(), tmp_R.data());
                 if (plugin->bypassed.load(std::memory_order_relaxed)) {
-                    meter_fx(MONITOR_ID, m_p_i, false, tmp_L.data(), tmp_R.data());
+                    meter_fx(MONITOR_ID, m_p_i, total_m_p, false, tmp_L.data(), tmp_R.data());
                     m_p_i++;
                     continue;
                 }
@@ -1450,7 +1607,7 @@ int main(int argc, char** argv) {
 
                 std::memcpy(tmp_L.data(), tmp_out_L.data(), sizeof(float) * nframes);
                 std::memcpy(tmp_R.data(), tmp_out_R.data(), sizeof(float) * nframes);
-                meter_fx(MONITOR_ID, m_p_i, false, tmp_L.data(), tmp_R.data());
+                meter_fx(MONITOR_ID, m_p_i, total_m_p, false, tmp_L.data(), tmp_R.data());
                 m_p_i++;
             }
 
@@ -1463,8 +1620,8 @@ int main(int argc, char** argv) {
             float m_peak_r = 0.0f;
 
             for (jack_nframes_t s = 0; s < nframes; s++) {
-                float out_spl_L = tmp_L[s] * m_gain * m_pan_gain_L;
-                float out_spl_R = tmp_R[s] * m_gain * m_pan_gain_R;
+                float out_spl_L = output_safety_clamp(tmp_L[s] * m_gain * m_pan_gain_L);
+                float out_spl_R = output_safety_clamp(tmp_R[s] * m_gain * m_pan_gain_R);
                 monitor_L[s] = out_spl_L;
                 monitor_R[s] = out_spl_R;
 
@@ -1502,8 +1659,14 @@ int main(int argc, char** argv) {
                 if (metro_remain > 0.0) {
                     const double env = metro_remain / click_len;      // 1 → 0
                     const float smp = static_cast<float>(std::sin(metro_phase) * metro_amp * env * env);
-                    if (to_mon) { monitor_L[s] += smp; monitor_R[s] += smp; }
-                    if (to_mst) { out_L[s] += smp; out_R[s] += smp; }
+                    if (to_mon) {
+                        monitor_L[s] = output_safety_clamp(monitor_L[s] + smp);
+                        monitor_R[s] = output_safety_clamp(monitor_R[s] + smp);
+                    }
+                    if (to_mst) {
+                        out_L[s] = output_safety_clamp(out_L[s] + smp);
+                        out_R[s] = output_safety_clamp(out_R[s] + smp);
+                    }
                     metro_phase += 2.0 * M_PI * metro_freq / static_cast<double>(sr);
                     metro_remain -= 1.0;
                 }
@@ -1625,10 +1788,10 @@ int main(int argc, char** argv) {
             }
             mj( "}");
 
-            // Per-plugin in/out for the editor the UI has open (fx_focus).
+            // Per-plugin in/out for the editor the UI has open (fx_focus), or whole rack (fp == -1).
             const int fc = g_fx_focus_channel.load(std::memory_order_relaxed);
             const int fp = g_fx_focus_plugin.load(std::memory_order_relaxed);
-            if (fc >= 0 && fp >= 0) {
+            if (fc >= 0 && fp >= -1) {
                 mj(
                     ",\"fx\":{\"channel\":%d,\"pluginIndex\":%d,\"inL\":%.1f,\"inR\":%.1f,\"outL\":%.1f,\"outR\":%.1f,\"rta\":[",
                     fc, fp,
@@ -1775,6 +1938,8 @@ int main(int argc, char** argv) {
                 static_cast<long long>(g_countin_frames.load(std::memory_order_relaxed)),
                 g_ltc_chase_err.load(std::memory_order_relaxed),
                 ltc_anchored ? 1 : 0);
+
+            mj(",\"afl_pfl\":%d", g_afl_pfl_mode.load(std::memory_order_relaxed));
 
             mj("}");
 

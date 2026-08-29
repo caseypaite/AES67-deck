@@ -11,8 +11,8 @@ i5-4570 / 4 GB). Adjust the NIC name and host specifics for your machine.
 | `sysctl/99-realtime-audio.conf` | `/etc/sysctl.d/` | RT scheduler throttle off, low swappiness, bigger socket buffers |
 | `limits/95-audio-realtime.conf` | `/etc/security/limits.d/` | `@audio` → rtprio 95, memlock unlimited, nice -19 |
 | `systemd/cpu-performance.service` | `/etc/systemd/system/` | lock CPU governor to `performance` at boot |
-| `pipewire/*.conf` | `~/.config/pipewire/pipewire.conf.d/` | 48 kHz / quantum 128 clock; RAVENNA sink+source bridge |
-| `wireplumber/*.conf` | `~/.config/wireplumber/wireplumber.conf.d/` | never idle-suspend the AES67 nodes |
+| `pipewire/*.conf` | `~/.config/pipewire/pipewire.conf.d/` | 48 kHz / quantum 128 clock; RAVENNA sink+source bridge; `AES67 System Audio` capture sink |
+| `wireplumber/*.conf` | `~/.config/wireplumber/wireplumber.conf.d/` | never idle-suspend the AES67 nodes; keep WirePlumber off the RAVENNA card |
 | `dkms/{dkms.conf,Makefile}` | `/usr/src/mergingravennaalsa-2.1/` | build the RAVENNA ALSA kernel module via DKMS |
 | `modules/aes67.conf` | `/etc/modules-load.d/` | load `MergingRavennaALSA` at boot |
 | `systemd/aes67-deck-{server,engine}.service` | `~/.config/systemd/user/` | run the stack as lingering user services |
@@ -146,14 +146,44 @@ Working options for the grandmaster:
 Never run `phc2sys -s CLOCK_REALTIME -c /dev/ptp0` (pipes NTP jitter into
 the reference).
 
-### RAVENNA ALSA period
+### RAVENNA ALSA period + graph clock master
 
 `20-aes67-ravenna-bridge.conf` pins `api.alsa.period-size = 48`
 (= `daemon.conf` `tic_frame_size_at_1fs`) with `period-num = 2` and
 `disable-tsched` — the driver rejects periods that don't match its tic
-frame size. Re-verify the negotiated `hw_params` (`cat
-/proc/asound/card0/pcm0p/sub0/hw_params`) once a GM is present and the
-device actually runs; the driver hints an "expected" buffer of 192.
+frame size, and **ignores a larger `period-num`** (negotiated `hw_params`
+stays `buffer_size: 96` regardless — the "expected 192" hint does not
+apply). So the card's jitter buffer is a fixed 96 samples / 2 ms.
+
+Because that buffer is tiny, **the RAVENNA card must be the PipeWire graph
+clock master**, not the on-board analog crystal. `AES67_Sink` /
+`AES67_Source` carry `priority.driver = 100000 / 90000`, and
+`wireplumber/53-aes67-clock-master.conf` demotes the analog output to
+`10`. Without this the analog drives, `AES67_Sink` follows and is
+rate-adapted against a drifting local clock, and the network output runs
+**200–500 xruns/s** (seen on `ck-aes67` 2026-08-29). With RAVENNA driving,
+`10-aes67-clock-48khz.conf` pins the graph quantum to **48** (phase-locked
+to the 1 ms tic) — a bigger quantum overflows the 96-sample buffer and
+makes it worse.
+
+Two more props on those nodes, both learned the hard way on `ck-aes67`:
+
+- `priority.session = 100` — a high `priority.driver` also made WirePlumber
+  pick `AES67_Sink` as the **default output sink**, so apps played straight
+  to the wire instead of into the mixer. Pin the bridge nodes low for
+  default-sink selection (the on-board analog sits at ~1009,
+  `AES67_System_Audio` at 2000).
+- `AES67_Source` `node.always-process = true` — the aes67-daemon writes
+  received RTP into `hw:RAVENNA` capture; if PipeWire has that PCM closed
+  (nothing routed downstream) the daemon reports the RX sink as
+  `all_muted` and drops the audio. `always-process` keeps the capture open
+  continuously so a subscribed stream is live the moment it's routed.
+
+Verify after deploy: `pw-top -b -n 8 | grep AES67_Sink` — the line should
+be a top-level driver (`R  <id>  48  48000 …`, not `+`-indented) with the
+`ERR` column flat over successive runs. `pw-dump` →
+`AES67_Sink … "node.driver-id"` should be absent/None (it drives itself);
+`pw-metadata -n default | grep default.audio.sink` → `AES67_System_Audio`.
 
 ## AES67 network I/O for the mix (plan Phase 2)
 
@@ -200,3 +230,36 @@ stream regardless of that assignment.
 
 `ptp/phc-stability-check.py <dev> <seconds>` characterises a free-running
 PHC (rate offset + jitter vs the undisciplined TSC) before you rely on it.
+
+## Local machine audio (system audio in, monitoring out)
+
+Same design on the dev workstation and the appliance — nothing per-host:
+
+- **This machine's own playback → the mixer.** `pipewire/30-aes67-system-audio.conf`
+  creates a virtual sink **`AES67 System Audio`**. The deck server makes it the
+  default output (`pactl set-default-sink`, `ensureSystemAudioDefault()` — run at
+  start and re-asserted on every engine reconnect; WirePlumber then persists the
+  choice in `~/.local/state/wireplumber/default-nodes`), so the browser, a media
+  player, notification sounds — everything — land on it. The server links its
+  output to a mixer input channel via the patchbay; **channel 1 by default**
+  (`DEFAULT_PATCHBAY_MAPPINGS`, seeded when no `patchbay_config.json` exists yet),
+  so a headless box has its own audio on a fader before anyone opens the UI.
+  The loopback has **no `node.target`** — system audio only ever reaches the
+  mixer, never the wire or the speakers directly. Put it on an AES67 stream or
+  in the operator's phones by routing the Master / an Aux / the Monitor bus.
+
+- **Monitor bus → the machine's headphone jack.** `resolveMonitorOutputPorts()`
+  scores the live graph's ALSA sinks (`head*phone` route ≫ `analog` ≫ on-board
+  PCI ≫ Pro profile ≫ USB), skips the RAVENNA bridge, the `AES67 System Audio`
+  virtual sink, and HDMI/SPDIF, and links `AES67_Deck:monitor_L/R` to that
+  node's `FL/FR` (or `AUX0/1`) pair. Pin it with
+  `DECK_MONITOR_PORTS="node:portL,node:portR"` in the server's environment if a
+  box guesses wrong. Fallback: `alsa_output.pci-0000_00_1b.0.analog-stereo`
+  (ck-aes67's on-board PCH).
+
+**Deploy:** `provision-rt.sh` installs `30-aes67-system-audio.conf`; restart
+PipeWire (kills+respawns the engine, server re-drives every link). Verify:
+`pactl get-default-sink` → `AES67_System_Audio`; play something and check
+`pw-link -l | grep -A2 AES67_System_Audio_Loopback:output` shows links only to
+`AES67_Deck:in_1`; `grep 'Monitor routing applied' ` the server log points at
+the on-board analog card.

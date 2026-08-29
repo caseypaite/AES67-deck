@@ -6,6 +6,7 @@ import { useMixerStore, positionToDb } from '../stores/useMixerStore';
 import { useDawStore } from '../stores/useDawStore';
 import { DawView } from './DawView';
 import { PatchbayView } from '../components/patchbay/PatchbayView';
+import { Aes67NetworkView } from './Aes67NetworkView';
 import { Screw } from '../components/analog/Screw';
 import { LufsPanel } from '../components/mixer/LufsPanel';
 import { MasteringPanel } from '../components/mixer/MasteringPanel';
@@ -271,6 +272,10 @@ const FxPanelRow = ({
     return () => ro.disconnect();
   }, []);
 
+  // When no channel or bus is selected, default to Master Bus (ID 100)
+  const activeChannelId = selectedChannelId !== null ? selectedChannelId : 100;
+  const channelType = channels[activeChannelId]?.type || (activeChannelId === 100 ? 'master' : 'input');
+
   return (
     <div
       ref={panelRef}
@@ -282,38 +287,28 @@ const FxPanelRow = ({
       <Screw seed={2} className="absolute bottom-1.5 left-1.5 z-30" />
       <Screw seed={3} className="absolute bottom-1.5 right-1.5 z-30" />
 
-      {selectedChannelId !== null ? (
-        <>
-          {/* Left: square FX Rack Card + detail panel. Capped at 1116px so
-              the FX rack + plugin UI never grows wider than a full 16-channel
-              input bank below it (16×65 + 15×4 gap + 16 padding). */}
-          <div className="flex-1 h-full overflow-hidden flex max-w-[1116px]">
-            <FxRackCard />
-          </div>
+      {/* Left: square FX Rack Card + detail panel. Capped at 1116px so
+          the FX rack + plugin UI never grows wider than a full 16-channel
+          input bank below it (16×65 + 15×4 gap + 16 padding). */}
+      <div className="flex-1 h-full overflow-hidden flex max-w-[1116px]">
+        <FxRackCard channelId={activeChannelId} />
+      </div>
 
-          {/* Right: Aux / Source sends sidebar. Fixed to SENDS_SIDEBAR_WIDTH
-              and right-anchored (ml-auto) so its left edge sits directly over
-              the BUS channel-strip group in the mixer below. ml-auto also
-              provides the gap after the FX panel. */}
-          <div
-            className="shrink-0 ml-auto h-full flex"
-            style={{ width: SENDS_SIDEBAR_WIDTH }}
-          >
-            {(() => {
-              const t = channels[selectedChannelId]?.type;
-              if (t === 'master' || t === 'monitor')
-                return <MasteringPanel channelId={selectedChannelId} />;
-              if (t === 'bus') return <SourceSendsPanel busId={selectedChannelId} />;
-              return <AuxSendsPanel channelId={selectedChannelId} />;
-            })()}
-          </div>
-        </>
-      ) : (
-        <div className="w-full flex flex-col items-center justify-center font-black tracking-[0.2em] h-full text-engrave">
-          <div className="text-2xl mb-2">NO CHANNEL SELECTED</div>
-          <div className="text-xs font-bold tracking-widest opacity-70">Click a channel strip below to select a channel.</div>
-        </div>
-      )}
+      {/* Right: Aux / Source sends sidebar or MasteringPanel. Fixed to SENDS_SIDEBAR_WIDTH
+          and right-anchored (ml-auto) so its left edge sits directly over
+          the BUS channel-strip group in the mixer below. ml-auto also
+          provides the gap after the FX panel. */}
+      <div
+        className="shrink-0 ml-auto h-full flex"
+        style={{ width: SENDS_SIDEBAR_WIDTH }}
+      >
+        {(() => {
+          if (channelType === 'master' || channelType === 'monitor')
+            return <MasteringPanel channelId={activeChannelId} />;
+          if (channelType === 'bus') return <SourceSendsPanel busId={activeChannelId} />;
+          return <AuxSendsPanel channelId={activeChannelId} />;
+        })()}
+      </div>
     </div>
   );
 };
@@ -504,6 +499,12 @@ export const LiveConsoleView = () => {
           >
             PATCHBAY
           </button>
+          <button 
+            className={`px-4 py-1.5 rounded-sm font-bold text-xs tracking-wider transition-colors ${activeView === 'network' ? 'bg-blue-600 text-white' : 'bg-transparent text-gray-400 hover:bg-gray-800'}`}
+            onClick={() => setActiveView('network')}
+          >
+            AES67 NETWORK
+          </button>
         </div>
         
         <div className="flex gap-2 items-center">
@@ -667,6 +668,10 @@ export const LiveConsoleView = () => {
 
         {activeView === 'patchbay' && (
           <PatchbayView />
+        )}
+
+        {activeView === 'network' && (
+          <Aes67NetworkView />
         )}
       </div>
     </div>

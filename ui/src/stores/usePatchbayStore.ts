@@ -274,10 +274,18 @@ export const usePatchbayStore = create<PatchbayState>()(
 
   upsertStream: (name, address) => {
     set(state => {
-      const existingIndex = state.streams.findIndex(s => s.address === address && s.name === name);
+      const now = Date.now();
+      // Prune streams that haven't announced in > 60 seconds
+      const activeStreams = (state.streams || []).filter(s => (now - (s.lastSeen || 0)) < 60000);
+      const existingIndex = activeStreams.findIndex(s => s.address === address || s.name === name);
       if (existingIndex >= 0) {
-        const newStreams = [...state.streams];
-        newStreams[existingIndex] = { ...newStreams[existingIndex], lastSeen: Date.now() };
+        const newStreams = [...activeStreams];
+        newStreams[existingIndex] = {
+          ...newStreams[existingIndex],
+          name,
+          address,
+          lastSeen: now
+        };
         return { streams: newStreams };
       }
       const newStream: Aes67Stream = {
@@ -286,9 +294,9 @@ export const usePatchbayStore = create<PatchbayState>()(
         address,
         channels: 2,
         ports: [],
-        lastSeen: Date.now()
+        lastSeen: now
       };
-      return { streams: [...state.streams, newStream] };
+      return { streams: [...activeStreams, newStream] };
     });
   },
 
@@ -468,6 +476,8 @@ export const usePatchbayStore = create<PatchbayState>()(
         delete copy.daemonRemoteSources;
         delete copy.txSources;
         delete copy.daemonSinkStreams;
+        delete copy.streams;
+        delete copy.discoveredDestinations;
         return copy as unknown as PatchbayState;
       },
       // Fields added after this store was first persisted won't exist in
@@ -478,9 +488,9 @@ export const usePatchbayStore = create<PatchbayState>()(
         const state = { ...current, ...(persisted as Partial<PatchbayState>) };
         const withPorts = (s: Partial<Aes67Stream>): Aes67Stream =>
           ({ ...s, ports: Array.isArray(s.ports) ? s.ports : [] } as Aes67Stream);
-        state.streams = (state.streams || []).map(withPorts);
+        state.streams = [];
+        state.discoveredDestinations = [];
         state.manualStreams = (state.manualStreams || []).map(withPorts);
-        state.discoveredDestinations = (state.discoveredDestinations || []).map(withPorts);
         state.manualDestinations = (state.manualDestinations || []).map(withPorts);
         state.outputMappings = buildOutputMappings(state.outputMappings);
         state.talkbackSourcePorts = Array.isArray(state.talkbackSourcePorts) ? state.talkbackSourcePorts : [];

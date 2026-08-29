@@ -516,6 +516,14 @@ const SOCKET_PATH = process.env.AES67_SOCKET_PATH || '/tmp/aes67_deck.sock';
 const WSS_PORT = parseInt(process.env.PORT || '8081', 10);
 
 const PATCHBAY_CONFIG_PATH = 'patchbay_config.json';
+
+// Seed routing used when no patchbay_config.json exists yet (fresh install /
+// first boot). Channel 1 <- the machine's captured system audio, so a
+// headless appliance has its own playback in the mixer before anyone opens
+// the UI. Matches initialMappings in ui/src/stores/usePatchbayStore.ts.
+const DEFAULT_PATCHBAY_MAPPINGS: Record<string, any> = {
+  '1': { channelId: 1, sourceStreamId: 'system-audio-loopback', sourceChannel: 0, destStreamId: null, destChannel: 0 },
+};
 const OUTPUT_ROUTING_PATH = 'output_routing.json';
 const TALKBACK_CONFIG_PATH = 'talkback_config.json';
 const MIXER_STATE_PATH = 'mixer_state.json';
@@ -748,6 +756,9 @@ function buildEngineRestoreCommands(): string[] {
     if (ch.auxSends)
       for (const [busId, level] of Object.entries(ch.auxSends))
         lines.push(JSON.stringify({ type: 'set_aux_send', channel, busId: Number(busId), value: level }));
+  }
+  if (typeof (mixerState as any).aflPflMode === 'number') {
+    lines.push(JSON.stringify({ type: 'set_afl_pfl_mode', channel: 0, busId: 0, value: (mixerState as any).aflPflMode }));
   }
   return lines;
 }
@@ -1718,13 +1729,12 @@ wss.on('connection', (ws) => {
   console.log('UI Client connected to WebSocket');
   connectedWsClients.push(ws);
 
-  if (fs.existsSync(PATCHBAY_CONFIG_PATH)) {
-     try {
-       const savedMappings = fs.readFileSync(PATCHBAY_CONFIG_PATH, 'utf8');
-       ws.send(JSON.stringify({ type: 'patchbay_config_loaded', mappings: JSON.parse(savedMappings) }));
-     } catch (e) {
-       console.error('Error sending saved patchbay config', e);
-     }
+  try {
+    // Effective mappings — the saved file if present, otherwise the seeded
+    // default (channel 1 <- system audio) so the UI and the wired graph agree.
+    ws.send(JSON.stringify({ type: 'patchbay_config_loaded', mappings: getPatchbayMappings() }));
+  } catch (e) {
+    console.error('Error sending patchbay config', e);
   }
 
   ws.send(JSON.stringify({ type: 'output_routing_loaded', outputs: getOutputRouting() }));
@@ -1783,7 +1793,7 @@ wss.on('connection', (ws) => {
       // Only forward allowed types to prevent arbitrary data injection
       const allowedTypes = [
         'set_fader', 'set_pan', 'set_mute', 'set_solo', 'set_arm', 'set_phase', 'set_aux_send', 'start_record', 'stop_record',
-        'set_plugin_param', 'set_plugin_bypass', 'set_talkback_active',
+        'set_plugin_param', 'set_plugin_bypass', 'set_talkback_active', 'set_afl_pfl_mode',
         // Which plugin editor the UI has open — drives the engine's
         // per-plugin in/out metering (the `fx` key on `metering`).
         'fx_focus',
@@ -2323,6 +2333,9 @@ wss.on('connection', (ws) => {
           if (!mixerState[ch]) mixerState[ch] = {};
           mixerState[ch].solo = !!data.value;
           saveMixerState();
+        } else if (data.type === 'set_afl_pfl_mode') {
+          (mixerState as any).aflPflMode = data.value;
+          saveMixerState();
         } else if (data.type === 'set_arm' && typeof data.channel === 'number') {
           if (!mixerState[ch]) mixerState[ch] = {};
           mixerState[ch].arm = !!data.value;
@@ -2581,6 +2594,7 @@ const ipcServer = net.createServer((socket) => {
     // retries, leaving the whole graph disconnected. Wait for the engine's
     // ports to actually appear first.
     await waitForEnginePorts();
+    await ensureSystemAudioDefault();
     await handlePatchbaySync(getPatchbayMappings());
     await applyOutputRouting(getOutputRouting());
     await applyMonitorRouting();
@@ -2688,6 +2702,10 @@ const ipcServer = net.createServer((socket) => {
 ipcServer.listen(SOCKET_PATH, () => {
   console.log(`IPC Server listening on ${SOCKET_PATH}`);
 });
+
+// Assert the system-audio default sink as soon as we start — the engine may
+// already be connected (also re-asserted on every engine reconnect above).
+ensureSystemAudioDefault().catch(() => {});
 
 // Full routing (patchbay + output endpoints + Monitor + Talkback) is now
 // re-applied from the "C++ Engine connected via IPC" handler above on every
@@ -3211,6 +3229,42 @@ async function listAllOutputPorts(): Promise<string[]> {
   return stdout.split('\n').map(l => l.trim()).filter(Boolean);
 }
 
+// Point the machine's default sink at the "AES67 System Audio" loopback so
+// every app's playback is captured into the mixer (channel 1 by default).
+// No-op unless that sink exists — i.e. deploy/pipewire/30-aes67-system-audio.conf
+// is installed. Uses pw-dump + wpctl (core PipeWire/WirePlumber tools, present
+// on the appliance which has no pactl). Idempotent; safe on start and on every
+// engine (re)connect. WirePlumber persists the choice, so after the first run
+// this only corrects a drift.
+async function ensureSystemAudioDefault(): Promise<void> {
+  const dump = await runCmd('pw-dump', []);
+  if (!dump) return;
+  let sinkId: number | null = null;
+  let effName = '';
+  try {
+    for (const o of JSON.parse(dump) as any[]) {
+      if (o?.type === 'PipeWire:Interface:Node'
+          && o?.info?.props?.['node.name'] === 'AES67_System_Audio') {
+        sinkId = o.id;
+      } else if (o?.type === 'PipeWire:Interface:Metadata' && Array.isArray(o.metadata)) {
+        // The *effective* default (default.audio.sink), not the stored
+        // preference (default.configured.audio.sink) — WirePlumber can fail
+        // to honour the preference (e.g. another sink outranks it), and then
+        // the configured value lies. Assert against reality.
+        const e = o.metadata.find((x: any) => x?.key === 'default.audio.sink');
+        if (e) {
+          const v = typeof e.value === 'string' ? (() => { try { return JSON.parse(e.value); } catch { return e.value; } })() : e.value;
+          effName = (v && typeof v === 'object' ? v.name : v) || '';
+        }
+      }
+    }
+  } catch { return; }
+  if (sinkId == null) return;                       // config not deployed here
+  if (effName === 'AES67_System_Audio') return;
+  await runCmd('wpctl', ['set-default', String(sinkId)]);
+  console.log(`Default sink → AES67_System_Audio (node ${sinkId}; system audio into the mixer; was ${effName || 'unset'})`);
+}
+
 // Polls the PipeWire graph until the engine's JACK ports are present (or a
 // timeout), so the routing reapply on engine (re)connect doesn't race the
 // engine's port registration. `monitor_R` is the very last output port the
@@ -3426,14 +3480,14 @@ try {
 // wipe out every other channel's routing. Also rejects any channel id that
 // isn't a real channel number before it's written to disk.
 function mergePatchbayMappings(incoming: any): Record<string, any> {
-  let merged: Record<string, any> = {};
+  let merged: Record<string, any> = { ...DEFAULT_PATCHBAY_MAPPINGS };
   try {
     if (fs.existsSync(PATCHBAY_CONFIG_PATH)) {
       merged = JSON.parse(fs.readFileSync(PATCHBAY_CONFIG_PATH, 'utf8'));
     }
   } catch (e) {
     console.error('Error reading existing patchbay config, starting fresh', e);
-    merged = {};
+    merged = { ...DEFAULT_PATCHBAY_MAPPINGS };
   }
 
   if (!incoming || typeof incoming !== 'object') return merged;
@@ -3455,20 +3509,47 @@ function mergePatchbayMappings(incoming: any): Record<string, any> {
 // output_routing.json); Master and the Aux buses have no forced default of
 // their own and are freely mapped to any destination via Output Endpoints.
 //
-// Resolved from the live graph at routing time rather than hardcoded, so
-// `run-dev` on a dev workstation lands on that machine's real output and the
-// appliance lands on its on-board card — without a per-host build.
-// `DECK_MONITOR_PORTS="node:portL,node:portR"` pins it explicitly.
+// Resolved from the live graph at routing time rather than hardcoded, so the
+// dev workstation and the ck-aes67 appliance each land on their own on-board
+// analog output — the jack the operator plugs headphones into — with no
+// per-host build. `DECK_MONITOR_PORTS="node:portL,node:portR"` pins it.
 const MONITOR_FALLBACK_PORTS: [string, string] = [
   'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FL', // ck-aes67 on-board PCH
   'alsa_output.pci-0000_00_1b.0.analog-stereo:playback_FR',
 ];
 
-// A usable local monitor sink is a real ALSA output — not an AES67 network /
-// virtual bridge node, where Monitor audio would be transmitted on the wire or
-// looped straight back into the deck's own input.
+// A usable local monitor sink is a real ALSA analog output — not the AES67
+// network / RAVENNA bridge (Monitor would go on the wire or loop into the
+// deck's own input), not the "AES67 System Audio" virtual sink, and not an
+// HDMI/SPDIF digital port (no headphone jack behind it).
 function isLocalHardwareSink(node: string): boolean {
-  return node.startsWith('alsa_output.') && !/aes67|ravenna/i.test(node);
+  return node.startsWith('alsa_output.')
+    && !/aes67|ravenna|hdmi|iec958|spdif|\.monitor$/i.test(node);
+}
+
+// Rank candidate hardware sinks so the headphone / on-board analog output
+// wins over a USB DAC, a dock, or a second card's line-out.
+function monitorSinkScore(node: string): number {
+  let s = 0;
+  if (/head[\s._-]?phone/i.test(node)) s += 1000; // explicit headphone route
+  if (/analog/i.test(node))            s += 200;  // analog-stereo etc.
+  if (/\.pci-/i.test(node))            s += 60;   // on-board / PCI codec
+  if (/pro-output/i.test(node))        s += 20;   // Pro profile: raw AUX0/1
+  if (/\.usb-/i.test(node))            s += 10;   // USB DAC — usable, lower
+  return s;
+}
+
+// The L/R pair of a sink node: prefer front L/R, then AUX0/1, then the first
+// two ports (avoids grabbing FC/LFE off a surround card).
+function stereoPairOf(ports: string[]): [string, string] | [string] | null {
+  const bySuffix = (suf: string) => ports.find((p) => new RegExp(`[:_]${suf}$`).test(p));
+  const fl = bySuffix('FL'), fr = bySuffix('FR');
+  if (fl && fr) return [fl, fr];
+  const a0 = bySuffix('AUX0'), a1 = bySuffix('AUX1');
+  if (a0 && a1) return [a0, a1];
+  if (ports.length >= 2) return [ports[0], ports[1]];
+  if (ports.length === 1) return [ports[0]];
+  return null;
 }
 
 async function resolveMonitorOutputPorts(): Promise<[string, string]> {
@@ -3481,21 +3562,20 @@ async function resolveMonitorOutputPorts(): Promise<[string, string]> {
     .split('\n').map((l) => l.trim()).filter(Boolean);
   const portsOf = (node: string) => inPorts.filter((p) => p.startsWith(node + ':')).sort();
 
-  const candidates: string[] = [];
-  const def = (await runCmd('pactl', ['get-default-sink'])).trim();
-  if (def && isLocalHardwareSink(def)) candidates.push(def);
+  const nodes = new Set<string>();
   for (const p of inPorts) {
     const node = p.slice(0, p.lastIndexOf(':'));
-    if (isLocalHardwareSink(node) && !candidates.includes(node)) candidates.push(node);
+    if (isLocalHardwareSink(node)) nodes.add(node);
+  }
+  const ranked = [...nodes].sort(
+    (a, b) => monitorSinkScore(b) - monitorSinkScore(a) || a.localeCompare(b));
+
+  for (const node of ranked) {
+    const pair = stereoPairOf(portsOf(node));
+    if (pair) return pair.length === 2 ? [pair[0], pair[1]] : [pair[0], pair[0]];
   }
 
-  for (const node of candidates) {
-    const ps = portsOf(node);
-    if (ps.length >= 2) return [ps[0], ps[1]];
-    if (ps.length === 1) return [ps[0], ps[0]];
-  }
-
-  console.warn('resolveMonitorOutputPorts: no local hardware sink in the graph — using fallback');
+  console.warn('resolveMonitorOutputPorts: no local analog sink in the graph — using fallback');
   return MONITOR_FALLBACK_PORTS;
 }
 

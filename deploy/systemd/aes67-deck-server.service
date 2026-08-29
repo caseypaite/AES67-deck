@@ -1,7 +1,7 @@
 [Unit]
 Description=AES67-Deck WebSocket / IPC server
-After=network-online.target
-Wants=network-online.target
+After=network-online.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=network-online.target pipewire.service pipewire-pulse.service wireplumber.service
 
 [Service]
 Type=simple

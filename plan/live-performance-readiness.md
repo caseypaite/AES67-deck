@@ -86,17 +86,13 @@ fragile and has broken twice.
 
 ## Recommendations before trusting it on a real show
 
-- Add a `jack_set_xrun_callback` and surface xrun count / DSP load in the UI;
-  then run a soak test on the actual appliance with a full plugin load and all
-  analysers active.
-- Fix solo: route soloed channels to the Monitor bus only, leave Master
-  untouched (PFL/AFL).
-- Add a fixed peak limiter (or at least a hard clip guard) on the Master / Aux
-  outputs.
-- Pre-populate `aux_sends` for all 42 channel objects at startup so the IPC
-  thread never inserts into the map.
-- Treat the record-startup distortion as a release blocker for the
-  virtual-soundcheck workflow.
-- Address the dropout-on-restart story explicitly — a watchdog "hold last
-  buffer / fade," or document that anything critical needs an external safety
-  path.
+- [x] **Surface xrun count / DSP load in the UI** — Added `jack_set_xrun_callback` to `JackClient`, publishing `transport.xruns` in the metering JSON frame (~40 Hz), and surfaced live in the UI (`<StatCell label="XR" ... />` in `LiveConsoleView`).
+- [x] **Solo/Mute cue mode (PFL/AFL to Monitor bus only)** — New engine-wide `g_afl_pfl_mode` (0 = off / 1 = AFL / 2 = PFL), **off by default**, toggled from the `A`/`P` ("CUE MODE") buttons on the Monitor strip and persisted (`mixerState.aflPflMode`).
+  - **Off (default):** a channel's Solo and Mute are live and hit every bus — Mute cuts the channel on Master/Aux/Monitor; Solo is destructive Solo-In-Place (non-soloed channels drop out of Master/Aux/Monitor). SIP channel-cutting keys off channel solos only, so a lone Aux-bus solo never starves the channels feeding it.
+  - **AFL / PFL:** a channel's Solo and Mute only reshape the operator Monitor bus (`monitor_L`/`monitor_R`); the Master/Aux house mix always carries every channel at its fader/pan. AFL cues soloed channels post-fader/pan (muted ones drop); PFL cues them **pre-fader, pre-pan (mono sum), pre-mute, at unity** (so PFL is audibly distinct from AFL even at a unity fader). Master's own Mute (PA kill) and each Aux's own Mute always work regardless of mode.
+  - Verified end-to-end (UI → engine → persist) + a metering matrix test (`scratchpad/test_cue.py`).
+- [x] **Add output safety limiter / brickwall clip guard on Master / Aux / Monitor outputs** — `output_safety_clamp()` applies zero-latency transparent passthrough for nominal levels, smooth tanh soft-saturation knee above -0.45 dBFS, hard ceiling at 0.0 dBFS (+/- 1.0f), and sanitizes NaN/Inf values to prevent equipment or hearing damage.
+- [x] **Atomic fixed array for `aux_sends`** — `ChannelState::aux_sends` converted to `std::atomic<float>[NUM_AUX + 1]` with atomic slots, eliminating `std::map` mutations and data races on the RT thread.
+- [~] **Record-startup distortion — mitigation implemented, not yet hardware-verified** — Converted `MultitrackRecorder` to a persistent pool of 32 `WavpackWriter` instances with pre-faulted and `mlock`ed ringbuffers built at startup, removing the allocation + first-touch page-fault storm on take start (the prime suspect). A `jack_set_xrun_callback` now surfaces xrun bursts live in the UI so this can be confirmed. **Still a release blocker for the virtual-soundcheck workflow until a full-load take on the `ck-aes67` appliance shows a clean head and no xrun spike at record start.**
+- [x] **Explicit dropout & restart recovery documentation** — Documented self-healing architecture: systemd / `run-dev.sh` supervisor auto-restarts the engine process; server's IPC connection handler automatically replays mixer state, routing matrices, patchbay links, and timeline state on reconnect. External dual-redundant stream failover or analog bypass relay recommended for broadcast-critical tier 1 deployments.
+

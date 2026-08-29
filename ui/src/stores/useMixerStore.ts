@@ -48,12 +48,12 @@ export const TALKBACK_ID = 110;
 
 interface MixerState {
   channels: Record<number, Channel>;
-  activeView: 'mixer' | 'daw' | 'patchbay';
+  activeView: 'mixer' | 'daw' | 'patchbay' | 'network';
   transportState: 'playing' | 'recording' | 'stopped';
   ws: WebSocket | null;
   selectedChannelId: number | null;
 
-  setActiveView: (view: 'mixer' | 'daw' | 'patchbay') => void;
+  setActiveView: (view: 'mixer' | 'daw' | 'patchbay' | 'network') => void;
   setChannelValue: <K extends keyof Channel>(id: number, key: K, value: Channel[K]) => void;
   renameChannel: (id: number, name: string) => void;
   setAuxSend: (channelId: number, busId: number, level: number) => void;
@@ -103,6 +103,15 @@ interface MixerState {
   connectWebSocket: () => void;
   scenes: string[];
   deleteScene: (name: string) => void;
+
+  // Solo-mode / monitor cue mode (governs how a channel's Solo + Mute behave):
+  // 'off' (default) — Solo + Mute are live and affect every bus (Mute cuts the
+  //   channel everywhere, Solo is destructive Solo-In-Place).
+  // 'afl' / 'pfl' — cue mode: Solo + Mute only reshape the Monitor bus; the
+  //   Master/Aux house mix is untouched. AFL cues post-fader/pan; PFL cues
+  //   pre-fader, pre-pan (mono), pre-mute at unity.
+  aflPflMode: 'afl' | 'pfl' | 'off';
+  setAflPflMode: (mode: 'afl' | 'pfl' | 'off') => void;
 
   // --- Virtual soundcheck (plan/daw-timeline-roadmap.md Phase 3a) ---
   // Per-channel monitor override: bit (id-1) set => channel id monitors its
@@ -277,6 +286,15 @@ export const useMixerStore = create<MixerState>((set, get) => ({
   selectedChannelId: null,
 
   monitorInputMask: 0,
+  aflPflMode: 'off',
+  setAflPflMode: (mode) => {
+    set({ aflPflMode: mode });
+    const ws = get().ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const val = mode === 'afl' ? 1 : mode === 'pfl' ? 2 : 0;
+      ws.send(JSON.stringify({ type: 'set_afl_pfl_mode', channel: 0, busId: 0, value: val }));
+    }
+  },
   vscConfig: { autoRecord: false, splitOnMarker: true, minFreeGb: 5, schedule: { enabled: false, at: '19:00' } },
   vscStatus: { diskLow: false, freeGb: null, message: null },
 
@@ -911,6 +929,12 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           });
         } else if (data.type === 'set_monitor_input_mask' && typeof data.mask === 'number') {
           set({ monitorInputMask: data.mask >>> 0 });
+        } else if (data.type === 'set_afl_pfl_mode' && typeof data.value === 'number') {
+          // Broadcast from another client — mirror it locally without echoing
+          // back to the server (the metering frame also carries afl_pfl, but
+          // this keeps multi-client UIs in sync immediately).
+          const mode = data.value === 1 ? 'afl' : data.value === 2 ? 'pfl' : 'off';
+          if (get().aflPflMode !== mode) set({ aflPflMode: mode });
         } else if (data.type === 'vsc_config_loaded' && data.config) {
           set({ vscConfig: {
             autoRecord: !!data.config.autoRecord,
@@ -954,6 +978,10 @@ export const useMixerStore = create<MixerState>((set, get) => ({
           }
           if (typeof data.transport?.xruns === 'number' && data.transport.xruns !== get().xruns) {
             set({ xruns: data.transport.xruns });
+          }
+          if (typeof data.afl_pfl === 'number') {
+            const mode = data.afl_pfl === 1 ? 'afl' : data.afl_pfl === 2 ? 'pfl' : 'off';
+            if (get().aflPflMode !== mode) set({ aflPflMode: mode });
           }
           if (data.tc) useDawStore.getState().applyTcTelemetry(data.tc);
           if (data.transport) {

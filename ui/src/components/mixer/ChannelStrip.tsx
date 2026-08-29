@@ -95,12 +95,13 @@ const TapeLabel = ({ text, onRename }: { text: string, onRename: (name: string) 
   );
 };
 
-const AnalogButton = ({ label, active, onClick, colorClass }: { label: string, active: boolean, onClick: () => void, colorClass: string }) => (
-  <button 
+const AnalogButton = ({ label, active, onClick, colorClass, title, hintClass }: { label: string, active: boolean, onClick: () => void, colorClass: string, title?: string, hintClass?: string }) => (
+  <button
+    title={title}
     onClick={(e) => { e.stopPropagation(); onClick(); }}
     className={`flex-1 h-6 rounded-[3px] border-2 flex items-center justify-center relative transition-all overflow-hidden z-10
-      ${active ? `${colorClass} shadow-[inset_0_0_10px_rgba(255,255,255,0.4),0_0_8px_currentColor] scale-[0.97]` 
-               : 'bg-[#2a2d33] border-[#1a1c22] text-[#666] shadow-[0_4px_4px_rgba(0,0,0,0.8),inset_0_1px_2px_rgba(255,255,255,0.1)]'}`}
+      ${active ? `${colorClass} shadow-[inset_0_0_10px_rgba(255,255,255,0.4),0_0_8px_currentColor] scale-[0.97]`
+               : `bg-[#2a2d33] text-[#666] shadow-[0_4px_4px_rgba(0,0,0,0.8),inset_0_1px_2px_rgba(255,255,255,0.1)] ${hintClass || 'border-[#1a1c22]'}`}`}
     style={{ borderColor: active ? 'transparent' : '' }}
   >
     <span className="font-bold text-[9px] drop-shadow-md z-10">{label}</span>
@@ -143,6 +144,20 @@ export const ChannelStrip = ({ id }: { id: number }) => {
   const isBus = channel.type === 'bus';
   const isMonitor = channel.type === 'monitor';
   const isSelected = selectedChannelId === id;
+  const aflPflMode = useMixerStore((s) => s.aflPflMode);
+  const setAflPflMode = useMixerStore((s) => s.setAflPflMode);
+  // Cue mode uses Solo as the per-channel PFL/AFL trigger — reflect that on the
+  // Solo buttons, and on the MON-strip badge (which prompts for a solo until
+  // one exists).
+  const cueActive = aflPflMode !== 'off';
+  const anySoloed = useMixerStore((s) =>
+    Object.values(s.channels).some(c => (c.type === 'input' || c.type === 'bus') && c.solo));
+  const soloColorClass = aflPflMode === 'pfl'
+    ? 'bg-cyan-500 text-black border-cyan-700'
+    : 'bg-yellow-500 text-black border-yellow-700';
+  const soloHintClass = aflPflMode === 'pfl'
+    ? 'border-cyan-500/60'
+    : aflPflMode === 'afl' ? 'border-yellow-500/70' : undefined;
 
   const db = positionToDb(channel.fader);
   const dbValue = db === -Infinity ? '-∞' : db.toFixed(1);
@@ -176,7 +191,7 @@ export const ChannelStrip = ({ id }: { id: number }) => {
 
       <div className="w-full h-[2px] bg-black/30 my-2 shadow-[0_1px_0_rgba(255,255,255,0.1)] z-10 shrink-0" />
 
-      {/* Spacer to push controls to bottom, filling empty space for buses/master */}
+      {/* Spacer to push controls to bottom, filling empty space for buses/master/monitor */}
       <div className="w-full flex flex-col justify-end items-center mb-2 shrink-0">
         {/* Pan Knob */}
         {!isMaster && !isBus && !isMonitor && (
@@ -191,6 +206,48 @@ export const ChannelStrip = ({ id }: { id: number }) => {
              />
           </div>
         )}
+        {/* Monitor CUE-mode control (global, lives on the MON strip). OFF by
+            default: channel Solo + Mute are live and hit every bus. Engage A
+            or P and Solo + Mute only reshape this Monitor bus — the Master/Aux
+            house mix keeps every channel. */}
+        {isMonitor && (
+          <div className="w-full flex flex-col items-center px-1 py-1 gap-1">
+            <div className="text-[7px] font-black tracking-widest text-black/40 uppercase">Cue Mode</div>
+            <div className="w-full flex justify-center items-center gap-1">
+              <AnalogButton
+                label="A"
+                title="AFL (After-Fader Listen). When engaged, channel Solo + Mute affect the Monitor bus ONLY — the Master and Aux outputs keep the full mix. Soloed channels are cued post-fader/pan. (Off by default: Solo + Mute are live and hit every bus.)"
+                active={aflPflMode === 'afl'}
+                onClick={() => setAflPflMode(aflPflMode === 'afl' ? 'off' : 'afl')}
+                colorClass="bg-yellow-500 text-black border-yellow-700"
+              />
+              <AnalogButton
+                label="P"
+                title="PFL (Pre-Fader Listen). Same as AFL — channel Solo + Mute affect the Monitor bus only — but soloed channels are cued pre-fader, pre-pan (mono), pre-mute, at unity gain."
+                active={aflPflMode === 'pfl'}
+                onClick={() => setAflPflMode(aflPflMode === 'pfl' ? 'off' : 'pfl')}
+                colorClass="bg-cyan-500 text-black border-cyan-700"
+              />
+            </div>
+            {cueActive && (
+              anySoloed ? (
+                <div
+                  className="text-[7px] font-black tracking-widest text-cyan-200 bg-cyan-950/70 border border-cyan-700/70 rounded-[2px] px-1 py-0.5 uppercase text-center leading-tight"
+                  title="Cue mode active — channel Solo and Mute are affecting the Monitor bus only. The Master and Aux house mix is unaffected."
+                >
+                  Solo/Mute<br />→ Mon only
+                </div>
+              ) : (
+                <div
+                  className="text-[7px] font-black tracking-widest text-cyan-300/80 border border-dashed border-cyan-600/50 rounded-[2px] px-1 py-0.5 uppercase text-center leading-tight animate-pulse"
+                  title="Cue mode is armed but nothing is soloed. Press a channel's Solo button to cue it onto the Monitor bus (Solo is the per-channel PFL/AFL trigger)."
+                >
+                  Solo a ch<br />to cue
+                </div>
+              )
+            )}
+          </div>
+        )}
       </div>
 
       <div className="w-full h-[2px] bg-black/30 my-2 shadow-[0_1px_0_rgba(255,255,255,0.1)] z-10 shrink-0" />
@@ -199,8 +256,17 @@ export const ChannelStrip = ({ id }: { id: number }) => {
       <div className="w-full flex-1 flex flex-col items-center px-1 overflow-hidden">
         {/* Toggles */}
         <div className="flex w-full gap-1 mb-2 shrink-0">
-          {!isMonitor && (
-            <AnalogButton label="S" active={channel.solo} onClick={() => setChannelValue(id, 'solo', !channel.solo)} colorClass="bg-yellow-500 text-black border-yellow-700" />
+          {!isMonitor && !isMaster && (
+            <AnalogButton
+              label={cueActive ? aflPflMode.toUpperCase() : 'S'}
+              active={channel.solo}
+              onClick={() => setChannelValue(id, 'solo', !channel.solo)}
+              colorClass={soloColorClass}
+              hintClass={soloHintClass}
+              title={cueActive
+                ? `${aflPflMode.toUpperCase()} cue — press to route this channel to the Monitor bus only (${aflPflMode === 'pfl' ? 'pre-fader, pre-pan, mono' : 'post-fader/pan'}), leaving the house mix untouched. This is the channel's Solo button.`
+                : 'Solo (Solo-In-Place — cuts non-soloed channels on every bus)'}
+            />
           )}
           <AnalogButton label="M" active={channel.mute} onClick={() => setChannelValue(id, 'mute', !channel.mute)} colorClass="bg-orange-600 text-white border-orange-800" />
         </div>

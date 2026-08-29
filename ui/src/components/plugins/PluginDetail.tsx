@@ -213,9 +213,11 @@ const GenericBody = ({
 export const PluginDetail = ({
   plugin,
   channelId,
+  onClose,
 }: {
   plugin: PluginNode;
   channelId: number;
+  onClose?: () => void;
 }) => {
   const setPluginEnabled = useMixerStore(s => s.setPluginEnabled);
   const setFxFocus = useMixerStore(s => s.setFxFocus);
@@ -248,6 +250,15 @@ export const PluginDetail = ({
     <div className="flex-1 h-full flex flex-col bg-[#0b0c10] border-l-2 border-black/70 overflow-hidden">
       {/* Header */}
       <div className="metal-face metal-grain relative flex items-center gap-2 px-3 py-2 border-b-2 border-black/60 shrink-0">
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="metal-btn text-[9px] font-black tracking-wider text-sky-300 px-2 py-1 rounded-[3px] shrink-0 hover:text-white"
+            title="Return to FX Chain Overview"
+          >
+            ◀ OVERVIEW
+          </button>
+        )}
         <div
           className="text-[9px] font-black tracking-widest px-1.5 py-0.5 rounded shadow-[0_1px_2px_rgba(0,0,0,0.6),inset_0_1px_0_rgba(255,255,255,0.35)]"
           style={{ background: accent, color: '#0b0c10' }}
