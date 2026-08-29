@@ -2,8 +2,9 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phases 1–6 done + runtime-verified (Release + TSan + ASan builds,
-scripted concurrency driver, dev-stack + browser functional checks).
+**Status:** Phases 1–7 done + runtime-verified (Release + TSan + ASan builds,
+scripted concurrency driver, dev-stack + browser functional checks). Phase 7's
+target bug is appliance-specific and needs a final check on the real box.
 
 ### Progress — Phase 1 (engine RT-safety)
 
@@ -391,9 +392,41 @@ correctly at the loop-out point.
 
 ---
 
-## 9. Outstanding (separate from the audit)
+## 9. Phase 7 — record-startup distortion  ✅ addressed (commit `f56661e`), appliance check pending
 
-- **"First ~2 s distorted" take** — still unexplained (see §6). Not a
-  concurrency bug in the recorder; suspect input signal or WavPack.
+The "first ~2 s of every multitrack take is distorted" bug.
+
+- **Does not reproduce on the dev workstation** — recorded takes are clean
+  (no clipping / gaps / NaN, `overrun:false`, steady gain). It's
+  appliance-specific (RT scheduling + real ALSA capture + disk on the
+  ThinkCentre).
+- **New diagnosis:** `jack_set_xrun_callback` → an atomic counter echoed as
+  `transport.xruns` on the metering frame (also audit finding "no xrun
+  visibility") shows `start_multitrack_record` causing a JACK xrun **even on
+  the workstation**. Cause: `mtr.start()` built N × (16 MB
+  `jack_ringbuffer_create` + disk-thread spawn) on the IPC thread the instant
+  the transport flipped to recording. The reverted head-discard "didn't help"
+  because it only delayed the first ring write, moving the xrun storm with it.
+- **Fix:** the `WavpackWriter`s are now a **persistent pool of 32**, built
+  once in the `MultitrackRecorder` constructor; `start()` only opens files.
+  No per-take ring alloc / thread spawn / destruction — which also let the
+  Phase-5 reaper/retired/atomic-pointer machinery be deleted (nothing to race
+  when writers never move or die). Per-writer ring 16 MB → 4 MB. `WavpackWriter`
+  made reopen-safe (bounded wait, drain-not-reset, gated disk thread, atomic
+  `wpc_`/`channels_`, `close_file` publishes null last). Ring pages faulted in
+  + `mlock`ed in the ctor — same for `DiskWriter` and `TimelinePlayer`.
+- **Verified:** Release/TSan/ASan clean. Dev stack: 4 consecutive 6-channel
+  takes add **3 xruns total** (takes 2 & 4 add zero) vs. ~1 per take before;
+  all takes valid + lossless. **Still needs a run on the appliance** —
+  `memlock infinity` there makes `mlock` real, and the weaker CPU makes the
+  burst worse, so that's where the fix matters most. The new **XR** toolbar
+  cell shows the count live.
+
+---
+
+## 10. Outstanding
+
 - Full **helgrind** run (TSan covered the same ground; a second opinion,
   lower priority now).
+- Appliance soak test with the full plugin load + all analysers, watching
+  the new XR counter (audit recommendation).
