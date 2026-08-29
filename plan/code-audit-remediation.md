@@ -2,9 +2,8 @@
 
 **Source:** `docs/code-audit-report.md` (2026-08-29)
 **Branch:** `audit-remediation-phase1`
-**Status:** Phases 1–3 done + runtime-verified, incl. a ThreadSanitizer pass.
-Phase 4 (plugin-chain thread safety — new findings from the TSan pass) is
-recommended but not started.
+**Status:** Phases 1–4 done + runtime-verified (Release + TSan + ASan builds,
+scripted concurrency driver, dev-stack functional checks).
 
 ### Progress — Phase 1 (engine RT-safety)
 
@@ -294,31 +293,50 @@ start/stop, timeline set — for ~25 s while draining metering.
   synchronised through `jack_ringbuffer` (plugin_cmd_ring / plugin_trash_ring)
   — real acquire/release ordering TSan can't see inside uninstrumented libjack.
 
-## 5. Phase 4 (recommended) — plugin-chain thread safety
+## 5. Phase 4 — plugin-chain thread safety  ✅ DONE (commit `318c668`)
 
-Found during the TSan pass; **not in the original audit**, genuine latent bugs:
+Both from the Phase 3 TSan pass; **not in the original audit**.
 
-- **`PluginInstance::bypassed` is a plain `bool`** written by
-  `set_plugin_callback` (IPC thread, `plugin->bypassed = …`) and read every
-  block by the audio thread (`main.cpp` insert-chain loop). → `std::atomic<bool>`.
-- **`set_plugin_callback` (`set_plugin_param` / `set_plugin_bypass`) runs on
-  the IPC thread and dereferences `channels[ch].insert_chain[idx].get()`
-  directly** — reading the vector and calling `set_control_value_by_symbol()`
-  on a `PluginInstance` the audio thread may be erasing and the trash thread
-  may be `delete`ing. This one is **not** ring-mediated — it's a real
-  cross-thread `std::vector` + use-after-free hazard on a live control path.
-  Fix: route param/bypass changes through `plugin_cmd_ring` like add/remove,
-  or hold an atomic per-port value array the audio thread reads.
-- Consider the same treatment for `MultitrackRecorder` (never audited for
-  concurrency; also the suspect for the open "first ~2 s distorted" bug).
+- **`PluginInstance::bypassed`** `bool` → `std::atomic<bool>` (IPC writes it
+  during add/seed, the audio thread reads it every block; the SetBypass
+  command applies it too).
+- **`set_plugin_param` / `set_plugin_bypass` no longer run off the IPC
+  thread.** They dereferenced `channels[ch].insert_chain[idx].get()` — a
+  `std::vector` the audio thread mutates and a `PluginInstance` the trash
+  thread may `delete` (real cross-thread vector access + UAF on a live
+  control path). Now queued onto `plugin_cmd_ring` as
+  `PluginCmd{SetParam, SetBypass}` and applied by the audio thread. The
+  modern UI sends real LV2 symbols so no per-URI remap is needed on this path
+  (`seed_params`, on a fresh not-yet-shared instance, keeps its remap).
+- **`set_control_value_by_symbol` is now RT-safe** — `symbol → port index`
+  resolved against a map built once in `instantiate()`, no lilv calls, no
+  allocation. Unknown symbol = harmless no-op.
+- **`src/util/tsan_annotations.h`** — `AES67_TSAN_RELEASE/ACQUIRE` around the
+  `plugin_cmd_ring` / `plugin_trash_ring` hand-offs, so TSan sees the
+  happens-before edge that lives inside libjack. This **replaced** the
+  `PluginInstance` / `Lv2Host` suppressions — a real future plugin race now
+  surfaces instead of being masked. `tsan.supp` is now third-party only.
 
-**Explicitly not doing:** C3 (hardcoded paths — non-issue); Phase 3.2 unless
-the latency target changes.
+### Verification
+Release + TSan + ASan builds clean. ASan-clean under the real persisted
+`fx_racks.json` restore (Compressor+Reverb+EQ8Band on ch1) plus param/bypass
+churn. TSan data-race-clean (2 remaining findings are 100 % `ld-linux` /
+`libpipewire-module-protocol-native` mutex-tracking artifacts, present from
+the first run). Dev-stack functional check: add / param / bypass / remove +
+300 rapid param changes — effects apply, engine stable, `fxN` telemetry
+tracks the chain.
+
+**Explicitly not doing:** C3 (hardcoded paths — non-issue); Phase 3.2 RT
+metering rework (unless the latency target changes).
 
 ---
 
-## 6. Outstanding
+## 6. Outstanding (separate from the audit)
 
-- Pre-existing **loop-wrap bug** (`transport_set_loop` never reaches
-  `g_transport.loop_enabled`) — see §1 note. Separate from the audit.
-- Phase 4 above (new findings).
+- **Loop-wrap bug** — `transport_set_loop` never reaches
+  `g_transport.loop_enabled` (see §1 note). Confirmed pre-existing via an
+  A/B build against `46d2e76`.
+- **`MultitrackRecorder`** — never audited for concurrency; also the suspect
+  for the open "first ~2 s of every take distorted" bug. Worth its own pass.
+- Full **helgrind** run (TSan covered the same ground; helgrind would be a
+  second opinion, lower priority now).
